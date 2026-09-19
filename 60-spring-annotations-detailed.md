@@ -1,23 +1,28 @@
-# 60. Главные аннотации Spring / Spring Boot
+# 60. Главные аннотации Spring и Spring Boot: internals каждой
 
-Каждая ключевая аннотация: что делает, как реализована под капотом.
+## Зачем понимать аннотации глубже уровня «работает»
 
----
+Разработчик который начинает Spring обычно использует аннотации как magic. @Service marks bean, @Autowired injects dependency, @Transactional wraps transaction. Работает — moving on. Реальные production issues требуют understanding как эти аннотации реально processed. Почему @Transactional не срабатывает when called from same class? Почему @Autowired циклическая dependency ломает startup? Почему @Configuration класс должен быть CGLib proxied? Почему @Async return void не ловит exceptions?
 
-## 1. Как Spring обрабатывает аннотации в целом
+Разница между разработчиком «использующим аннотации» и «понимающим их internals» проявляется в troubleshooting сложных scenarios. Первый видит «self-invocation issue» и searches Stack Overflow для fix. Второй знает что @Transactional работает через AOP-proxy (CGLib для class, JDK для interface). Знает что calling method through this bypasses proxy. Знает что @Configuration класс обёрнут в CGLib proxy чтобы @Bean method calls внутри same class returned same singleton instance. Знает что @Autowired обрабатывается AutowiredAnnotationBeanPostProcessor через reflection. Knowledge internals enables predicting behavior plus diagnosing issues.
 
-Механизм: **BeanPostProcessor + BeanFactoryPostProcessor**.
+В этом файле разберём все ключевые Spring аннотации с deep dive в implementation. Как Spring обрабатывает аннотации в общем — BeanPostProcessor, BeanFactoryPostProcessor. @SpringBootApplication composition. Stereotypes (@Component, @Service, @Repository, @Controller). @Configuration и CGLib proxy для @Bean methods. @Autowired через reflection. @Qualifier, @Primary, @Lazy. @Scope. @EnableAutoConfiguration магия. @Conditional* family. @Value plus @ConfigurationProperties. @Profile. @Enable* pattern. @Async, @Scheduled, @Transactional (AOP-proxy family). @Cacheable. @PostConstruct/@PreDestroy. @EventListener. Web annotations. @Valid, @ControllerAdvice. Utility annotations.
 
-- **BeanFactoryPostProcessor** — модифицирует определения бинов (BeanDefinition) до их создания. Пример: `ConfigurationClassPostProcessor` парсит `@Configuration`.
-- **BeanPostProcessor** — модифицирует бины после создания. Пример: `AutowiredAnnotationBeanPostProcessor` обрабатывает `@Autowired`.
+## Как Spring обрабатывает аннотации в целом
 
-Плюс **проксирование** (CGLib / JDK Dynamic Proxy) для `@Transactional`, `@Async`, `@Cacheable`.
+Механизм основывается на двух key extension points.
 
----
+BeanFactoryPostProcessor — модифицирует определения бинов (BeanDefinition) до их создания. Пример — ConfigurationClassPostProcessor парсит @Configuration классы. Runs early в container lifecycle. Modifies bean registration information.
 
-## 2. @SpringBootApplication
+BeanPostProcessor — модифицирует бины после создания. Пример — AutowiredAnnotationBeanPostProcessor обрабатывает @Autowired поля. Runs during bean instantiation. Wraps beans или injects dependencies.
 
-Композиция трёх:
+Плюс проксирование (CGLib / JDK Dynamic Proxy) для @Transactional, @Async, @Cacheable. AOP-driven behaviors implemented через proxy interception.
+
+Together these mechanisms обеспечивают declarative programming model Spring. Annotations mark intentions, framework processes them at appropriate lifecycle stages.
+
+## @SpringBootApplication
+
+Композиция трёх аннотаций:
 ```java
 @SpringBootConfiguration
 @EnableAutoConfiguration
@@ -25,38 +30,37 @@
 public @interface SpringBootApplication { ... }
 ```
 
-- **@SpringBootConfiguration** = `@Configuration` (специальный маркер для Spring Boot Test).
-- **@EnableAutoConfiguration** — включает автоконфигурацию (см. §11).
-- **@ComponentScan** — сканирует пакет + подпакеты.
+@SpringBootConfiguration = @Configuration (специальный маркер для Spring Boot Test — different testing frameworks recognize).
 
-**Правило**: класс с этой аннотацией — в **корневом пакете**, чтобы ComponentScan охватил всё.
+@EnableAutoConfiguration — включает автоконфигурацию (см. section 11).
 
-Под капотом: обработчики автоконфига читают `spring.factories` (Boot 2) / `AutoConfiguration.imports` (Boot 3), applyят условно.
+@ComponentScan — сканирует пакет plus подпакеты. Default — package of annotated class.
 
----
+Правило. Класс с этой аннотацией в корневом пакете чтобы ComponentScan охватил всё. Package structure aligned с scanning expectations.
 
-## 3. Стереотипы: @Component, @Service, @Repository, @Controller
+Под капотом. Обработчики автоконфига читают META-INF/spring.factories (Boot 2) или META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports (Boot 3) из всех jar'ов classpath. Apply conditional logic для each auto-configuration.
 
-Все — маркеры «этот класс — bean, регистрируй». Функционально почти одинаковы.
+## Stereotypes: @Component, @Service, @Repository, @Controller
 
-- **@Component** — базовый.
-- **@Service** — семантика: business logic (bean-slice).
-- **@Repository** — семантика: data access. **Плюс** — Spring оборачивает исключения в `DataAccessException` через `PersistenceExceptionTranslationPostProcessor`.
-- **@Controller** — MVC-контроллер, возвращает view names.
-- **@RestController** = `@Controller` + `@ResponseBody` (JSON everywhere).
+Все — маркеры «этот класс — bean, регистрируй». Функционально почти одинаковы. Semantic differences в некоторых.
 
-### 3.1 Реализация
+@Component — базовый. Generic bean marker.
 
-`ClassPathBeanDefinitionScanner` сканирует пакет, ищет классы с этими аннотациями (через meta-annotation `@Component`), регистрирует как **BeanDefinition**.
+@Service — семантика business logic. Non-technical marker для service layer classes.
 
-Дальше — обычная фабрика бинов.
+@Repository — семантика data access. Плюс важное — Spring оборачивает исключения в DataAccessException через PersistenceExceptionTranslationPostProcessor. Database vendor exceptions translated к consistent Spring hierarchy.
 
----
+@Controller — MVC-контроллер. Возвращает view names (не response body).
 
-## 4. @Configuration
+@RestController = @Controller plus @ResponseBody. JSON everywhere convenience. Standard для REST APIs.
 
-Класс с `@Bean`-методами.
+Реализация. ClassPathBeanDefinitionScanner сканирует пакет. Ищет классы с этими аннотациями (через meta-annotation @Component). Регистрирует как BeanDefinition. Дальше — обычная фабрика бинов создаёт instances.
 
+Semantic naming важен для readability. Reader знает role класса по annotation. Non-functional difference но important для code understanding.
+
+## @Configuration и CGLib proxy
+
+Класс с @Bean методами:
 ```java
 @Configuration
 class AppConfig {
@@ -65,40 +69,33 @@ class AppConfig {
 }
 ```
 
-### 4.1 Реализация
+Реализация. ConfigurationClassPostProcessor (BeanFactoryPostProcessor). Находит все @Configuration классы. Читает их @Bean методы. Регистрирует каждый метод как BeanDefinition (factory method).
 
-`ConfigurationClassPostProcessor` (BeanFactoryPostProcessor):
-1. Находит все `@Configuration` классы.
-2. Читает их `@Bean` методы.
-3. Регистрирует каждый метод как BeanDefinition (factory method).
-
-### 4.2 CGLib proxy
-
-`@Configuration` класс **оборачивается в CGLib proxy**. Зачем?
-
+CGLib proxy. @Configuration класс оборачивается в CGLib proxy. Зачем?
 ```java
 @Configuration
 class Cfg {
     @Bean DataSource ds() { return new HikariDataSource(...); }
     @Bean JdbcTemplate jdbc() {
-        return new JdbcTemplate(ds());   // ← если бы не прокси, было бы второй DataSource
+        return new JdbcTemplate(ds());   // если бы не прокси, было бы второй DataSource
     }
 }
 ```
 
-Прокси перехватывает `ds()` внутри `jdbc()` → возвращает **тот же** singleton, не создаёт новый.
+Прокси перехватывает ds() внутри jdbc() — возвращает тот же singleton, не создаёт новый. Ensures @Bean methods return same instance regardless of call location.
+
+Без proxy — ds() вызывается directly, creates new HikariDataSource каждый раз. Bean registration semantics broken. Multiple DataSources в container вместо singleton.
 
 Отключить (быстрее старт, но без гарантии singleton внутри):
 ```java
 @Configuration(proxyBeanMethods = false)
 ```
 
----
+Используется в auto-configuration classes где @Bean methods не call each other. Optimization.
 
-## 5. @Bean
+## @Bean
 
-Метод как factory для bean.
-
+Метод как factory для bean:
 ```java
 @Bean
 DataSource dataSource() {
@@ -112,19 +109,15 @@ DataSource specialDs() { ... }
 MyBean myBean() { ... }
 ```
 
-Использование:
-- Сторонние классы (не можешь навесить `@Component`).
-- Условная логика создания.
-- Auto-configuration.
+Использование. Сторонние классы (не можешь навесить @Component). Условная логика создания. Auto-configuration.
 
-Имя bean = имя метода (или явно через `@Bean(name = "...")`).
+Имя bean = имя метода (или явно через @Bean(name = "...")). Multiple names via name = {"n1", "n2"}.
 
----
+initMethod / destroyMethod для lifecycle callbacks. Called после construction / перед destruction. Alternative to InitializingBean/DisposableBean interfaces.
 
-## 6. @Autowired
+## @Autowired
 
-Внедрение зависимости.
-
+Внедрение зависимости:
 ```java
 @Service
 class OrderService {
@@ -138,33 +131,27 @@ class OrderService {
 }
 ```
 
-Правило: **constructor injection**. С Spring 4.3+ на **единственном** конструкторе `@Autowired` не нужен.
+Правило constructor injection. Immutability. Explicit dependencies. Easier testing (no reflection required).
 
-### 6.1 Реализация
+С Spring 4.3+ на единственном конструкторе @Autowired не нужен. Implicit annotation.
 
-**`AutowiredAnnotationBeanPostProcessor`** (BeanPostProcessor):
-1. При создании bean — сканирует поля/сеттеры/конструкторы с `@Autowired`.
-2. Для каждой зависимости — резолвит через `BeanFactory.getBean(type)`.
-3. Injectит.
+Реализация. AutowiredAnnotationBeanPostProcessor (BeanPostProcessor). При создании bean — сканирует поля/сеттеры/конструкторы с @Autowired. Для каждой зависимости — резолвит через BeanFactory.getBean(type). Injectит через reflection (или constructor).
 
-### 6.2 @Autowired(required = false)
-
-Не падать если нет bean:
+@Autowired(required = false) не падать если нет bean:
 ```java
 @Autowired(required = false) SomeOptional optional;
 ```
 
-Или через `Optional<T>`:
+Или через Optional<T>:
 ```java
 @Autowired Optional<SomeOptional> optional;
 ```
 
----
+Cleaner API для optional dependencies. Explicit Optional wrapping preferred over required=false.
 
-## 7. @Qualifier
+## @Qualifier
 
 Уточняет какой bean, когда несколько кандидатов:
-
 ```java
 @Bean("fast") FnoService fast() { ... }
 @Bean("slow") FnoService slow() { ... }
@@ -172,25 +159,23 @@ class OrderService {
 @Autowired @Qualifier("fast") FnoService svc;
 ```
 
----
+Handles multiple beans same type. Explicit choice.
 
-## 8. @Primary
+## @Primary
 
 Метка «этот по умолчанию»:
-
 ```java
 @Bean @Primary FnoService fast() { ... }
 @Bean FnoService slow() { ... }
 
-@Autowired FnoService svc;   // → fast (потому что @Primary)
+@Autowired FnoService svc;   // fast (потому что @Primary)
 ```
 
----
+Default choice when multiple beans same type. @Qualifier overrides @Primary когда explicitly specified.
 
-## 9. @Lazy
+## @Lazy
 
-Bean создаётся не при старте, а при первом использовании.
-
+Bean создаётся не при старте, а при первом использовании:
 ```java
 @Component @Lazy
 class ExpensiveBean { ... }
@@ -201,13 +186,11 @@ class ExpensiveBean { ... }
 @Autowired @Lazy ExpensiveBean bean;   // прокси, реальный при первом вызове
 ```
 
-Использование:
-- Тяжёлые бины (не создавать если не нужны).
-- Разрешение циклических зависимостей.
+Использование. Тяжёлые бины (не создавать если не нужны). Разрешение циклических зависимостей.
 
----
+Circular dependency resolution. @Lazy на injection creates proxy — actual bean fetched on first method call. Both sides can initialize через proxy references.
 
-## 10. @Scope
+## @Scope
 
 Область жизни bean:
 ```java
@@ -215,26 +198,19 @@ class ExpensiveBean { ... }
 @Component @Scope("request") class RequestContext { }   // web-only
 ```
 
-Scopes: `singleton` (default), `prototype`, `request`, `session`, `application`.
+Scopes. singleton (default) — one instance per container. prototype — new instance каждый раз. request — one instance per HTTP request. session — one per HTTP session. application — one per servlet context.
 
-Реализация: `BeanFactory.getBean()` каждый раз для prototype; кэш для singleton.
+Реализация. BeanFactory.getBean() каждый раз для prototype (new instance created). Кэш для singleton (same instance returned). Web scopes tie к servlet lifecycle.
 
----
-
-## 11. @EnableAutoConfiguration
+## @EnableAutoConfiguration
 
 Магия Spring Boot. Автоматически конфигурирует бины по classpath.
 
-### 11.1 Реализация
+Реализация. При старте. Читаются файлы META-INF/spring.factories (Boot 2) или META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports (Boot 3) из всех jar'ов. Получается список auto-configuration классов. Каждый — @Configuration с @Conditional* условиями. Если условия выполнены — бины регистрируются.
 
-При старте:
-1. Читаются файлы `META-INF/spring.factories` (Boot 2) или `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` (Boot 3) из всех jar'ов.
-2. Получается список auto-configuration классов.
-3. Каждый — `@Configuration` с `@Conditional*` условиями.
-4. Если условия выполнены — бины регистрируются.
+Пример flow. Spring Boot Data JPA starter в classpath — includes JpaAutoConfiguration. Condition — @ConditionalOnClass(EntityManagerFactory.class). Если EntityManagerFactory на classpath — configuration applied — beans registered.
 
-### 11.2 Отключение
-
+Отключение специфических autoconfigurations:
 ```java
 @SpringBootApplication(exclude = { DataSourceAutoConfiguration.class })
 ```
@@ -247,12 +223,11 @@ spring:
       - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
 ```
 
----
+Sometimes needed когда default auto-configuration incompatible с specific requirements.
 
-## 12. @Conditional*
+## @Conditional* family
 
-Регистрация bean по условию.
-
+Регистрация bean по условию:
 ```java
 @Bean
 @ConditionalOnClass(DataSource.class)
@@ -261,39 +236,43 @@ spring:
 DataSource dataSource() { ... }
 ```
 
-Виды:
-- **@ConditionalOnClass** — есть класс в classpath.
-- **@ConditionalOnMissingClass** — нет.
-- **@ConditionalOnBean** — есть bean этого типа.
-- **@ConditionalOnMissingBean** — нет (юзер не определил свой).
-- **@ConditionalOnProperty(name, havingValue, matchIfMissing)** — по property.
-- **@ConditionalOnWebApplication** — web-context.
-- **@ConditionalOnJava** — Java version.
-- **@Conditional(MyCondition.class)** — custom.
+Виды conditions.
 
-Основа Spring Boot auto-configuration.
+@ConditionalOnClass — есть класс в classpath. Enable feature только если dependency available.
 
----
+@ConditionalOnMissingClass — нет класса. Opposite.
 
-## 13. @ComponentScan
+@ConditionalOnBean — есть bean этого типа. Chain configurations.
 
-Сканирование classpath на bean'ы.
+@ConditionalOnMissingBean — нет bean. User did not provide own — use default. Enables user overrides.
 
+@ConditionalOnProperty(name, havingValue, matchIfMissing) — по property value. Feature flags.
+
+@ConditionalOnWebApplication — web context.
+
+@ConditionalOnJava — Java version. Version-specific configurations.
+
+@Conditional(MyCondition.class) — custom logic. Extend for specific requirements.
+
+Основа Spring Boot auto-configuration. Combining conditions enables sophisticated intelligent defaults.
+
+## @ComponentScan
+
+Сканирование classpath на bean'ы:
 ```java
 @ComponentScan(basePackages = {"kz.gov.kgd.isna.knp", "kz.gov.kgd.isna.commons"})
 class Config { }
 ```
 
-По умолчанию (внутри `@SpringBootApplication`) — сканирует **пакет класса с аннотацией + подпакеты**.
+По умолчанию (внутри @SpringBootApplication) — сканирует пакет класса с аннотацией plus подпакеты.
 
-Реализация: `ClassPathScanningCandidateComponentProvider`.
+Реализация. ClassPathScanningCandidateComponentProvider. Reads class files. Checks for stereotype annotations. Registers matching classes as BeanDefinitions.
 
----
+Package structure critical. Application class в корне scanned package. Sub-packages для different concerns. Everything within reach.
 
-## 14. @Value
+## @Value
 
-Injection value из configuration.
-
+Injection value из configuration:
 ```java
 @Value("${server.port}") int port;
 @Value("${app.name:defaultName}") String appName;
@@ -301,14 +280,13 @@ Injection value из configuration.
 @Value("${servers}") List<String> servers;                  // comma-separated
 ```
 
-Реализация: `Environment.getProperty(...)` + placeholder resolution.
+Реализация. Environment.getProperty(...) plus placeholder resolution. SpEL expressions evaluated at injection.
 
----
+Detailed usage в файле 57. Here — annotation semantic reminder.
 
-## 15. @ConfigurationProperties
+## @ConfigurationProperties
 
-Группа properties как typed bean.
-
+Группа properties как typed bean:
 ```java
 @ConfigurationProperties(prefix = "knp")
 @Component
@@ -319,50 +297,36 @@ public class KnpProperties {
 }
 ```
 
-Уже разбирали в `57-spring-boot-config-detailed.md`.
+Уже разбирали в файле 57. Реализация — ConfigurationPropertiesBinder через reflection plus type conversion.
 
-Реализация: `ConfigurationPropertiesBinder` — reflection + type conversion.
+Preferred over @Value для multiple related properties. Type safety, validation, IDE support.
 
----
-
-## 16. @Profile
+## @Profile
 
 Bean/config активен только при активном profile:
-
 ```java
 @Configuration @Profile("prod") class ProdConfig { }
 @Component @Profile({"dev", "test"}) class DevOnlyBean { }
 @Component @Profile("!prod") class NonProdBean { }
 ```
 
-Реализация: `ProfileCondition` (частный случай `@Conditional`).
+Реализация. ProfileCondition (частный случай @Conditional). Checks active profiles from Environment.
 
----
+Enables completely different configurations per environment. Discussed in file 57.
 
-## 17. @EnableXxx аннотации
+## @EnableXxx pattern
 
-Spring/Boot использует много enabler'ов:
+Spring/Boot использует много enabler'ов.
 
-- **@EnableTransactionManagement** — включает `@Transactional` через AOP.
-- **@EnableAsync** — включает `@Async`.
-- **@EnableScheduling** — включает `@Scheduled`.
-- **@EnableCaching** — включает `@Cacheable`.
-- **@EnableAspectJAutoProxy** — включает AOP.
-- **@EnableConfigurationProperties(Xxx.class)** — регистрирует @ConfigurationProperties bean.
-- **@EnableWebSecurity** — Security config.
-- **@EnableJpaRepositories** — Spring Data JPA.
-- **@EnableFeignClients** — Feign.
+@EnableTransactionManagement — включает @Transactional через AOP. @EnableAsync — включает @Async. @EnableScheduling — включает @Scheduled. @EnableCaching — включает @Cacheable. @EnableAspectJAutoProxy — включает AOP infrastructure. @EnableConfigurationProperties(Xxx.class) — регистрирует @ConfigurationProperties bean. @EnableWebSecurity — Security config. @EnableJpaRepositories — Spring Data JPA. @EnableFeignClients — Feign.
 
-Механика: `@Import` → загружает specific configuration classes.
+Механика. @Import загружает specific configuration classes. Bootstrap beans plus infrastructure для feature.
 
-В Spring Boot большинство `@Enable` автоматически (не нужны явно) — auto-configuration включает.
+В Spring Boot большинство @Enable автоматически (не нужны явно) — auto-configuration включает when appropriate dependencies present. Manual usage для specific control или для non-Boot Spring applications.
 
----
+## @Async
 
-## 18. @Async
-
-Метод выполняется в **другом потоке**.
-
+Метод выполняется в другом потоке:
 ```java
 @Service
 class NotificationService {
@@ -378,36 +342,33 @@ class NotificationService {
 }
 ```
 
-Требует `@EnableAsync`.
+Требует @EnableAsync.
 
-### 18.1 Реализация
+Реализация. AOP-прокси перехватывает вызов. Сабмитит в TaskExecutor. Возвращает Future (или void).
 
-AOP-прокси перехватывает вызов → сабмитит в `TaskExecutor` → возвращает `Future` (или void).
+Кавет. Self-invocation — та же проблема что @Transactional. Method call через this bypasses proxy. Не async.
 
-### 18.2 Кавет
+Void методы — не узнаешь про exception. Использовать CompletableFuture для error handling.
 
-- **Self-invocation** — та же проблема, что @Transactional.
-- Void методы — не узнаешь про exception; используй `CompletableFuture`.
-- По default пул — `SimpleAsyncTaskExecutor` (создаёт thread на вызов!) — плохо для нагрузки; настрой свой:
-  ```java
-  @Bean(name = "taskExecutor")
-  TaskExecutor executor() {
-      var e = new ThreadPoolTaskExecutor();
-      e.setCorePoolSize(10);
-      e.setMaxPoolSize(50);
-      e.setQueueCapacity(200);
-      e.setThreadNamePrefix("async-");
-      e.initialize();
-      return e;
-  }
-  ```
+По default пул — SimpleAsyncTaskExecutor (создаёт thread на вызов). Плохо для нагрузки. Настрой свой:
+```java
+@Bean(name = "taskExecutor")
+TaskExecutor executor() {
+    var e = new ThreadPoolTaskExecutor();
+    e.setCorePoolSize(10);
+    e.setMaxPoolSize(50);
+    e.setQueueCapacity(200);
+    e.setThreadNamePrefix("async-");
+    e.initialize();
+    return e;
+}
+```
 
----
+Bounded pool с queue. Prevents unlimited thread creation. Production-ready configuration.
 
-## 19. @Scheduled
+## @Scheduled
 
-Cron / periodic tasks.
-
+Cron / periodic tasks:
 ```java
 @Scheduled(fixedRate = 5000)              // каждые 5 сек
 public void every5Sec() { ... }
@@ -422,34 +383,26 @@ public void daily() { ... }
 public void configurable() { ... }
 ```
 
-Требует `@EnableScheduling`.
+Требует @EnableScheduling.
 
-### 19.1 Реализация
+Реализация. ScheduledAnnotationBeanPostProcessor находит @Scheduled методы. Регистрирует в TaskScheduler. TaskScheduler дергает according к schedule.
 
-`ScheduledAnnotationBeanPostProcessor` находит `@Scheduled` методы, регистрирует в `TaskScheduler`.
+Кавет multi-instance. Если приложение в K8s с 3 репликами — все 3 запустят cron параллельно. Duplicate execution problem.
 
-### 19.2 Кавет multi-instance
-
-Если приложение в K8s с 3 репликами — все 3 запустят cron параллельно.
-
-Fix: **ShedLock** — distributed lock.
-
+Fix ShedLock — distributed lock:
 ```java
 @Scheduled(cron = "...")
 @SchedulerLock(name = "myTask", lockAtMostFor = "PT30S")
 public void task() { ... }
 ```
 
-Реальный ИСНА-кейс `knp-fno21-shedlock-stale-image-dup-regnum` — без ShedLock дубли.
+Only one instance executes at a time. Lock stored в shared database.
 
----
+Реальный ИСНА-кейс knp-fno21-shedlock-stale-image-dup-regnum — без ShedLock дубли. Fix — deploy с ShedLock plus proper lock configuration.
 
-## 20. @Transactional
+## @Transactional
 
-Обёртка транзакций через AOP-proxy.
-
-Разбирали детально в файлах 32-35.
-
+Обёртка транзакций через AOP-proxy. Разбирали детально в файлах 32-35:
 ```java
 @Transactional
 public void save(Order o) { ... }
@@ -459,12 +412,11 @@ public void save(Order o) { ... }
 public Order read(Long id) { ... }
 ```
 
----
+Полный deep dive в earlier files. Here — brief reminder что это AOP-proxy based mechanism through TransactionInterceptor.
 
-## 21. @Cacheable
+## @Cacheable
 
-Кэширование результата метода.
-
+Кэширование результата метода:
 ```java
 @Cacheable("orders")
 public Order getOrder(Long id) { ... }
@@ -479,18 +431,19 @@ public void deleteOrder(Order o) { ... }
 public Order updateOrder(Order o) { ... }
 ```
 
-Требует `@EnableCaching` + cache-manager (Hazelcast, Caffeine, Redis).
+Требует @EnableCaching plus cache-manager (Hazelcast, Caffeine, Redis).
 
-Через AOP-proxy.
+Реализация через AOP-proxy. First call — actual method invoked, result cached. Subsequent calls с same key — cached value returned без method execution.
 
-**Self-invocation** — та же проблема.
+@CacheEvict removes entries. @CachePut updates cache plus returns method result. @Caching для combining multiple operations.
 
----
+Self-invocation — та же проблема. this-based calls bypass proxy.
 
-## 22. @PostConstruct / @PreDestroy
+Cache keys default from method arguments. Custom keys через SpEL (key = "#id").
 
-Lifecycle-хуки bean.
+## @PostConstruct / @PreDestroy
 
+Lifecycle-хуки bean:
 ```java
 @Component
 class MyBean {
@@ -506,18 +459,15 @@ class MyBean {
 }
 ```
 
-С Spring 6 / Java 9+ — из пакета `jakarta.annotation.*` (не `javax.annotation.*`).
+С Spring 6 / Java 9+ — из пакета jakarta.annotation.* (не javax.annotation.*). Java module system change.
 
-Реализация: `CommonAnnotationBeanPostProcessor`.
+Реализация. CommonAnnotationBeanPostProcessor. Invoked after dependency injection (PostConstruct) plus before bean destruction (PreDestroy).
 
-**Кавет**: `@Transactional` НЕ работает в `@PostConstruct` (bean ещё не проксирован).
+Кавет. @Transactional НЕ работает в @PostConstruct. Bean ещё не проксирован. Fix через ApplicationRunner или @EventListener(ContextRefreshedEvent.class) для post-startup logic.
 
----
+## @EventListener
 
-## 23. @EventListener
-
-Подписка на events.
-
+Подписка на events:
 ```java
 @Component
 class OrderListener {
@@ -529,58 +479,57 @@ class OrderListener {
 }
 ```
 
-Синхронно (в том же потоке что publishEvent).
+Синхронно (в том же потоке что publishEvent). Event handled inline с publishing thread.
 
-С `@Async` — async.
+С @Async — async execution. Non-blocking publishing.
 
-### 23.1 @TransactionalEventListener
-
+@TransactionalEventListener для transaction-aware events:
 ```java
 @TransactionalEventListener(phase = AFTER_COMMIT)
 public void afterCommit(OrderCreated event) { ... }
 ```
 
-Только после успешного commit tx.
+Только после успешного commit tx. Prevents events firing на rolled back transactions. Разбирали в файле 34.
 
-Разбирали в `34-transactional-advanced.md`.
+## @RestController vs @Controller
 
----
-
-## 24. @RestController vs @Controller
-
-- **@Controller** — MVC, возвращает view name (Thymeleaf/JSP).
-- **@RestController** = `@Controller` + `@ResponseBody` на всех методах.
-
+@Controller — MVC, возвращает view name (Thymeleaf/JSP):
 ```java
 @Controller
 class OrderController {
     @GetMapping("/orders")
     public String list(Model model) {
         model.addAttribute("orders", ...);
-        return "orders";   // → orders.html
-    }
-}
-
-@RestController
-class OrderRestController {
-    @GetMapping("/api/orders")
-    public List<Order> list() {
-        return svc.findAll();   // → JSON
+        return "orders";   // orders.html
     }
 }
 ```
 
-Обычно микросервисы — `@RestController`.
+@RestController = @Controller plus @ResponseBody на всех методах:
+```java
+@RestController
+class OrderRestController {
+    @GetMapping("/api/orders")
+    public List<Order> list() {
+        return svc.findAll();   // JSON
+    }
+}
+```
 
----
+Обычно микросервисы — @RestController. Traditional web apps — @Controller.
 
-## 25. @RequestMapping и его варианты
+Difference. @Controller returns view names (rendered by template engine). @RestController returns objects (serialized via Jackson к JSON).
 
+## @RequestMapping и variants
+
+Full request mapping:
 ```java
 @RequestMapping(value = "/api/orders", method = RequestMethod.GET)
 public List<Order> list() { }
+```
 
-// или короче
+Shortcuts более common:
+```java
 @GetMapping("/api/orders")
 public List<Order> list() { }
 
@@ -606,10 +555,9 @@ class OrderController {
 }
 ```
 
----
+## Параметры контроллера
 
-## 26. Параметры контроллера
-
+Rich API для extracting request data:
 ```java
 @GetMapping("/orders/{id}")
 public Order get(@PathVariable Long id) { }               // URL path
@@ -627,9 +575,9 @@ public Order create(@RequestBody @Valid OrderDto dto,
 public User currentUser(@AuthenticationPrincipal Jwt jwt) { }
 ```
 
----
+@PathVariable — URL path segments. @RequestParam — query parameters. @RequestBody — HTTP body (deserialized via Jackson). @RequestHeader — HTTP headers. @AuthenticationPrincipal — current authenticated user.
 
-## 27. @Valid / @Validated
+## @Valid / @Validated
 
 Bean Validation (JSR-380):
 ```java
@@ -643,14 +591,15 @@ class OrderDto {
 public Order create(@Valid @RequestBody OrderDto dto) { }
 ```
 
-При invalid → `MethodArgumentNotValidException` → 400.
+При invalid — MethodArgumentNotValidException — 400 response.
 
----
+Standard validation annotations. @NotNull, @NotBlank, @Size, @Min, @Max, @Email, @Pattern. Composable для complex validations.
 
-## 28. @ExceptionHandler / @ControllerAdvice
+Custom validators possible через extending framework.
 
-Централизованная обработка exceptions.
+## @ExceptionHandler / @ControllerAdvice
 
+Централизованная обработка exceptions:
 ```java
 @ControllerAdvice
 class GlobalExceptionHandler {
@@ -667,91 +616,95 @@ class GlobalExceptionHandler {
 }
 ```
 
-`@ControllerAdvice` — global (все controllers) или scoped:
+@ControllerAdvice — global (все controllers) или scoped:
 ```java
 @ControllerAdvice(basePackages = "kz.gov.kgd.isna.knp.api")
 ```
 
----
+Applies to controllers в specified package. Centralized error handling instead of repeated try/catch в каждом controller method.
 
-## 29. Другие полезные
+Consistent error responses. Business exceptions mapped к appropriate HTTP status codes. Client sees uniform error format.
 
-### 29.1 @Order
+## Другие полезные аннотации
 
-Приоритет beans при инжекции коллекций / автопрокси:
+@Order приоритет beans при инжекции коллекций / автопрокси:
 ```java
 @Component @Order(1) class Handler1 { }
 @Component @Order(2) class Handler2 { }
 
-@Autowired List<Handler> handlers;   // → [Handler1, Handler2]
+@Autowired List<Handler> handlers;   // [Handler1, Handler2]
 ```
 
-### 29.2 @Import
+Deterministic ordering. Useful для chain-of-responsibility patterns.
 
-Импорт additional Configuration classes:
+@Import импорт additional Configuration classes:
 ```java
 @Configuration
 @Import({DbConfig.class, SecurityConfig.class})
 class AppConfig { }
 ```
 
-Основа `@EnableXxx` аннотаций.
+Composition configurations. Основа @Enable* аннотаций. @EnableXxx imports specific configuration classes internally.
 
-### 29.3 @PropertySource
-
-Дополнительный source properties:
+@PropertySource дополнительный source properties:
 ```java
 @Configuration
 @PropertySource("classpath:custom.properties")
 class Config { }
 ```
 
-Устарело в пользу yml + profile-specific.
+Устарело в пользу yml plus profile-specific. Rarely used в modern applications.
 
-### 29.4 @Retryable (Spring Retry)
-
-Retry метода при exception:
+@Retryable (Spring Retry) retry метода при exception:
 ```java
 @Retryable(retryFor = IOException.class, maxAttempts = 3, backoff = @Backoff(delay = 1000))
 public String call() { ... }
 ```
 
----
+Discussed в файле 52 detail. AOP-proxy based similar к @Transactional.
 
-## 30. Собесные вопросы
+## Итоги
 
-1. **Что делает @SpringBootApplication?** — Три в одной: `@SpringBootConfiguration`, `@EnableAutoConfiguration`, `@ComponentScan`.
-2. **Разница @Component/@Service/@Repository?** — Семантика + `@Repository` даёт exception translation.
-3. **Что делает @Configuration?** — Класс с @Bean методами; проксируется CGLib для singleton гарантии.
-4. **Что делает @Bean?** — Метод как factory для bean.
-5. **Как работает @Autowired?** — `AutowiredAnnotationBeanPostProcessor` через reflection; резолвит по типу.
-6. **Разница @Primary и @Qualifier?** — Primary: этот default; Qualifier: уточнить какой.
-7. **Что делает @Lazy?** — Bean создаётся при первом использовании (не при старте).
-8. **@Scope prototype — когда?** — Новый экземпляр каждый раз; для stateful/mutable объектов.
-9. **Как работает @EnableAutoConfiguration?** — Читает `spring.factories` / `AutoConfiguration.imports`, применяет `@Conditional*` условия.
-10. **Что такое @ConditionalOnXxx?** — Регистрация bean по условию (класс в classpath, bean отсутствует, property установлено).
-11. **@Value vs @ConfigurationProperties?** — Value: одно свойство; ConfigurationProperties: типизированная группа.
-12. **@Profile — как работает?** — `ProfileCondition` (частный @Conditional) на активном profile.
-13. **@Async — реализация?** — AOP-proxy сабмитит в TaskExecutor; кавет self-invocation.
-14. **@Scheduled + K8s — проблема?** — Все реплики запускают → ShedLock для distributed lock.
-15. **@Transactional — как?** — AOP-proxy (CGLib) с TransactionInterceptor.
-16. **@RestController vs @Controller?** — RestController = Controller + @ResponseBody на всех методах.
-17. **@Valid — где работает?** — На параметрах методов (контроллеров) с типом DTO.
-18. **@ControllerAdvice?** — Глобальный @ExceptionHandler для всех controllers.
-19. **@PostConstruct — когда?** — После injection всех зависимостей, до готовности bean.
-20. **@Transactional в @PostConstruct — работает?** — Нет; bean ещё не проксирован.
+@SpringBootApplication composition из three annotations. @SpringBootConfiguration plus @EnableAutoConfiguration plus @ComponentScan. Central entry point.
 
----
+Stereotypes (@Component/@Service/@Repository/@Controller) семантика plus @Repository exception translation. Regular beans registered via ClassPathBeanDefinitionScanner.
 
-## Итог
+@Configuration proxied через CGLib для singleton гарантии в @Bean method calls. proxyBeanMethods=false для optimization в auto-configuration.
 
-- **@SpringBootApplication** = 3-в-1.
-- **Stereotypes** = маркеры для регистрации.
-- **@Configuration** + **@Bean** = ручные фабрики.
-- **@Autowired** через `AutowiredAnnotationBeanPostProcessor`.
-- **@EnableAutoConfiguration** + **@Conditional*** = магия Boot.
-- **@Value** / **@ConfigurationProperties** для конфига.
-- **@Async / @Scheduled / @Transactional / @Cacheable** через **AOP-proxy** (все страдают self-invocation).
-- **@RestController** для REST APIs; **@ControllerAdvice** для error handling.
+@Bean methods as factories. Third-party classes без @Component. Conditional bean creation.
 
-Следующий — `61-spring-mvc-controllers-internals.md`.
+@Autowired через AutowiredAnnotationBeanPostProcessor plus reflection. Constructor injection preferred. Optional<T> для optional dependencies.
+
+@Qualifier resolves ambiguity. @Primary sets default. @Lazy defers creation.
+
+@Scope controls lifecycle. Singleton default. Prototype, request, session, application альтернативы.
+
+@EnableAutoConfiguration reads spring.factories/AutoConfiguration.imports. Applies conditional configurations based на classpath.
+
+@Conditional* family enables intelligent defaults. @ConditionalOnClass, @ConditionalOnBean, @ConditionalOnMissingBean, @ConditionalOnProperty стандартные.
+
+@ComponentScan discovers beans. Package structure aligned с scan requirements.
+
+@Value simple property injection. @ConfigurationProperties typed groups preferred для multiple related properties.
+
+@Profile conditional based на active profiles. @Enable* pattern для feature toggles.
+
+@Async, @Scheduled, @Transactional, @Cacheable через AOP-proxy. Все страдают self-invocation limitation.
+
+@PostConstruct/@PreDestroy lifecycle callbacks. jakarta.annotation.* с Spring 6/Java 9+. @Transactional не работает в @PostConstruct.
+
+@EventListener для synchronous events. @Async plus @EventListener для async. @TransactionalEventListener для transaction-aware.
+
+@RestController = @Controller plus @ResponseBody. REST APIs standard.
+
+@RequestMapping и HTTP method shortcuts для routing.
+
+Parameter annotations — @PathVariable, @RequestParam, @RequestBody, @RequestHeader, @AuthenticationPrincipal.
+
+@Valid triggers Bean Validation. @ControllerAdvice centralized exception handling.
+
+Utility annotations — @Order, @Import, @PropertySource, @Retryable.
+
+Understanding annotation internals enables predicting behavior plus diagnosing issues. Not magic — well-defined framework mechanisms.
+
+Дальше — Spring MVC controllers internals с deep dive в DispatcherServlet, HandlerMapping, HandlerAdapter, argument resolution, response processing.

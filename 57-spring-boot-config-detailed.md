@@ -1,82 +1,67 @@
-# 57. Конфигурация Spring Boot (yml, env, приоритеты)
+# 57. Spring Boot конфигурация: PropertySource, profiles, ConfigurationProperties, secrets
 
-Все способы конфигурации Spring Boot приложения. Приоритеты. Реализация.
+## Зачем нужна глубокая конфигурация
 
----
+Разработчик который недавно в Spring Boot обычно использует application.yml как «place где положить настройки». Знает про profiles — dev, prod. Считает достаточным. Реальность production приносит complications. Как передать secret database password? Не хочется коммитить в git. Как override configuration для specific environment без rebuild приложения? Как валидировать что required properties provided на startup? Как читать configuration из external systems (Consul, Vault) а не только файлов?
 
-## 1. Проблема
+Разница между разработчиком «использующим yml» и «понимающим Spring configuration» проявляется в operational flexibility. Первый застревает при deployment scenarios — переопределение property требует rebuild, secrets вваливают plain text в yml, missing properties detected только когда endpoint hit. Второй знает PropertySource hierarchy — command-line args override env vars override yml. Знает что @ConfigurationProperties provides typed configuration с validation vs @Value string extraction. Знает что secrets injected через env vars from K8s Secrets or Vault vault. Знает spring.config.import для reading configuration from Consul или other external sources.
 
-Приложение должно работать по-разному в:
-- **Local dev** — H2, HTTP :8080, DEBUG logs.
-- **CI/test** — Testcontainers PG.
-- **Preprod** — реальный PG, но test data.
-- **Prod** — реальный PG, real users.
+В этом файле разберём Spring configuration comprehensively. Fundamental problem конфигурации для разных environments. PropertySource как abstraction. Full hierarchy priorities. application.yml plus properties files. Profiles mechanism. Environment variables mapping (relaxed binding). Command-line arguments. Placeholders. @Value simple injection. @ConfigurationProperties typed groups. bootstrap.yml legacy. spring.config.import modern approach. External configuration. Secret encryption strategies. Runtime configuration refresh. Introspection through Actuator. Реализация под капотом.
 
-Код **одинаковый**, отличается только configuration.
+## Fundamental problem конфигурации
 
-Spring Boot даёт мощный механизм: **PropertySource** — иерархия источников конфига.
+Приложение должно работать по-разному в. Local dev — H2, HTTP :8080, DEBUG logs. CI/test — Testcontainers PostgreSQL. Preprod — реальный PG но test data. Prod — реальный PG, real users.
 
----
+Код одинаковый, отличается только configuration. This principle 12-factor apps — configuration в environment, code portable across deployments.
 
-## 2. Что такое PropertySource
+Spring Boot даёт мощный механизм — PropertySource как abstraction иерархия источников конфига. Multiple sources combined в predictable priority order. Application code queries Environment abstraction без knowing exact source.
 
-Абстракция «источник key=value».
+## PropertySource
 
-Каждый PropertySource — либо файл, либо env, либо ещё что-то.
+Абстракция «источник key=value». Каждый PropertySource — либо файл, либо env, либо ещё что-то (JNDI, ServletContext parameters).
 
-Приложение видит их через `Environment` bean:
+Приложение видит их через Environment bean:
 ```java
 @Autowired Environment env;
 
 String url = env.getProperty("spring.datasource.url");
 ```
 
-Spring перебирает source'ы по приоритету → возвращает первое найденное значение.
+Spring перебирает source'ы по приоритету — возвращает первое найденное значение. First match wins. Higher priority sources override lower.
 
----
+## Полный порядок приоритетов
 
-## 3. Все источники PropertySource
+От высшего приоритета к низшему:
 
-**Полный порядок** (от **высшего** приоритета к **низшему**):
+1. DevTools global settings (~/.spring-boot-devtools.properties).
+2. @TestPropertySource аннотации в тестах.
+3. SpringApplication.setDefaultProperties (programmatic).
+4. @SpringBootTest properties.
+5. Command-line arguments (--server.port=9090).
+6. JSON в SPRING_APPLICATION_JSON env var.
+7. ServletConfig init parameters.
+8. ServletContext init parameters.
+9. JNDI attributes (java:comp/env).
+10. Java System properties (-Dserver.port=9090).
+11. OS environment variables (SERVER_PORT=9090).
+12. Профиль-специфичные properties снаружи jar (./application-prod.yml).
+13. Профиль-специфичные properties внутри jar (classpath:application-prod.yml).
+14. Общие properties снаружи jar (./application.yml).
+15. Общие properties внутри jar (classpath:application.yml).
+16. @PropertySource на @Configuration.
+17. Default properties (SpringApplication.setDefaultProperties).
 
-1. **DevTools global settings** (`~/.spring-boot-devtools.properties`).
-2. **`@TestPropertySource`** аннотации в тестах.
-3. **`SpringApplication.setDefaultProperties`** (programmatic).
-4. **`@SpringBootTest` properties**.
-5. **Command-line arguments** (`--server.port=9090`).
-6. **JSON в `SPRING_APPLICATION_JSON`** env var.
-7. **`ServletConfig` init parameters**.
-8. **`ServletContext` init parameters**.
-9. **JNDI attributes** (`java:comp/env`).
-10. **Java System properties** (`-Dserver.port=9090`).
-11. **OS environment variables** (`SERVER_PORT=9090`).
-12. **Профиль-специфичные properties снаружи jar** (`./application-prod.yml`).
-13. **Профиль-специфичные properties внутри jar** (`classpath:application-prod.yml`).
-14. **Общие properties снаружи jar** (`./application.yml`).
-15. **Общие properties внутри jar** (`classpath:application.yml`).
-16. **`@PropertySource`** на `@Configuration`.
-17. **Default properties** (`SpringApplication.setDefaultProperties`).
+Чем выше — тем важнее (перекрывает нижнее).
 
-Чем **выше** — тем **важнее** (перекрывает нижнее).
+На практике обычно в порядке важности сверху. Command-line (--foo=bar). Env vars (FOO=bar). JVM props (-Dfoo=bar). application-{profile}.yml (external / classpath). application.yml (external / classpath). Defaults.
 
-### 3.1 На практике
+Overriding cascade. Deployment-time changes через command-line или env. Environment-specific через profile files. Default в code через yml. Predictable behavior.
 
-Обычно в порядке важности сверху:
-1. **Command-line** (`--foo=bar`).
-2. **Env vars** (`FOO=bar`).
-3. **JVM props** (`-Dfoo=bar`).
-4. **`application-{profile}.yml`** (external / classpath).
-5. **`application.yml`** (external / classpath).
-6. Defaults.
+## application.yml и application.properties
 
----
+Основные файлы конфига в src/main/resources.
 
-## 4. application.yml / application.properties
-
-Основные файлы конфига в `src/main/resources/`.
-
-### 4.1 YAML
-
+YAML format popular из-за vложенных structures:
 ```yaml
 server:
   port: 8080
@@ -97,9 +82,7 @@ logging:
     kz.gov.kgd.isna: DEBUG
 ```
 
-### 4.2 Properties
-
-Эквивалент:
+Properties equivalent:
 ```properties
 server.port=8080
 server.compression.enabled=true
@@ -113,80 +96,66 @@ logging.level.root=INFO
 logging.level.kz.gov.kgd.isna=DEBUG
 ```
 
-Обычно **YAML** — удобнее для вложенных структур.
+Обычно YAML — удобнее для nested structures. Properties может быть preferred для simple flat configuration.
 
-### 4.3 Форматы обоих
+YAML supports. Строки ("foo" или без кавычек). Числа (123, 1.5). Boolean (true, false). Списки:
+```yaml
+hosts:
+  - server1
+  - server2
+```
 
-YAML поддерживает:
-- Строки (`"foo"` или без кавычек).
-- Числа (`123`, `1.5`).
-- Boolean (`true`, `false`).
-- Списки:
-  ```yaml
-  hosts:
-    - server1
-    - server2
-  ```
-- Multiline:
-  ```yaml
-  banner: |
-    Line 1
-    Line 2
-  ```
-- Флэт-запись:
-  ```yaml
-  spring.datasource.url: jdbc:...
-  ```
+Multiline strings:
+```yaml
+banner: |
+  Line 1
+  Line 2
+```
 
----
+Flat notation:
+```yaml
+spring.datasource.url: jdbc:...
+```
 
-## 5. Profiles
+## Profiles
 
-**Profile** — именованная группа конфигов, активная при определённых условиях.
+Profile — именованная группа конфигов, активная при определённых условиях. Central mechanism для environment-specific configuration.
 
-### 5.1 Файлы
+Files. application.yml — общий для всех. application-dev.yml — активен при profile dev. application-prod.yml — при prod. application-test.yml — обычно для тестов.
 
-- `application.yml` — общий для всех.
-- `application-dev.yml` — активен при `dev`.
-- `application-prod.yml` — при `prod`.
-- `application-test.yml` — обычно для тестов.
+Активация несколькими способами.
 
-### 5.2 Активация
-
-**A) Command-line**:
+Command-line:
 ```
 java -jar app.jar --spring.profiles.active=prod
 ```
 
-**B) Env**:
+Env:
 ```
 SPRING_PROFILES_ACTIVE=prod
 ```
 
-**C) System property**:
+System property:
 ```
 java -Dspring.profiles.active=prod -jar app.jar
 ```
 
-**D) yml**:
+Или в yml:
 ```yaml
 spring:
   profiles:
     active: prod
 ```
 
-**E) Множество**:
+Множество profiles:
 ```
 --spring.profiles.active=prod,eu-west
 ```
 
-Активны оба.
+Активны оба. Multiple simultaneous profiles combine configurations.
 
-### 5.3 Профили в yml
-
-Один файл, много профилей:
+Профили в одном yml через разделитель ---:
 ```yaml
-# общие
 spring:
   application:
     name: isna-knp
@@ -208,10 +177,9 @@ spring:
     url: jdbc:postgresql://prod-db/knp
 ```
 
-Разделитель `---`.
+Один файл, много профилей. Alternative to separate files. Preferable когда файлы small или sharing common structure.
 
-### 5.4 Profile-conditional beans
-
+Profile-conditional beans через @Profile:
 ```java
 @Configuration
 @Profile("prod")
@@ -230,24 +198,26 @@ class DevConfig {
 class NonProdConfig { }
 ```
 
-### 5.5 Default profile
+Beans registered только when matching profile active. Enables completely different bean configurations per environment.
 
-Если не указан профиль:
+Default profile если не указан профиль:
 ```yaml
 spring:
   profiles:
     default: dev
 ```
 
----
+Applied когда no profile active. Прevents ambiguous default behavior.
 
-## 6. Env variables — маппинг
+## Environment variables
 
-Spring **relaxed binding**:
+Spring имеет relaxed binding для env vars mapping.
 
-- Точки → underscores: `spring.datasource.url` → `SPRING_DATASOURCE_URL`.
-- Kebab-case → UPPER_CASE: `some-property` → `SOME_PROPERTY`.
-- CamelCase → UPPER_CASE: `someProperty` → `SOMEPROPERTY`.
+Точки → underscores. spring.datasource.url → SPRING_DATASOURCE_URL.
+
+Kebab-case → UPPER_CASE. some-property → SOME_PROPERTY.
+
+CamelCase → UPPER_CASE. someProperty → SOMEPROPERTY.
 
 Примеры:
 ```
@@ -257,16 +227,14 @@ LOGGING_LEVEL_ROOT=DEBUG
 LOGGING_LEVEL_KZ_GOV_KGD_ISNA=TRACE
 ```
 
-**Правило**: **env для секретов и environment-specific** (URLs, passwords). Не hardcode в yml.
+Правило. Env для секретов и environment-specific (URLs, passwords). Не hardcode в yml. Application code stays same across environments, configuration через env varies.
 
-### 6.1 Docker / K8s
-
-Обычная схема:
+Docker / K8s conventions:
 ```dockerfile
 ENV SPRING_PROFILES_ACTIVE=prod
 ```
 
-K8s:
+K8s Secret injection:
 ```yaml
 env:
   - name: SPRING_PROFILES_ACTIVE
@@ -278,24 +246,21 @@ env:
         key: password
 ```
 
----
+Secrets stored в K8s Secret resource. Environment variables reference them. Never in image или yml plaintext.
 
-## 7. Command-line arguments
+## Command-line arguments
 
 ```
 java -jar app.jar --server.port=9090 --spring.profiles.active=prod
 ```
 
-Двойные тире `--` перед свойством.
+Двойные тире перед свойством. Convention для Spring Boot arguments.
 
-**Приоритет выше env / yml** — удобно для overrides.
+Приоритет выше env / yml — удобно для overrides. Ad hoc reconfiguration без changing environment or rebuilding.
 
----
-
-## 8. Placeholders
+## Placeholders
 
 Внутри yml — референсы на другие значения:
-
 ```yaml
 app:
   name: isna-knp
@@ -309,21 +274,20 @@ spring:
     password: ${DB_PASSWORD:defaultpass}
 ```
 
-Если `DB_PASSWORD` env есть → используется; нет → "defaultpass".
+Если DB_PASSWORD env есть — используется. Нет — defaultpass. Fallback mechanism для missing configuration.
 
-Nested:
+Nested placeholders:
 ```yaml
 spring:
   datasource:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:knp}
 ```
 
----
+Composition из multiple placeholders. Powerful для flexible configuration.
 
-## 9. @Value
+## @Value simple injection
 
-Простая injection свойства в поле/параметр:
-
+Простая injection свойства в поле или параметр:
 ```java
 @Component
 class MyBean {
@@ -345,20 +309,15 @@ class MyBean {
 }
 ```
 
-Плюсы:
-- Простой.
+Плюсы. Простой. Straightforward one-property injection.
 
-Минусы:
-- **Не typed** — строка → надо парсить.
-- **Не centralized** — разбросано по классам.
-- **Нет validation**.
+Минусы. Не typed — конверсия automatic но limited. Не centralized — свойства разбросаны по классам. Нет validation. Difficult refactoring — property name changes require finding all @Value usages.
 
----
+Для нескольких properties preferred @ConfigurationProperties.
 
-## 10. @ConfigurationProperties (лучше)
+## @ConfigurationProperties (лучше)
 
-Типизированная **группа** свойств.
-
+Типизированная группа свойств:
 ```java
 @ConfigurationProperties(prefix = "knp")
 @Component
@@ -380,7 +339,7 @@ public class KnpProperties {
 }
 ```
 
-Конфиг:
+Configuration:
 ```yaml
 knp:
   max-batch-size: 200
@@ -401,37 +360,29 @@ Duration timeout = props.getTimeout();
 int attempts = props.getRetry().getMaxAttempts();
 ```
 
-### 10.1 Плюсы
+Плюсы. Типизировано — не строка, а int, Duration, List. Централизованно — все свойства в одном классе. IDE support — autocomplete в yml (при spring-boot-configuration-processor). Validation через JSR-380:
+```java
+@ConfigurationProperties(prefix = "knp")
+@Validated
+public class KnpProperties {
+    @NotBlank String outerSystemUrl;
+    @Min(1) @Max(1000) int maxBatchSize;
+    @NotNull Duration timeout;
+}
+```
 
-- **Типизировано** — не строка, а `int`, `Duration`, `List`.
-- **Централизованно** — все свойства в одном классе.
-- **IDE support** — autocomplete в yml (при `spring-boot-configuration-processor`).
-- **Validation** через JSR-380:
-  ```java
-  @ConfigurationProperties(prefix = "knp")
-  @Validated
-  public class KnpProperties {
-      @NotBlank String outerSystemUrl;
-      @Min(1) @Max(1000) int maxBatchSize;
-      @NotNull Duration timeout;
-  }
-  ```
-  При старте — падает если инвалид.
+При старте — падает если инвалид. Fail-fast обнаружение configuration errors.
 
-### 10.2 Relaxed binding
-
-Все эти в yml маппятся на `maxBatchSize`:
+Relaxed binding. Все эти в yml маппятся на maxBatchSize:
 ```yaml
 knp.maxBatchSize: 200
 knp.max-batch-size: 200
 knp.MAX_BATCH_SIZE: 200
 ```
 
-Через env: `KNP_MAX_BATCH_SIZE=200`.
+Через env — KNP_MAX_BATCH_SIZE=200. Multiple naming conventions accepted.
 
-### 10.3 Duration / DataSize
-
-Spring парсит специально:
+Duration / DataSize types. Spring парсит специально:
 ```yaml
 knp:
   timeout: 30s              # PT30S
@@ -439,11 +390,9 @@ knp:
   retention: 7d
 ```
 
-Типы: `Duration`, `DataSize`, `Period`.
+Типы. Duration, DataSize, Period. Human-friendly notation converted к Java types automatically.
 
-### 10.4 @ConstructorBinding (Spring Boot 3+)
-
-Для **immutable** properties:
+@ConstructorBinding (Spring Boot 3+) для immutable properties:
 ```java
 @ConfigurationProperties(prefix = "knp")
 @ConstructorBinding
@@ -456,13 +405,9 @@ public record KnpProperties(
 }
 ```
 
-Иммутабельно (record) — потокобезопасно.
+Immutable (record) — потокобезопасно. С Boot 3 @ConstructorBinding не нужен для record (automatic).
 
-С Boot 3 — `@ConstructorBinding` не нужен для record (автоматически).
-
-### 10.5 @EnableConfigurationProperties
-
-Регистрация без `@Component`:
+@EnableConfigurationProperties регистрация без @Component:
 ```java
 @Configuration
 @EnableConfigurationProperties(KnpProperties.class)
@@ -472,12 +417,11 @@ class Config {}
 public class KnpProperties { }   // без @Component
 ```
 
----
+Alternative registration mechanism.
 
-## 11. bootstrap.yml (Spring Cloud)
+## bootstrap.yml (Spring Cloud legacy)
 
-Читается **до** `application.yml`. Нужен для Spring Cloud:
-
+Читается до application.yml. Нужен для Spring Cloud:
 ```yaml
 # bootstrap.yml
 spring:
@@ -491,15 +435,13 @@ spring:
         enabled: true
 ```
 
-Позволяет:
-- Настроить Consul/Config Server до загрузки основного конфига.
-- Основной yml читается из Consul KV.
+Позволяет. Настроить Consul/Config Server до загрузки основного конфига. Основной yml читается из Consul KV.
 
-С **Spring Cloud 2020+** bootstrap отключён по default → нужен `spring-cloud-starter-bootstrap` или `spring.config.import`.
+С Spring Cloud 2020+ bootstrap отключён по default. Нужен spring-cloud-starter-bootstrap или spring.config.import (modern approach).
 
-### 11.1 spring.config.import (Boot 2.4+)
+## spring.config.import (Boot 2.4+)
 
-Замена bootstrap:
+Замена bootstrap для reading external configuration:
 ```yaml
 spring:
   config:
@@ -509,25 +451,21 @@ spring:
       - "optional:file:./config/"
 ```
 
-Более гибко.
+Более гибко. Standard Spring Boot mechanism не Spring Cloud specific.
 
----
+Prefix «optional:» — если source unavailable, не fail. Fallback graceful.
 
-## 12. External configuration
+Modern replacement для bootstrap. Simpler configuration model.
+
+## External configuration
 
 Помимо classpath — внешние файлы.
 
-### 12.1 Приоритет
+Приоритет для external config. ./config/application.yml (рядом с jar). ./application.yml. classpath:/config/application.yml. classpath:/application.yml.
 
-- `./config/application.yml` (рядом с jar).
-- `./application.yml`.
-- `classpath:/config/application.yml`.
-- `classpath:/application.yml`.
+Внешние перекрывают classpath. Можно переопределить не пересобирая jar. Deployment flexibility.
 
-Внешние **перекрывают** classpath — можно переопределить не пересобирая jar.
-
-### 12.2 Custom location
-
+Custom location:
 ```
 java -jar app.jar --spring.config.location=/etc/myapp/config.yml
 ```
@@ -537,33 +475,33 @@ java -jar app.jar --spring.config.location=/etc/myapp/config.yml
 --spring.config.location=classpath:/,file:./custom.yml
 ```
 
-### 12.3 additional-location (лучше)
-
-Добавляет к defaults, не заменяет:
+additional-location добавляет к defaults не заменяет:
 ```
 --spring.config.additional-location=file:./custom.yml
 ```
 
----
+Preferred variant — augment defaults вместо replacement. Avoid accidentally missing configuration.
 
-## 13. Encryption секретов
+## Encryption секретов
 
-Пароли в yml — плохо (git).
+Пароли в yml — плохо (git commits). Multiple mitigation strategies.
 
-Варианты:
-- **Env variables** — `${DB_PASSWORD}` из env.
-- **Vault** (HashiCorp).
-- **AWS Secrets Manager / GCP Secret Manager**.
-- **Kubernetes Secret**.
-- **Jasypt** — Spring Boot encryption:
+Env variables. ${DB_PASSWORD} из env. Most common approach.
 
+Vault (HashiCorp). Dedicated secrets management. Runtime retrieval. Rotation supported.
+
+AWS Secrets Manager / GCP Secret Manager. Cloud provider solutions. Integrated с IAM.
+
+Kubernetes Secret. K8s native. Base64 encoded (not encrypted at rest by default but options exist).
+
+Jasypt — Spring Boot encryption:
 ```yaml
 spring:
   datasource:
     password: ENC(encrypted-value)
 ```
 
-```java
+```gradle
 implementation 'com.github.ulisesbocchio:jasypt-spring-boot-starter:3.0.5'
 ```
 
@@ -572,17 +510,13 @@ Master password через env:
 JASYPT_ENCRYPTOR_PASSWORD=master-key
 ```
 
-Правило: **никогда plain secrets в git**.
+Правило. Никогда plain secrets в git. Multiple layer defense — encryption plus access control plus rotation.
 
----
-
-## 14. Refresh конфига в рантайме
+## Refresh конфига в рантайме
 
 По умолчанию Spring Boot не обновляет конфиг в рантайме (нужен рестарт).
 
-### 14.1 @RefreshScope + Actuator
-
-С **Spring Cloud**:
+@RefreshScope plus Actuator с Spring Cloud:
 ```java
 @RestController
 @RefreshScope
@@ -591,85 +525,57 @@ class MyController {
 }
 ```
 
-POST `/actuator/refresh` → перечитывает конфиг → бины с `@RefreshScope` пересоздаются.
+POST /actuator/refresh — перечитывает конфиг. Бины с @RefreshScope пересоздаются. Runtime configuration updates без restart.
 
-Изменения из Consul / Config Server подтягиваются автоматом (через bus refresh).
+Изменения из Consul / Config Server подтягиваются автоматом через bus refresh.
 
-### 14.2 Кавет
+Кавет. Не все бины могут @RefreshScope. Не singleton — пересоздаются. Осторожно с state. State-heavy beans lose состояние at refresh.
 
-**Не все** бины могут `@RefreshScope` — не singleton (пересоздаются). Осторожно с state.
+## Как узнать текущий конфиг
 
----
-
-## 15. Как узнать текущий конфиг
-
-### 15.1 Actuator
-
+Actuator endpoints:
 ```
 GET /actuator/env
 ```
 
-Показывает ВСЕ property sources + значения (с маскированием секретов).
+Показывает ВСЕ property sources plus значения (с маскированием секретов).
 
 ```
 GET /actuator/configprops
 ```
 
-Показывает все `@ConfigurationProperties` бины с текущими значениями.
+Показывает все @ConfigurationProperties бины с текущими значениями. Type-safe view of configuration.
 
-### 15.2 Программно
-
+Программно:
 ```java
 @Autowired Environment env;
 
 env.getActiveProfiles();
 env.getProperty("spring.datasource.url");
 
-// или через PropertySources
 ConfigurableEnvironment cenv = (ConfigurableEnvironment) env;
 cenv.getPropertySources().forEach(ps -> {
     log.info("PropertySource: {}", ps.getName());
 });
 ```
 
----
+Runtime introspection. Debugging misconfigured deployments.
 
-## 16. Реализация под капотом
+## Реализация под капотом
 
-### 16.1 Environment
+Environment interface ConfigurableEnvironment имеет список PropertySources.
 
-`ConfigurableEnvironment` — интерфейс с списком `PropertySources`.
+При старте SpringApplication. Создаёт StandardServletEnvironment. Добавляет system properties, env vars как PropertySources. ConfigDataEnvironmentPostProcessor ищет application.yml/properties в стандартных местах. Для каждого active profile — добавляет profile-specific. Обрабатывает spring.config.import (Consul, Vault). Результат — упорядоченный список PropertySources.
 
-При старте `SpringApplication`:
-1. Создаёт `StandardServletEnvironment`.
-2. Добавляет **system properties**, **env vars** как PropertySources.
-3. **`ConfigDataEnvironmentPostProcessor`** ищет `application.yml/properties` в стандартных местах.
-4. Для каждого activate profile — добавляет profile-specific.
-5. Обрабатывает `spring.config.import` (Consul, Vault).
-6. Результат — упорядоченный список PropertySources.
+Property resolution через env.getProperty("foo"). Идёт по PropertySources по порядку (высший приоритет первый). Первое совпадение — возвращает. Разрешает placeholders ${...} рекурсивно.
 
-### 16.2 Property resolution
+@ConfigurationProperties binding. ConfigurationPropertiesBinder через reflection. Читает bean class. Ищет свойства по префиксу. Конвертирует (String → int / Duration / etc). Валидирует (@Validated). Заполняет.
 
-`env.getProperty("foo")`:
-1. Идёт по PropertySources по порядку (высший приоритет первый).
-2. Первое совпадение — возвращает.
-3. Разрешает placeholders `${...}` (может рекурсивно).
+Всё на старте — если конфиг инвалид, приложение падает. Fail-fast principle.
 
-### 16.3 @ConfigurationProperties binding
+## Пример полной конфигурации ИСНА
 
-`ConfigurationPropertiesBinder` через reflection:
-1. Читает bean class.
-2. Ищет свойства по префиксу.
-3. Конвертирует (String → int / Duration / etc).
-4. Валидирует (@Validated).
-5. Заполняет.
-
-Всё на старте — если конфиг инвалид, приложение падает.
-
----
-
-## 17. Пример полной конфигурации ИСНА
-
+Real-world example:
 ```yaml
 # application.yml (общий)
 spring:
@@ -739,40 +645,34 @@ knp:
     multiplier: 2
 ```
 
-Deploy:
-- Local: `--spring.profiles.active=dev`.
-- Prod: env `SPRING_PROFILES_ACTIVE=prod` + `DB_PASSWORD=secret` из K8s Secret.
+Deployment. Local — --spring.profiles.active=dev. Prod — env SPRING_PROFILES_ACTIVE=prod plus DB_PASSWORD=secret из K8s Secret.
 
----
+Structure demonstrates. Common configuration в default section. Profile-specific overrides. Placeholders для env-specific values. Business configuration отдельно (knp namespace).
 
-## 18. Собесные вопросы
+## Итоги
 
-1. **Что такое PropertySource?** — Абстракция источника key=value; иерархия в Environment.
-2. **Порядок приоритетов?** — Command-line > env > system > profile-yml > yml > defaults.
-3. **Что такое profile?** — Именованная группа конфигов, активная по условию.
-4. **Как активировать profile?** — `--spring.profiles.active`, `SPRING_PROFILES_ACTIVE`, `-Dspring.profiles.active`.
-5. **Env → property маппинг?** — Relaxed binding: точки → underscores, upper case.
-6. **Разница @Value и @ConfigurationProperties?** — Value — одна строка; ConfigurationProperties — типизированная группа + validation.
-7. **@ConstructorBinding — что?** — Immutable properties через конструктор (record).
-8. **bootstrap.yml vs application.yml?** — Bootstrap читается ДО application; для Spring Cloud (Consul).
-9. **spring.config.import — что?** — Boot 2.4+ замена bootstrap для внешних источников.
-10. **Как передать секрет в приложение?** — Env var (K8s Secret), Vault, Jasypt.
-11. **Как посмотреть текущий конфиг?** — `/actuator/env`, `/actuator/configprops`.
-12. **@RefreshScope — что?** — Бин пересоздаётся при POST `/actuator/refresh` (для конфига без рестарта).
-13. **Duration тип в @ConfigurationProperties?** — Spring парсит `30s`, `5m`, `1h`.
-14. **placeholder default value?** — `${VAR:default}`.
-15. **Разница `spring.config.location` и `additional-location`?** — Location заменяет defaults; additional добавляет.
+PropertySource как abstraction. Иерархия priorities — command-line > env > system > profile-yml > yml > defaults.
 
----
+Profiles для разных окружений. @Profile для beans. Multiple simultaneous profiles.
 
-## Итог
+Environment variables с relaxed binding — точки в underscores, upper case.
 
-- **PropertySource иерархия**: command-line > env > system > yml > defaults.
-- **Profiles** для разных окружений.
-- **@ConfigurationProperties** лучше @Value (типизация + validation).
-- **Env vars** для секретов.
-- **bootstrap.yml / spring.config.import** для Spring Cloud.
-- **`/actuator/env`** для проверки в рантайме.
-- **Relaxed binding** — env `SPRING_DATASOURCE_URL` = yml `spring.datasource.url`.
+Placeholders ${var:default} для references plus defaults.
 
-Следующий — `58-helm-helmsman.md`.
+@ConfigurationProperties preferred over @Value. Типизированные группы. Validation через JSR-380. IDE support через spring-boot-configuration-processor.
+
+Duration, DataSize types automatically parsed. Human-friendly notation.
+
+@ConstructorBinding для immutable properties. Records в Spring Boot 3+ automatic.
+
+bootstrap.yml legacy. spring.config.import modern approach для external sources (Consul, Vault).
+
+External configuration через ./config/ folder или explicit location.
+
+Secrets management критично. Env vars, Vault, K8s Secret, Jasypt для encryption at rest.
+
+Runtime refresh через @RefreshScope plus Actuator refresh endpoint. Careful with stateful beans.
+
+Introspection через /actuator/env и /actuator/configprops. Runtime debugging capability.
+
+Дальше — Helm plus Helmsman для K8s deployment automation.
