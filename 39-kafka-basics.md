@@ -1,63 +1,48 @@
 # 39. Kafka основы: broker, topic, partition, offset
 
-Что такое Kafka, чем отличается от Rabbit, как устроена.
+## Что такое Kafka
 
----
+Apache Kafka это distributed streaming platform. Не просто очередь — это распределённый log (log-based storage). Понимание этой фундаментальной discrepancy важно для правильного применения Kafka.
 
-## 1. Что такое Kafka
+Идея. События (messages) пишутся в log — append-only структуру. Consumers читают log с любой позиции. Log НЕ удаляется после чтения (в отличие от RabbitMQ где сообщение исчезает после ack). Хранится долго — дни, недели, месяцы или годы в зависимости от retention policy.
 
-**Apache Kafka** — distributed streaming platform. Не «просто очередь» — это **распределённый лог** (log-based storage).
+Создан в LinkedIn в 2011 году для их internal messaging infrastructure. Open sourced и стал foundation для event streaming во многих enterprise системах. Активно развивается Apache Software Foundation.
 
-Идея:
-- События (messages) пишутся в **log** (append-only).
-- Consumer'ы **читают** log с любой позиции.
-- Log **не удаляется после чтения** (в отличие от Rabbit).
-- Хранится долго (дни, недели, годы).
+## Kafka vs RabbitMQ
 
-Создан в LinkedIn (2011), open-source.
+Классический вопрос для собеседований и архитектурных решений. Понимание различий определяет правильный выбор.
 
----
+Model. Kafka log-based (persistent log с offset). RabbitMQ queue-based (transient messages удаляются после ack).
 
-## 2. Kafka vs RabbitMQ
+Delivery model. Kafka consumer pull — clients сами запрашивают messages. RabbitMQ broker push — broker активно отправляет messages consumers.
 
-Классический вопрос.
+Ordering. Kafka guarantees ordering только внутри partition. RabbitMQ guarantees ordering в queue при одном consumer. Multi-consumer в обоих ломает strict ordering.
 
-| | Kafka | RabbitMQ |
-|---|---|---|
-| Модель | Log-based (persistent) | Queue-based (transient) |
-| Delivery | Consumer pull | Broker push |
-| Ordering | В partition — да | В queue — да (1 consumer) |
-| Multi-consumer | Consumer groups (одно сообщение — одному в группе) | Fanout exchange / много queues |
-| Throughput | Очень высокий (millions/sec) | Высокий (~50k/sec) |
-| Retention | По времени/размеру, не завист от чтения | Удаляется после ack |
-| Replay | Да (перечитать с любого offset) | Нет (DLQ архив) |
-| Priority | Нет | Да |
-| Route-логика | Только по partition | Богатая (topic exchange, headers) |
-| Транзакции | Да (transactional producer) | Ограниченно |
+Multi-consumer patterns. Kafka consumer groups — одно сообщение доставляется одному consumer в каждой группе. RabbitMQ fanout exchange распространяет копии на много queues.
 
-**Когда Kafka**:
-- Event streaming / event sourcing.
-- Log agregation.
-- Change data capture (CDC).
-- Metrics ingest.
-- High throughput.
-- Требуется replay.
+Throughput. Kafka очень высокий — миллионы messages в секунду per broker. RabbitMQ высокий но lower — обычно десятки тысяч в секунду.
 
-**Когда Rabbit**:
-- Task queues.
-- RPC-style.
-- Priority messages.
-- Complex routing.
-- Ниже требования к throughput.
+Retention. Kafka по времени или размеру, не зависит от чтения. RabbitMQ удаляется после ack.
 
----
+Replay. Kafka supports — можно перечитать с любого offset. RabbitMQ nope — только DLQ archive.
 
-## 3. Основные концепты
+Priority. Kafka нет. RabbitMQ да через priority queues.
 
+Route logic. Kafka только по partition (простой). RabbitMQ богатый — topic exchange, headers exchange, complex routing.
+
+Transactions. Kafka full (transactional producer). RabbitMQ ограничено.
+
+Когда Kafka. Event streaming и event sourcing. Log aggregation across services. Change data capture (CDC) from databases. Metrics ingest. High throughput scenarios. Требуется replay для reprocessing.
+
+Когда RabbitMQ. Task queues для job processing. RPC-style request-response. Priority messages где ordering by importance. Complex routing patterns. Lower throughput requirements где Rabbit достаточно.
+
+## Основные концепты
+
+Архитектура Kafka cluster:
 ```
 ┌─── Kafka Cluster ────────────────────────────┐
 │                                              │
-│  ┌─── Broker 1 ────┐  ┌─── Broker 2 ────┐  │
+│  ┌─── Broker 1 ────┐  ┌─── Broker 2 ────┐   │
 │  │                 │  │                 │   │
 │  │  Topic "orders" │  │  Topic "orders" │   │
 │  │  Partition 0    │  │  Partition 1    │   │
@@ -76,64 +61,38 @@
 └──────────────────────────────────────────────┘
 ```
 
-Разберём каждый.
+Broker это один процесс Kafka. Cluster обычно 3-9 brokers для HA plus scalability.
 
-### 3.1 Broker
+Topic это логическая категория сообщений. Например orders, payments, user-events. Producer пишет в конкретный topic. Consumer subscribes на конкретные topics.
 
-Один процесс Kafka. Кластер обычно 3-9 broker'ов.
-
-### 3.2 Topic
-
-Логическая категория сообщений. Например: `orders`, `payments`, `user-events`.
-
-Topic делится на **partitions** для параллелизма.
-
-### 3.3 Partition
-
-**Упорядоченный лог сообщений**. Каждое сообщение имеет **offset** — позицию в partition.
-
+Topic делится на partitions для parallelism. Каждая partition это упорядоченный log сообщений:
 ```
 Partition 0:
 [msg0] [msg1] [msg2] [msg3] [msg4] [msg5]
  offset 0-5
 ```
 
-Гарантии:
-- Порядок **внутри partition** — да.
-- Между partitions — **нет** гарантии.
+Каждое сообщение имеет offset — монотонно растущий integer identifier position в partition. Offset уникален per partition — разные partitions могут иметь same offset numbers для разных messages.
 
-Больше partitions = больше параллелизм. Но также overhead.
+Гарантии ordering. Внутри одной partition Kafka guarantees strict ordering — messages появляются в consumer в том же order что written. Между partitions ordering НЕ guaranteed — reader может видеть messages в разном order чем publisher intended if reading multiple partitions.
 
-### 3.4 Offset
+Больше partitions равно больше parallelism (больше consumers могут работать одновременно). Но также больше overhead — metadata management, replication overhead, resource usage.
 
-Позиция сообщения в partition. Монотонно растёт.
+Offset это позиция message в partition. Монотонно растёт с каждым new message. Consumer хранит свой offset — до какой позиции прочитал. Начинает с этой позиции при рестарте.
 
-Consumer хранит **свой offset** — до какой позиции прочитал. Начинает с этой позиции при рестарте.
+Offset не удаляется до retention limit. Отсюда возможность replay — consumer может seek to любой offset и перечитать messages.
 
-Offset **не удаляется** до retention limit — можно перечитать.
+Replica это копия partition на другом broker. Replication factor определяет сколько replicas каждой partition (стандарт 3 для production).
 
-### 3.5 Replica
+Один broker это leader для каждой partition — обслуживает reads и writes. Остальные — followers — тянут данные с leader и держат synchronized copy. При падении leader — один из followers выбирается новым leader.
 
-Партиция реплицируется на **replication factor** брокеров. Стандарт — 3.
+ISR (In-Sync Replicas) это replicas догоняющие leader (лаг меньше replica.lag.time.max.ms configuration). Только из ISR может быть выбран новый leader — гарантия что новый leader имеет самые recent committed данные.
 
-Один broker — **leader** partition (обслуживает read/write). Остальные — **followers** (тянут данные с leader).
+min.insync.replicas настройка определяет сколько ISR должно подтвердить write при acks=all. Обычно 2 (leader plus один follower) для баланса reliability и availability.
 
-При падении leader — один из followers становится новым leader.
+## Producer детали
 
-### 3.6 ISR (In-Sync Replicas)
-
-Replicas, догоняющие leader (лаг < `replica.lag.time.max.ms`).
-
-Только из ISR может быть выбран новый leader.
-
-**`min.insync.replicas`** — сколько ISR должно подтвердить write (при `acks=all`). Обычно 2 (leader + 1 follower).
-
----
-
-## 4. Producer
-
-Пишет сообщения в topic.
-
+Producer записывает сообщения в topic:
 ```java
 Properties props = new Properties();
 props.put("bootstrap.servers", "kafka:9092");
@@ -146,51 +105,47 @@ producer.send(new ProducerRecord<>("orders", "key1", "message"));
 producer.close();
 ```
 
-### 4.1 Partitioner
+Partitioner определяет в какую partition отправить message.
 
-Producer решает в какую partition отправить:
-- **С ключом** — hash(key) % partitions. Тот же ключ → та же partition → тот же порядок.
-- **Без ключа** — round-robin / sticky partitioning.
+С ключом — hash(key) modulo partitions. Тот же ключ маршрутизируется в ту же partition обеспечивая ordering per key. Например все events one customer идут в one partition.
 
-Правило: **если важен порядок для чего-то (userId, orderId) — использовать этот id как ключ**.
+Без ключа — round-robin или sticky partitioning. Sticky (Kafka 2.4+) собирает multiple messages в one partition для batch efficiency потом switches.
 
-### 4.2 acks
+Правило — если важен ordering для чего-то (userId, orderId) — использовать этот id как message key для guaranteed same-partition routing.
 
-Уровень надёжности:
-- **acks=0** — fire-and-forget. Не ждём подтверждения. Максимальная скорость, потери возможны.
-- **acks=1** — leader подтвердил. Быстро, но если leader упадёт до replication → потеря.
-- **acks=all** — все ISR подтвердили. Максимальная надёжность, медленнее.
+acks setting определяет level reliability.
 
-Правило: **`acks=all` + `min.insync.replicas=2`** для важных данных.
+acks=0 fire-and-forget. Не ждём подтверждения от broker. Максимальная скорость, потери возможны при broker unavailability или crashes.
 
-### 4.3 Batching
+acks=1 leader подтвердил. Быстро но если leader падает до replication на followers — потеря message.
 
-Producer собирает сообщения в batch перед отправкой:
-- **linger.ms** — сколько ждать до отправки (default 0).
-- **batch.size** — max размер batch (default 16 KB).
+acks=all все ISR подтвердили. Максимальная reliability, медленнее из-за replication wait.
 
-Увеличить `linger.ms` до 10-100 мс + batch.size = хорошая пропускная способность за счёт небольшой latency.
+Правило для важных данных — acks=all plus min.insync.replicas=2 для guaranteed durability.
 
-### 4.4 Compression
+Batching для throughput. Producer собирает messages в batch перед отправкой. linger.ms контролирует сколько ждать до отправки (default 0). batch.size максимальный размер batch (default 16 KB).
 
-- `snappy`, `lz4`, `gzip`, `zstd`.
-- `zstd` — лучший баланс.
-- Больше compression = меньше сеть, больше CPU.
+Увеличение linger.ms до 10-100 миллисекунд plus batch.size даёт значительно лучшую throughput ценой небольшой latency. Trade-off для high-throughput workloads обычно worth it.
 
-### 4.5 Idempotent producer
+Compression через snappy, lz4, gzip, zstd algorithms. zstd лучший баланс compression ratio и CPU cost. Больше compression меньше network usage но больше CPU для encoding/decoding.
 
-`enable.idempotence=true` — гарантирует что при retry не будет дублей.
+Idempotent producer через enable.idempotence=true. Гарантирует что при retry не будет duplicates. Kafka присваивает producer ID plus sequence number на каждое message. Broker дедуплицирует базируясь на этих identifiers.
 
-Внутри Kafka присваивает каждому producer'у ID + sequence number на каждое сообщение → broker дедуплицирует.
+Обязательно для критичных данных. Zero cost overhead — always turn on.
 
-**Обязательно** для критичных данных.
+Delivery guarantees через комбинации settings.
 
----
+At-most-once — acks=0 или 1 plus retries=0. Может потерять, не задваивает.
 
-## 5. Consumer
+At-least-once — acks=all plus retries>0. Не потеряет, может задвоить (при retry без idempotence).
 
-Читает сообщения из topic.
+Exactly-once в one producer — acks=all plus enable.idempotence=true. Не потеряет, не задваивает (в рамках одной partition).
 
+Exactly-once transactional требует transactional.id plus producer.initTransactions. Для multiple partitions atomic writes plus consumer offset commits.
+
+## Consumer детали
+
+Consumer читает сообщения из topic:
 ```java
 Properties props = new Properties();
 props.put("bootstrap.servers", "kafka:9092");
@@ -210,34 +165,17 @@ while (true) {
 }
 ```
 
-Подробно про consumer — в следующем файле.
+Detailed consumer discussion в следующем файле.
 
----
+## Retention
 
-## 6. Retention
+Kafka хранит сообщения согласно retention policies.
 
-Kafka хранит сообщения по политикам:
+Time-based retention. retention.ms=604800000 (7 дней по default). Через 7 дней старые segments удаляются.
 
-### 6.1 Time-based
+Size-based retention. retention.bytes=1073741824 (1 GB per partition). При превышении — старые segments удаляются.
 
-```
-retention.ms = 604800000   # 7 days (default)
-```
-
-Через 7 дней сегменты старше — удаляются.
-
-### 6.2 Size-based
-
-```
-retention.bytes = 1073741824   # 1 GB per partition
-```
-
-При превышении — старые сегменты удаляются.
-
-### 6.3 Log compaction
-
-**Log compaction** — не удалять по времени, а держать **последнее значение для каждого key**.
-
+Log compaction это специальная policy. Не удаляет по времени, а держит последнее значение для каждого key:
 ```
 Original log:
 key=A, value=1
@@ -250,24 +188,15 @@ key=A, value=2
 key=B, value=2
 ```
 
-Использование: KV-store поверх Kafka (event sourcing snapshots, Kafka Streams state).
+Использование для KV-store поверх Kafka. Event sourcing snapshots. Kafka Streams state stores. Configuration data.
 
-Настройка: `cleanup.policy=compact` (или `delete,compact` для гибрида).
+Настройка через cleanup.policy=compact или delete,compact для гибрида (compact plus time-based cleanup).
 
-### 6.4 Правильные значения
+Правильные retention значения. Обычные event topics — 7-30 дней retention достаточно. Analytics и replay scenarios — месяцы. Compaction для KV — вечно plus periodic compaction.
 
-Для типового topic с событиями: 7-30 дней retention.
+## Segments и файлы
 
-Для аналитики/replay: месяцы.
-
-Для compaction (KV): вечно + периодический compaction.
-
----
-
-## 7. Segments и файлы
-
-Partition на диске = набор **segments**:
-
+Partition на диске это набор segments. Каждый segment это pair файлов plus indexes:
 ```
 /var/lib/kafka/data/orders-0/
 ├── 00000000000000000000.log       ← сегмент 1 (offset 0 - 999)
@@ -278,58 +207,33 @@ Partition на диске = набор **segments**:
 └── 00000000000000001000.timeindex
 ```
 
-- **.log** — сам данные.
-- **.index** — offset → байтовый offset.
-- **.timeindex** — timestamp → offset (для поиска по времени).
+.log это сам message data. .index maps offset to byte position в .log. .timeindex maps timestamp to offset для поиска по времени.
 
-Новый сегмент открывается по достижении `segment.bytes` (1 GB) или `segment.ms` (7 days).
+Новый segment открывается по достижении segment.bytes (default 1 GB) или segment.ms (default 7 days).
 
-Retention удаляет сегменты **целиком**, не отдельные сообщения.
+Retention удаляет segments целиком, не отдельные messages. Это делает retention operation быстрой — просто delete files.
 
----
+## ZooKeeper vs KRaft
 
-## 8. ZooKeeper vs KRaft
+Historical model. До Kafka 2.8 требовался Zookeeper для metadata (topics, partitions, replicas), controller election, ACLs, consumer offsets (до 0.10 — теперь в special topic).
 
-### 8.1 Раньше: Kafka + Zookeeper
+Проблемы Zookeeper approach. Ещё одна distributed system для support и operations. Ограничение scale — around 200k partitions практический limit. Разная consistency model между Kafka и Zookeeper — sync issues возможны.
 
-До 2.8 Kafka требовал Zookeeper для:
-- Metadata (topics, partitions, replicas).
-- Controller election.
-- ACLs.
-- Consumer offsets (до 0.10 — потом в спец. topic).
+KRaft (KIP-500) mode начиная с Kafka 2.8 preview, production ready с 3.3+. Internal Raft consensus в Kafka вместо Zookeeper.
 
-Проблемы:
-- Ещё одна распределённая система для support.
-- Ограничение масштаба (~200k partitions).
-- Разная модель consistency.
+Плюсы. Одна distributed system для management. Больше scale — миллионы partitions поддерживаются. Быстрее startup и controller failover.
 
-### 8.2 KRaft (KIP-500)
+В Kafka 3.x можно выбирать между Zookeeper и KRaft. В 4.x (2024+) только KRaft — Zookeeper support полностью удалён.
 
-С Kafka 2.8 (preview) / 3.3+ (production) — **KRaft mode**: внутренний Raft, без Zookeeper.
+## Controller
 
-Плюсы:
-- Одна система.
-- Больше масштаб (миллионы partitions).
-- Быстрее startup, controller failover.
+Один broker выбран controller (координатор cluster). Ответственности controller. Отслеживает состояние других brokers. Управляет partition leader election при failures. Обрабатывает administrative операции — создание topics, изменение partition count.
 
-В 3.x — можно выбирать. В 4.x (2024) — только KRaft, Zookeeper удалён.
+В classical Kafka с Zookeeper controller выбирается через Zookeeper election. В KRaft mode — через internal Raft consensus.
 
----
+## Publish и consume happy path
 
-## 9. Controller
-
-Один broker выбран **controller** (координатор):
-- Отслеживает состояние других broker'ов.
-- Управляет partition leader election.
-- Обрабатывает административные операции.
-
-В классической Kafka выбирается через Zookeeper. В KRaft — через внутренний Raft.
-
----
-
-## 10. Публикация и чтение — happy path
-
-Publish:
+Publish flow полностью:
 ```
 1. Producer.send(record)
 2. Partitioner выбирает partition (по ключу или round-robin)
@@ -340,7 +244,7 @@ Publish:
 7. acks=all → все ISR подтвердили → producer получает ack
 ```
 
-Consume:
+Consume flow:
 ```
 1. Consumer.subscribe("orders")
 2. Присоединяется к consumer group
@@ -351,71 +255,55 @@ Consume:
 7. Consumer.commitSync() → offset сохраняется в __consumer_offsets
 ```
 
----
+## Deployment типичный
 
-## 11. Deployment
+Kafka cluster 3-5 brokers для standard HA setup.
 
-Типичный:
-- **Kafka**: 3-5 broker.
-- **Zookeeper** (если не KRaft): 3-5 ensemble.
-- **Kafka Connect** (для integration): опционально.
-- **Schema Registry** (Confluent) — для Avro.
-- **ksqlDB / Kafka Streams** — для stream processing.
+Zookeeper ensemble 3-5 nodes если использется классический mode.
 
-Мониторинг:
-- **JMX metrics** → Prometheus.
-- **kafka-consumer-groups.sh** — consumer lag.
+Kafka Connect для integration с databases и other systems. Optional но common.
 
----
+Schema Registry (Confluent) для Avro schemas. Ensures schema evolution compatibility.
 
-## 12. Terminология
+ksqlDB или Kafka Streams для stream processing поверх Kafka data.
 
-- **Topic** — категория.
-- **Partition** — упорядоченный лог.
-- **Offset** — позиция в partition.
-- **Broker** — один узел Kafka.
-- **Producer** — пишет.
-- **Consumer** — читает.
-- **Consumer group** — группа consumer'ов, делят partitions.
-- **Rebalance** — перераспределение partitions между consumer'ами группы.
-- **Replica** — копия partition на другом broker.
-- **ISR** — In-Sync Replicas.
-- **Leader / Follower** — роли replica.
-- **Controller** — координатор кластера.
-- **Retention** — политика хранения.
-- **Log compaction** — держать только последнее по ключу.
+Monitoring. JMX metrics для broker health. Prometheus scraping. Grafana dashboards. kafka-consumer-groups.sh script для consumer lag monitoring.
 
----
+## Terminology summary
 
-## 13. Собесные вопросы
+Topic — категория messages.
+Partition — упорядоченный log внутри topic для parallelism.
+Offset — позиция message в partition.
+Broker — один Kafka node.
+Producer — пишет messages в topics.
+Consumer — читает messages из topics.
+Consumer group — набор consumers deliver same topic delivering distinct partitions.
+Rebalance — перераспределение partitions между consumers of group.
+Replica — копия partition на другом broker.
+ISR — In-Sync Replicas догоняющие leader.
+Leader/Follower — роли replica per partition.
+Controller — cluster coordinator.
+Retention — политика хранения old messages.
+Log compaction — keep only latest per key policy.
 
-1. **Kafka vs RabbitMQ?** — Kafka log-based (persistent, replay), Rabbit queue-based (transient); Kafka для high throughput + streaming, Rabbit для task queues.
-2. **Что такое topic и partition?** — Topic = категория; partition = упорядоченный лог внутри topic для параллелизма.
-3. **Что такое offset?** — Позиция сообщения в partition; consumer хранит свою.
-4. **Как гарантируется порядок?** — Внутри partition — да; между partitions — нет.
-5. **Как обеспечить порядок для конкретного ключа?** — Использовать этот ключ как message key → hash → та же partition.
-6. **Что такое ISR?** — In-Sync Replicas, догоняющие leader (лаг < threshold).
-7. **Разница acks=0/1/all?** — 0 fire-and-forget; 1 leader ack; all все ISR ack.
-8. **Что такое idempotent producer?** — Retry не даёт дублей (внутренний sequence number).
-9. **Что такое log compaction?** — Хранить только последнее сообщение для каждого key.
-10. **Retention типы?** — Time-based, size-based, log compaction.
-11. **Что такое Zookeeper в Kafka?** — Metadata + coordination (устарел, замена — KRaft).
-12. **Что делает controller?** — Координирует состояние broker'ов, leader election.
-13. **Что такое replication factor?** — Сколько replica у каждой partition (стандарт 3).
-14. **Broker упал — что происходит?** — Followers → новый leader выбирается; при падении controller — новый выбирается.
-15. **Как обеспечить no data loss?** — acks=all + min.insync.replicas=2 + idempotent producer + replication.factor=3.
+## Итоги
 
----
+Kafka это distributed log не queue. Persistent log storage с offset-based access.
 
-## Итог
+Kafka vs RabbitMQ разные модели. Kafka log-based для streaming, high throughput, replay. Rabbit queue-based для task queues, RPC, complex routing.
 
-- **Kafka** = distributed **log**, не очередь.
-- **Topic** → **Partitions** → **Segments** → messages с **offset**.
-- **Broker** — узел; кластер 3-5.
-- **Replication factor** = 3, `acks=all`, `min.insync.replicas=2` — надёжный setup.
-- **Idempotent producer** для no-duplicates.
-- **Consumer group** делит partitions.
-- **Retention** по времени/размеру или **log compaction**.
-- **KRaft** заменяет Zookeeper (3.3+).
+Основные концепты. Broker — процесс. Topic — категория. Partition — упорядоченный log. Offset — позиция message в partition. Replica — копия для HA. ISR — replicas догоняющие leader.
 
-Следующий — `40-kafka-producer-consumer-offsets.md`.
+Producer plus partitioner routing. Key hash для same-partition ordering. Round-robin или sticky для without key. acks levels balance reliability и speed. Idempotent producer для no duplicates.
+
+Consumer pull based через poll. Consumer groups для parallelism. Обработка после poll plus commit offsets.
+
+Retention time-based или size-based. Log compaction для KV stores поверх Kafka.
+
+Segments — physical файлы. Retention deletes целые segments.
+
+KRaft заменяет Zookeeper начиная с 3.3+. В 4.x only KRaft.
+
+Controller координирует cluster — election в KRaft mode.
+
+Дальше — детальный разбор producer, consumer, offsets, consumer groups как practical work with Kafka.

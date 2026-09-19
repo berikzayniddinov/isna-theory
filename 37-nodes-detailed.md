@@ -1,37 +1,18 @@
-# 37. Nodes: что это в разных системах (детально)
+# 37. Nodes: что это в разных системах
 
-**Node** — универсальный термин в распределённых системах. В разных контекстах означает разное. Разберём каждый случай.
+## Общее определение
 
----
+Node это универсальный термин в распределённых системах означающий один экземпляр в distributed system. Может представлять разные физические сущности в зависимости от контекста. Физическую машину. Виртуальную машину. Docker контейнер. Kubernetes Pod. Процесс на сервере.
 
-## 1. Общее определение
+Идея одна — система состоит из нескольких node которые общаются между собой и работают как единое целое. Каждый node имеет свои ресурсы (CPU, memory, storage), может независимо принимать запросы и выполнять работу.
 
-**Node** = «узел» = **один экземпляр** в распределённой системе.
+Ключевые свойства распределённых систем определяют почему nodes существуют и как они взаимодействуют. Failure tolerance — один node может упасть, система должна продолжать работать. Consensus — множество nodes должны договариваться о общем состоянии. Split-brain — сеть может разделить nodes на несколько частей, каждая может думать что «главная». Quorum — большинство nodes должно согласиться для принятия критических решений.
 
-Может быть:
-- Физическая машина.
-- Виртуальная машина.
-- Docker-контейнер.
-- K8s Pod.
-- Процесс на сервере.
+Понимание концепций nodes в разных technologies помогает правильно проектировать и troubleshoot distributed systems. Ниже разбор специфики для каждой основной технологии используемой в КНП инфраструктуре.
 
-Идея одна: система состоит из **нескольких** node, они общаются между собой и работают как единое целое.
+## Node в Kubernetes
 
-Ключевые свойства распределённых систем:
-- **Failure** — один node может упасть, система должна работать.
-- **Consensus** — как несколько node договариваются.
-- **Split-brain** — сеть разделила node, каждая думает что «главная».
-- **Quorum** — большинство node должны согласиться.
-
----
-
-## 2. Node в Kubernetes
-
-Обсуждалось в `10-kubernetes-detailed.md`, но подробнее.
-
-### 2.1 Что это
-
-**K8s Node** = физическая или виртуальная машина, на которой бегут поды.
+Kubernetes node это физическая или виртуальная машина где бегут pods. Kubernetes cluster состоит из control-plane nodes управляющих кластером и worker nodes где размещаются user workloads.
 
 ```
 K8s Cluster
@@ -46,97 +27,37 @@ K8s Cluster
     └─ ...             ┘
 ```
 
-### 2.2 Компоненты worker node
+Компоненты worker node. kubelet это агент K8s запускающий контейнеры через container runtime. kube-proxy реализует Service через iptables или IPVS. Container runtime это containerd или CRI-O (раньше Docker но устарел как runtime). cAdvisor собирает метрики контейнеров.
 
-- **kubelet** — агент K8s, запускает контейнеры через container runtime.
-- **kube-proxy** — реализует Service через iptables/IPVS.
-- **container runtime** — containerd / CRI-O (раньше Docker).
-- **cAdvisor** — метрики контейнеров.
+Компоненты control-plane node. kube-apiserver предоставляет REST API кластера. etcd это KV-хранилище используемое как persistent storage через Raft consensus. kube-scheduler решает на какой worker node размещать новые pods. kube-controller-manager запускает контроллеры для Deployment, ReplicaSet и других ресурсов.
 
-### 2.3 Компоненты control-plane node
+Управление nodes через kubectl. `kubectl get nodes` показывает список всех nodes. `kubectl describe node <name>` даёт детальную информацию о конкретном node. `kubectl top nodes` показывает CPU и memory usage. `kubectl get pods -o wide --all-namespaces` показывает где какой pod размещён.
 
-- **kube-apiserver** — REST API кластера.
-- **etcd** — KV-хранилище (Raft).
-- **kube-scheduler** — решает на какую ноду ставить под.
-- **kube-controller-manager** — контроллеры (Deployment, ReplicaSet, ...).
+Node lifecycle. Ready означает kubelet отвечает, всё работает нормально. NotReady kubelet не отвечает — pods будут evicted через около 5 минут. SchedulingDisabled это состояние при maintenance — новые pods не размещаются но существующие продолжают работать.
 
-### 2.4 Как узнать про ноды
+Taints и Tolerations управляют размещением pods. Taint на node говорит «не размещайте здесь pods без соответствующего toleration». Pod с tolerance подходящим к taint может быть размещён, без tolerance — нет. Использование для выделенных nodes под GPU workloads, IO-heavy applications, dedicated tenants requiring isolation.
 
-```bash
-kubectl get nodes                        # список
-kubectl describe node <name>             # подробно
-kubectl top nodes                        # CPU/memory
-kubectl get pods -o wide --all-namespaces   # где какой pod
-```
+Node affinity предоставляет более гибкие правила размещения. nodeSelector это простое совпадение labels — pod идёт только на nodes с matching labels. nodeAffinity позволяет сложные правила — required (обязательные) plus preferred (желательные) с весами определяющими priority.
 
-### 2.5 Node lifecycle
+В КНП K8s cluster состоит из нескольких VM на реальных IP addresses. Из memory examples — 172.158.0.12 как extprod/intprod host, 172.19.21.66 как etprod-kesh, и другие. Разные namespaces (knp, fno, tax-report) все размещаются на общем worker pool.
 
-- **Ready** — kubelet отвечает, все ОК.
-- **NotReady** — kubelet не отвечает, поды эвикнутся через ~5 мин.
-- **SchedulingDisabled** — новых подов не пускаем (при maintenance).
+## Node в Consul
 
-### 2.6 Taints & Tolerations
+Consul node это один экземпляр Consul процесса. Consul cluster имеет два типа nodes для разных ролей.
 
-**Taint** на ноде — «не ставьте сюда pods, если у них нет tolerance».
-```bash
-kubectl taint node worker-1 special=true:NoSchedule
-```
+Server nodes участвуют в Raft consensus, хранят все данные (services registry, KV store, ACLs). Обычно 3 или 5 servers в cluster для HA plus consensus quorum. Servers это критическая инфраструктура — их падение break service discovery.
 
-Pod с tolerance попадёт, без — нет. Использование: выделенные ноды под GPU / IO-heavy / dedicated tenants.
+Client agents это легковесные agents на каждой node где работают applications. Они не хранят данные — только forward requests to servers. Обычно deployed как DaemonSet в Kubernetes — по одному на каждый worker node. Applications обращаются к local agent через localhost который forwards to servers.
 
-### 2.7 Node affinity
+Важно понимать что Consul node не то же самое что K8s node. Consul это своя абстракция с собственными nodes. Пример реальной architecture — K8s cluster с 10 worker nodes. На каждом бежит Consul agent (client) как DaemonSet. Плюс 3 отдельных Consul server (могут быть в K8s или на отдельных VMs).
 
-Правила «где размещать pod»:
-- `nodeSelector` — простое совпадение labels.
-- `nodeAffinity` — сложные правила (required, preferred, weight).
+Gossip protocol используется для communication между agents. SWIM protocol быстро распространяет информацию о node states через cluster. LAN gossip работает внутри одного datacenter. WAN gossip для communication между datacenters.
 
-### 2.8 Реальные IP-адреса нод ИСНА
+Команды мониторинга. `consul members` показывает все nodes в cluster. `consul operator raft list-peers` показывает какие servers участвуют в Raft consensus.
 
-Из memory: `172.158.0.12` (extprod/intprod host), `172.19.21.66` (etprod-kesh), etc. Реальные VM/физ. серверы.
+## Node в RabbitMQ
 
----
-
-## 3. Node в Consul
-
-Обсуждалось в `11-consul-detailed.md`.
-
-### 3.1 Что это
-
-**Consul Node** = один экземпляр процесса Consul.
-
-Два типа:
-- **Server** — участвует в Raft consensus, хранит данные. Обычно 3 или 5 в кластере.
-- **Client (agent)** — легковесный агент на каждой ноде приложения, форвардит запросы к серверам.
-
-### 3.2 Раздельно от K8s Node
-
-`Consul node` ≠ `K8s node`. Consul — своя абстракция.
-
-Пример: K8s cluster с 10 worker nodes. На каждом бежит Consul agent (client) как DaemonSet. Плюс отдельные 3 Consul server (в K8s или вне).
-
-### 3.3 Gossip
-
-Consul agents гошипятся между собой (SWIM protocol) — быстро распространяют информацию о состоянии.
-
-- **LAN gossip** — внутри одного DC.
-- **WAN gossip** — между DC.
-
-### 3.4 Как посмотреть
-
-```bash
-consul members                    # все ноды кластера
-consul operator raft list-peers   # какие server в Raft
-```
-
----
-
-## 4. Node в RabbitMQ
-
-### 4.1 Что это
-
-**RabbitMQ Node** = один процесс Erlang broker.
-
-Кластер:
+RabbitMQ node это один Erlang broker process. Cluster формируется из нескольких RabbitMQ instances:
 ```
 Cluster
   ├─ rabbit@node1
@@ -144,38 +65,19 @@ Cluster
   └─ rabbit@node3
 ```
 
-### 4.2 Data distribution
+Data distribution зависит от типа queue. Classic queues живут на одной node, могут mirror-иться на другие (mirroring deprecated). Quorum queues реплицируются на 3 nodes через Raft consensus — automatic failover. Metadata (exchanges, bindings, users) синхронизируется на всех nodes.
 
-- **Classic queues** — на одной ноде, могут mirror'иться (deprecated).
-- **Quorum queues** — на 3 нодах (Raft), автоматический failover.
-- **Metadata** (exchanges, bindings, users) — синхронно на всех нодах.
+Split-brain scenario критически важен для RabbitMQ. Если сеть разделила nodes (network partition) — каждая часть может думать «я главная» и продолжать работать independently.
 
-### 4.3 Split-brain
+Политики handling network partitions. ignore — каждая часть работает independently, приводит к data conflicts после reconciliation. pause_minority — часть без quorum majority блокируется, только majority работает. autoheal — при восстановлении сети выбирается «главная» часть, minority side перезапускается теряя changes.
 
-Если сеть разделила ноды (network partition) — каждая часть может думать «я главная».
+Правильная стратегия — pause_minority для избежания split-brain data loss. Majority продолжает работать, minority останавливается до восстановления сети.
 
-RabbitMQ политики:
-- `ignore` — каждая часть работает независимо (плохо, data conflict).
-- `pause_minority` — часть без большинства блокируется.
-- `autoheal` — при восстановлении сети выбирается «главная» часть, минорная перезапускается.
+Мониторинг через rabbitmqctl. `rabbitmqctl cluster_status` показывает состояние cluster. `rabbitmqctl list_queues name node` показывает какая queue на каком node.
 
-**Правильно**: `pause_minority` для избежания split-brain data loss.
+## Node в PostgreSQL
 
-### 4.4 Как посмотреть
-
-```bash
-rabbitmqctl cluster_status
-rabbitmqctl list_queues name node
-```
-
----
-
-## 5. Node в PostgreSQL
-
-### 5.1 Primary vs Replica
-
-- **Primary (master)** — принимает write. Один в кластере.
-- **Replica (standby)** — только read; следит за WAL primary.
+PostgreSQL использует primary-replica architecture. Primary (иногда называется master) принимает все writes. Один primary в cluster. Replicas (иногда называется standby) только для reads — они следят за WAL primary и применяют same changes к своим data files.
 
 ```
 Application → write → [Primary]
@@ -183,24 +85,13 @@ Application → write → [Primary]
                        [Replica 2]
 ```
 
-### 5.2 Streaming replication
+Streaming replication это основной механизм. Primary отправляет WAL stream на replicas. Replicas применяют changes сохраняя consistent copy данных.
 
-Primary стримит WAL в реплики. Реплики применяют.
+Sync vs async replication. Sync replication — commit возвращается только когда replica подтвердила receipt WAL. Медленнее (extra round-trip) но zero data loss при primary failure. Async replication — commit возвращается сразу без ожидания. Быстрее но может потерять несколько recent transactions при primary crash.
 
-- **Sync replication** — commit только когда реплика подтвердила (медленнее, надёжнее).
-- **Async replication** — быстрее, но при падении primary может потерять последние транзакции.
+Failover это process когда primary упал и replica promoted до primary. Manual failover — administrator вручную выполняет promotion. Automatic failover через tools вроде Patroni (использует etcd или Consul для coordination), repmgr, pg_auto_failover.
 
-### 5.3 Failover
-
-Primary упал → одна из реплик promoted до primary.
-
-Инструменты:
-- **Patroni** — автоматический failover через etcd/Consul + Raft.
-- **repmgr**.
-- **pg_auto_failover**.
-
-### 5.4 Read replicas в приложении
-
+Read replicas в приложении настраиваются через отдельные datasources:
 ```yaml
 spring:
   datasource:
@@ -210,206 +101,138 @@ spring:
       url: jdbc:postgresql://pg-replica:5432/knp
 ```
 
-Кавет **replication lag** — реплика может отстать на 100 мс — 1 сек. Не для read-after-write критики.
+Caveat replication lag. Replica может отставать на 100 миллисекунд до 1 секунды. Read сразу после write через replica может показать old data. Не подходит для read-after-write critical сценариев. Для критических читаемых сразу после write — читать с primary или использовать sync replication.
 
----
+## Node в Kafka
 
-## 6. Node в Kafka
+Kafka node называется broker. Один broker это один Kafka process. Cluster обычно из 3-9 brokers для HA plus scaling.
 
-Kafka node называется **broker**.
+Каждый broker выполняет несколько функций. Хранит parts of topics (partitions). Обслуживает producers и consumers для своих partitions. Реплицирует данные с и на другие brokers для fault tolerance.
 
-### 6.1 Что это
+Роли внутри cluster. Controller это один broker выбранный через Raft для coordination — управляет partition leader election, обрабатывает administrative операции (создание topic, реассignment partitions). Leader — для каждой partition один broker leader принимающий writes. Follower — replicas следящие за leader и синхронизирующие данные.
 
-Kafka broker = один процесс. Кластер обычно из 3-9 broker'ов.
+ISR (In-Sync Replicas) это replicas которые догоняют leader (лаг меньше threshold). При падении leader — новый leader выбирается только из ISR. Это гарантирует что новый leader имеет самые recent committed данные.
 
-Каждый broker:
-- Держит части topics (partitions).
-- Обслуживает producers/consumers.
-- Реплицирует данные с/на другие broker'ы.
+## Node в Elasticsearch
 
-### 6.2 Роли
+Elasticsearch поддерживает несколько ролей per node. Один physical node может выполнять несколько ролей одновременно.
 
-- **Controller** — один broker выбран через Raft, отвечает за metadata (создание topic, перераспределение partition при падении).
-- **Leader** — для каждой partition один broker leader (принимает write).
-- **Follower** — replica, следит за leader.
+Master node управляет cluster — создание индексов, распределение shards между data nodes, tracking membership. Data node хранит данные и обслуживает queries — search и indexing operations. Coordinating node принимает client requests и координирует их execution across cluster без хранения данных. Ingest node выполняет pre-processing документов перед их indexing.
 
-### 6.3 ISR
+В small clusters один node может выполнять все роли. В larger clusters роли разделяются для performance и reliability. Например 3 dedicated master-eligible nodes plus 5 data nodes plus 2 coordinating nodes.
 
-**In-Sync Replicas** — replicas, догоняющие leader (лаг < threshold).
+## Node в Cassandra и Redis Cluster
 
-При падении leader — новый leader выбирается из ISR.
+Cassandra это peer-to-peer architecture. Все nodes равноправны — нет «главного» master. Данные распределяются через consistent hashing (token ring). Каждая node ответственна за определённый range hash values. Replication factor определяет сколько replicas каждого данного (обычно 3).
 
----
+Redis Cluster использует 16384 hash slots распределённые между master nodes. Каждый master имеет несколько replicas для HA. При failure master один из replicas promoted до master.
 
-## 7. Node в Elasticsearch
+Общее для обоих — нет single point of coordination. Sharding через hash даёт horizontal scalability. Client library знает cluster topology и routes requests к нужным nodes.
 
-Тема отдельного файла `45-elasticsearch.md`. Кратко.
+## Node в Zookeeper
 
-Роли:
-- **Master node** — управляет кластером (создание индексов, распределение shards).
-- **Data node** — хранит данные, обслуживает queries.
-- **Coordinating node** — принимает запросы, координирует.
-- **Ingest node** — pre-processing документов.
+Zookeeper ensemble это 3 или 5 nodes работающих вместе через Zab protocol (похожий на Raft). Ensemble предоставляет distributed coordination services для других systems.
 
-Node может совмещать несколько ролей.
+Использование. Kafka classic mode использовал Zookeeper для metadata и coordination. Hadoop использует для coordination. HBase использует. Многие distributed systems полагаются на Zookeeper для reliable coordination.
 
----
+Kafka 3.x переходит на KRaft (Kafka's own Raft implementation). Убирает dependency на Zookeeper. В 4.x Zookeeper support полностью удаляется. Тренд — избавление от external coordination systems в пользу internal Raft.
 
-## 8. Node в Cassandra / Redis Cluster
+## Node в Neo4j graph database
 
-**Cassandra**: peer-to-peer, все ноды равноправны. Данные распределяются через consistent hashing (token ring).
-
-**Redis Cluster**: 16384 hash slots распределены между master node. Каждый master имеет replicas.
-
-Общее: нет «главного» master в классическом смысле. Sharding через hash.
-
----
-
-## 9. Node в Zookeeper
-
-**Zookeeper ensemble** — 3 или 5 node.
-
-Ensemble — координация распределённых систем (используется в Kafka, Hadoop, HBase).
-
-Consensus через **Zab protocol** (похожий на Raft).
-
-**Kafka с 3.x** переходит на KRaft (внутренний Raft), убирая зависимость от Zookeeper.
-
----
-
-## 10. Node в Neo4j (graph БД)
-
-Здесь **node** имеет другое значение — **вершина графа** (не «сервер»).
+Здесь термин node имеет другое значение — вершина графа не «сервер». Не путать с cluster nodes.
 
 ```
 (a:Person)-[:KNOWS]->(b:Person)
    node A            node B
 ```
 
-Не путать с cluster node.
+Confusingly два разных концепта используют одно слово. При обсуждении Neo4j важно уточнять — data node в graph modeling или cluster node в distributed setup.
 
----
+## Общие принципы работы с nodes
 
-## 11. Общие принципы работы с nodes
+Failure detection это фундаментальная задача. Как система понимает что node упал?
 
-### 11.1 Failure detection
+Heartbeat это периодические keep-alive messages от каждой node. Другие nodes ожидают heartbeat в определённом interval. Пропуск N heartbeats подряд — node считается dead.
 
-Как понять что node упала?
-- **Heartbeat** — периодические keep-alive.
-- **Gossip** — ноды сплетничают о состоянии соседей.
-- **Health check** — активная проверка.
+Gossip protocol используется в некоторых systems (Consul, Cassandra). Nodes «сплетничают» друг с другом обмениваясь информацией о состоянии соседей. Информация быстро распространяется через cluster.
 
-Порог: сколько failed heartbeats подряд = node dead.
+Active health checks это explicit проверки через probes — HTTP endpoint, TCP connect, custom protocol. Более definitive чем heartbeat но требует больше resources.
 
-### 11.2 Consensus (Raft, Paxos)
+Threshold detection обычно требует несколько consecutive failures до объявления node dead. Предотвращает flapping из-за transient issues (temporary network delays).
 
-Как несколько nodes договариваются о состоянии?
+Consensus algorithms решают проблему как множество nodes договариваются о common state. Раньше обсуждались briefly, теперь подробнее.
 
-**Raft** (более простой и популярный):
-1. Одна нода — **leader**, остальные — **followers**.
-2. Все writes через leader.
-3. Leader реплицирует на followers.
-4. При падении leader — выборы нового.
+Raft более простой и популярный algorithm. Одна node становится leader через election, остальные — followers. Все writes идут через leader. Leader реплицирует изменения на followers. При падении leader — followers инициируют новую election для выбора нового leader. Используется в etcd, Consul, Kafka KRaft, quorum queues в RabbitMQ, Nomad, TiKV.
 
-Используется в: etcd, Consul, quorum queues, KRaft, Nomad, TiKV.
+Paxos это оригинальный consensus algorithm, сложнее Raft. Использовался в Zookeeper (Zab это вариация Paxos). Много academic contributions но practical implementations сложные.
 
-**Paxos** — оригинальный, сложнее. Использовался в Zookeeper (Zab — вариация).
+Quorum это минимальное большинство nodes для принятия решения. 3 nodes требуют quorum 2 — можно потерять 1 node. 5 nodes требуют quorum 3 — можно потерять 2 nodes.
 
-### 11.3 Quorum
+Почему нечётное число nodes. 4 nodes требуют quorum 3 — при потере 2 nodes невозможна работа. То же fault tolerance как 3 nodes (потеря 1) но дороже. Всегда предпочтительнее нечётное число.
 
-**Кворум** = минимальное большинство для принятия решения.
+Split-brain это критическая проблема где сеть разделяет cluster на несколько частей и каждая думает что «главная». Классический пример — 5 nodes разделяются 3 plus 2 из-за network partition. Часть с 3 имеет quorum и продолжает работать. Часть с 2 нет quorum — должна остановиться иначе data conflict при восстановлении.
 
-- 3 nodes → кворум 2 (можно потерять 1).
-- 5 nodes → кворум 3 (можно потерять 2).
+Правильно построенные системы через Raft не дают split-brain благодаря quorum requirement. Плохо построенные (некоторые старые MySQL replication setups без proper coordination) split-brain приводит к data loss или corruption.
 
-**Почему нечётное число**: 4 nodes → кворум 3. Потеря 2 → нельзя работать. То же что и с 3 nodes, но дороже.
+Cascading failure это когда падение одного node создаёт chain reaction. Одна node упала — nagruzka перераспределилась на других — они не справились — тоже упали. Может привести к полному outage cluster.
 
-### 11.4 Split-brain
+Защита от cascading failures. Circuit breaker fast fails при обнаружении проблем downstream. Rate limiting ограничивает traffic to prevent overload. Backpressure сигнализирует upstream что downstream перегружен. Auto-scaling добавляет capacity при росте load. Bulkheads изолируют resource pools для разных dependencies.
 
-Сеть разделила кластер на две части, каждая думает что «главная».
+## Reference таблица типичных counts
 
-Классический пример:
-- 5 nodes, разделены 3 + 2.
-- Часть с 3 — кворум есть, работает.
-- Часть с 2 — кворума нет, **должна остановиться** (иначе data loss при восстановлении).
-
-Правильно построенные системы (Raft) — не дают split-brain через кворум.
-
-Плохо построенные (некоторые старые MySQL replication setups) — split-brain приводит к data loss.
-
-### 11.5 Cascading failure
-
-Одна нода упала → нагрузка перераспределилась на других → они не справились → тоже упали.
-
-Защита:
-- **Circuit breaker**.
-- **Rate limiting**.
-- **Backpressure**.
-- **Auto-scaling**.
-- **Bulkheads**.
-
----
-
-## 12. Reference: node counts
+Практические типичные конфигурации:
 
 | System | Typical count | Notes |
 |---|---|---|
-| K8s control plane | 3 или 5 | HA + Raft |
-| K8s worker | 3-1000+ | сколько нужно |
-| Consul server | 3 или 5 | Raft |
-| Consul agent | по одному на каждый узел | |
-| RabbitMQ cluster | 3 | quorum queues |
+| K8s control plane | 3 или 5 | HA plus Raft (etcd) |
+| K8s worker | 3-1000+ | сколько нужно для workload |
+| Consul server | 3 или 5 | Raft consensus |
+| Consul agent | 1 на каждый node | DaemonSet в K8s |
+| RabbitMQ cluster | 3 | quorum queues требуют 3 |
 | Kafka broker | 3-9 | replication factor 3 |
-| PostgreSQL | 1 primary + 1-N replicas | |
-| Elasticsearch | 3-N | 3 master-eligible |
-| Zookeeper ensemble | 3 или 5 | |
+| PostgreSQL | 1 primary + 1-N replicas | streaming replication |
+| Elasticsearch | 3-N | 3 master-eligible минимум |
+| Zookeeper ensemble | 3 или 5 | Zab consensus |
 | Redis Cluster | 3 master + 3 replicas минимум | |
 
----
+Общий pattern — 3 nodes минимум для HA plus consensus based systems. 5 nodes для higher fault tolerance. Больше при need для scaling или performance requirements.
 
-## 13. Как ИСНА использует ноды (по memory)
+## Как КНП использует nodes
 
-- **K8s nodes**: несколько VM (172.158.0.12 extprod/intprod host, etc). Разные namespaces (knp, fno, tax-report) — все на общем worker pool.
-- **Consul servers**: 3 (обычно) для HA.
-- **PostgreSQL**: обычно primary + реплика. Через **pgbouncer** (`db-knp` = pgbouncer в pod-сети).
-- **RabbitMQ**: кластер.
-- **Hazelcast**: distributed cache (memory `taxrep21-hazelcast-kesh66-unreachable` — .66:5702 unreachable = один член кластера недоступен).
-- **Elasticsearch**: ELK-стек для логов (memory `knp-prod-historical-logs-elk`).
-- **Kubelet + kube-proxy** на каждой worker node.
+Практика из КНП environment plus memory кейсов.
 
----
+K8s nodes — несколько VM (172.158.0.12 extprod/intprod host, другие). Разные namespaces (knp, fno, tax-report) размещаются на общем worker pool. Control plane обычно 3 masters для HA.
 
-## 14. Собесные вопросы
+Consul servers — 3 обычно для HA plus Raft consensus. Consul agents на каждом K8s worker node как DaemonSet — locally accessible service registry для applications.
 
-1. **Что такое node в распределённой системе?** — Один экземпляр (физ. VM, VM, контейнер, процесс).
-2. **Что такое K8s node?** — Физ/виртуальная машина где бегут pods; control-plane или worker.
-3. **Компоненты worker node?** — kubelet, kube-proxy, container runtime.
-4. **Что такое split-brain?** — Сеть разделила cluster, каждая часть думает что «главная»; риск data loss.
-5. **Что такое quorum?** — Минимальное большинство для принятия решения; нечётное число nodes.
-6. **Почему всегда нечётное число nodes?** — Чётное — тот же fault tolerance что предыдущее нечётное, но дороже.
-7. **Что такое Raft?** — Алгоритм консенсуса; leader + followers; используется в etcd, Consul, KRaft.
-8. **Разница master и worker node в K8s?** — Master = control-plane (apiserver, etcd, scheduler); worker = где бегут pods.
-9. **Что делает kubelet?** — Агент K8s на ноде; запускает/останавливает контейнеры через CRI.
-10. **Что такое ISR в Kafka?** — In-Sync Replicas — replicas, догоняющие leader.
-11. **PostgreSQL primary vs replica?** — Primary для writes; replicas для reads; sync/async replication.
-12. **Как узнать про K8s nodes?** — `kubectl get nodes`, `kubectl describe node`, `kubectl top nodes`.
-13. **Что такое taint и toleration?** — Taint на ноде запрещает pods без toleration.
-14. **Cassandra vs Cassandra: где master?** — Peer-to-peer, все равноправны, sharding через consistent hashing.
-15. **Что такое cascading failure?** — Падение одного node → перегрузка других → они падают тоже.
+PostgreSQL обычно primary plus replica configuration. Через PgBouncer как connection pooler. db-knp это PgBouncer в pod-сети — accessible только внутри cluster.
 
----
+RabbitMQ cluster для messaging. Quorum queues для важных данных обеспечивающие HA.
 
-## Итог
+Hazelcast distributed cache используется. Memory кейс taxrep21-hazelcast-kesh66-unreachable упоминает что .66:5702 unreachable означает один member cluster недоступен — необходимо monitoring для detection.
 
-- **Node** = один экземпляр в distributed system.
-- **K8s**: control-plane + worker; kubelet на каждой.
-- **Consul**: server (Raft) + agent (на каждой ноде).
-- **RabbitMQ**: broker; quorum queues для HA.
-- **PostgreSQL**: primary + replicas; sync/async replication.
-- **Kafka**: broker; leader/follower per partition; ISR.
-- **Elasticsearch**: master/data/coordinating/ingest роли.
-- **Raft** — консенсус для метадаты (etcd, Consul, KRaft, quorum queues).
-- **Quorum** — большинство; нечётное число nodes оптимально.
-- **Split-brain** — главный враг distributed systems; защита через quorum.
+Elasticsearch ELK stack для logs. Memory кейс knp-prod-historical-logs-elk описывает что kubectl logs показывает только current, исторические доступны только через Elasticsearch queries.
 
-Следующий — `38-logging.md`.
+Kubelet и kube-proxy на каждом worker node — стандартная Kubernetes infrastructure.
+
+## Итоги
+
+Node это универсальный термин в distributed systems означающий один экземпляр — VM, container, process. Разные technologies имеют свои concepts nodes с специфическими характеристиками.
+
+Kubernetes nodes — control-plane plus worker. Компоненты kubelet, kube-proxy, container runtime на каждом. Node lifecycle через Ready, NotReady, SchedulingDisabled. Taints и tolerations для placement control.
+
+Consul nodes — servers (Raft consensus) plus agents (на каждой application node). Gossip protocol для communication.
+
+RabbitMQ nodes работают в cluster. Quorum queues для HA. pause_minority policy для split-brain protection.
+
+PostgreSQL primary plus replicas. Streaming replication sync или async. Read replicas для scaling reads с caveat replication lag.
+
+Kafka brokers cluster. Controller для coordination. Leader/follower per partition. ISR для reliable failover.
+
+Elasticsearch multiple roles per node. Master, data, coordinating, ingest.
+
+Cassandra peer-to-peer. Redis Cluster hash slots. Zookeeper ensemble. Neo4j graph node (не путать).
+
+Общие принципы. Failure detection через heartbeat, gossip, active health checks. Raft consensus most popular. Quorum обеспечивает split-brain protection. Нечётное число nodes оптимально. Cascading failure защищается через circuit breakers, rate limiting, bulkheads.
+
+Дальше — logging как критическая observability составляющая. SLF4J, Logback, ELK stack и best practices.

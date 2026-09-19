@@ -1,13 +1,8 @@
 # 40. Kafka: producer, consumer, offsets, consumer groups
 
-Как реально работать с Kafka. Гарантии доставки, offset management, rebalancing.
+## Producer детально
 
----
-
-## 1. Producer детали
-
-### 1.1 Основной цикл
-
+Основной цикл работы с producer:
 ```java
 Producer<String, Order> producer = new KafkaProducer<>(props);
 
@@ -24,8 +19,7 @@ RecordMetadata meta = future.get();   // sync — блокирует
 producer.close();
 ```
 
-### 1.2 Async с callback
-
+Sync запись через future.get блокирует поток до получения confirmation от broker. Safe но медленно. Асинхронная запись через callback:
 ```java
 producer.send(record, (meta, exception) -> {
     if (exception != null) {
@@ -36,10 +30,11 @@ producer.send(record, (meta, exception) -> {
 });
 ```
 
-Не блокирует. Callback вызывается в I/O-потоке producer'а (не спать долго!).
+Не блокирует producer thread. Callback вызывается в I/O-thread producer'а поэтому не должен блокировать на долго — быстрый callback обязателен.
 
-### 1.3 Основные настройки
+## Producer настройки
 
+Ключевые properties для production:
 ```properties
 bootstrap.servers=broker1:9092,broker2:9092,broker3:9092
 key.serializer=org.apache.kafka.common.serialization.StringSerializer
@@ -48,7 +43,7 @@ value.serializer=org.apache.kafka.common.serialization.StringSerializer
 acks=all
 enable.idempotence=true
 max.in.flight.requests.per.connection=5
-retries=2147483647          # max
+retries=2147483647          # max int
 delivery.timeout.ms=120000
 
 # batch tuning
@@ -60,72 +55,63 @@ compression.type=zstd
 buffer.memory=33554432       # 32 MB
 ```
 
-### 1.4 Partitioning стратегии
+bootstrap.servers это список brokers для initial connection. Producer discovers full cluster через metadata request к любому из них. Обычно 2-3 addresses указывается для resilience.
 
-**По ключу** (default):
+acks=all plus enable.idempotence=true plus retries max — стандартный production setup для reliability.
+
+max.in.flight.requests.per.connection=5 разрешает 5 unacked requests в одно время plus preserving ordering (с idempotence).
+
+linger.ms=10 plus batch.size=32768 balance latency и throughput.
+
+compression.type=zstd для network efficiency.
+
+## Partitioning стратегии
+
+По ключу default. Producer вычисляет hash(key) modulo partitions:
 ```java
 new ProducerRecord<>("orders", "customer-42", order);
 // hash("customer-42") % partitions → та же partition для этого customer
 ```
 
-**Round-robin** (без ключа):
+Гарантирует ordering per key. Все events one customer идут в one partition в правильном order.
+
+Round-robin без ключа:
 ```java
 new ProducerRecord<>("orders", null, order);
 // каждое сообщение → следующая partition
 ```
 
-**Sticky** (Kafka 2.4+, default для без-ключа): batch отправляется на одну partition для эффективности.
+Uniform distribution но no ordering guarantees per anything specific.
 
-**Custom**:
+Sticky (Kafka 2.4+, default для без-ключа). Batch отправляется на одну partition для batching efficiency plus rotates on batch completion. Combines throughput benefits batching plus reasonable distribution.
+
+Custom partitioner для business-specific logic:
 ```java
 public class MyPartitioner implements Partitioner {
     public int partition(String topic, Object key, byte[] keyBytes,
                          Object value, byte[] valueBytes, Cluster cluster) {
-        // custom logic
+        // custom logic based on value or business rules
     }
 }
 ```
 
-Регистрация: `partitioner.class=com.example.MyPartitioner`.
+Регистрация через partitioner.class=com.example.MyPartitioner.
 
-### 1.5 Delivery guarantees
+## Delivery guarantees сочетания
 
-Комбинация настроек:
+Combinations settings определяют guarantees.
 
-**At-most-once**:
-```
-acks=0 (или 1) + retries=0
-```
+At-most-once. acks=0 или 1 plus retries=0. Может потерять messages, не задваивает. Использование для metrics где потеря одной метрики не критична.
 
-Может потерять, не задваивает.
+At-least-once. acks=all plus retries>0. Не потеряет message, может задвоить (при retry без idempotence). Standard for reliable data. Idempotency consumer критична.
 
-**At-least-once**:
-```
-acks=all + retries>0
-```
+Exactly-once в one producer. acks=all plus enable.idempotence=true. Не потеряет, не задваивает в рамках одной partition. Ideal для single-partition scenarios.
 
-Не потеряет, может задвоить (при retry без idempotence).
+Exactly-once transactional требует transactional.id plus producer.initTransactions plus wrap operations in beginTransaction/commitTransaction. Для multi-partition atomic writes plus consumer offset commits в one transaction.
 
-**Exactly-once** (в одном producer):
-```
-acks=all + enable.idempotence=true
-```
+## Consumer детально
 
-Не потеряет, не задвоит (в рамках одной partition).
-
-**Exactly-once transactional** (см. `42-kafka-prod.md`):
-```
-+ transactional.id + producer.initTransactions()
-```
-
-Для многих partitions атомарно.
-
----
-
-## 2. Consumer детали
-
-### 2.1 Основной цикл
-
+Основной цикл consumer:
 ```java
 Consumer<String, Order> consumer = new KafkaConsumer<>(props);
 consumer.subscribe(List.of("orders"));
@@ -150,20 +136,13 @@ try {
 }
 ```
 
-### 2.2 poll модель
+poll model. Kafka pull-based (в отличие от RabbitMQ push). Consumer сам запрашивает данные через poll(timeout).
 
-Kafka — **pull-based**. Consumer сам запрашивает данные. В отличие от Rabbit (push).
+poll(timeout) забирает batch messages up to max.poll.records (default 500). Ждёт до timeout если нет данных. Также используется для heartbeat к coordinator — важная function.
 
-`poll(timeout)`:
-- Забирает пачку сообщений (до `max.poll.records`, default 500).
-- Ждёт до `timeout` если нет данных.
-- **Также** используется для heartbeat к coordinator.
+Если между poll'ами прошло больше max.poll.interval.ms (default 5 минут) — coordinator считает consumer мёртвым и triggers rebalance. Отсюда правило — обрабатывать batch быстро, для долгих операций либо увеличить max.poll.interval.ms либо offload обработку в отдельные threads.
 
-Если между poll'ами прошло больше `max.poll.interval.ms` (default 5 мин) → coordinator считает consumer мёртвым → rebalance.
-
-**Правило**: обрабатывать batch быстро; для долгих операций — увеличить `max.poll.interval.ms` или обработка в отдельных потоках.
-
-### 2.3 Ключевые настройки
+## Consumer ключевые настройки
 
 ```properties
 bootstrap.servers=broker:9092
@@ -189,22 +168,19 @@ fetch.min.bytes=1
 fetch.max.wait.ms=500
 ```
 
-### 2.4 auto.offset.reset
+auto.offset.reset определяет behavior при первом запуске когда нет saved offset.
 
-Что делать при первом запуске (нет сохранённого offset):
-- **earliest** — с начала topic.
-- **latest** — только новые сообщения (пропустить историю).
-- **none** — exception.
+earliest — с начала topic. Consumer reads все historical messages.
 
-Для новых consumer'ов на существующем topic — обычно `latest`.
+latest — только новые сообщения. Пропускает history.
 
----
+none — throw exception если no offset. Для strict scenarios где либо offset есть либо fail.
 
-## 3. Consumer group
+Для новых consumers на existing topic обычно latest — не хотим reprocess historical data.
 
-### 3.1 Что это
+## Consumer group
 
-**Consumer group** — набор consumer'ов, делящих обработку topic.
+Consumer group это набор consumers делящих обработку topic. Ключевая абстракция для parallelism.
 
 ```
 Topic "orders" (partitions 0, 1, 2, 3)
@@ -217,17 +193,11 @@ Topic "orders" (partitions 0, 1, 2, 3)
 └───────────────────────────────────┘
 ```
 
-Правило: **каждая partition назначена одному consumer в группе**.
+Правило — каждая partition назначена ровно одному consumer в group. Если consumers меньше partitions некоторые consumers обслуживают multiple partitions. Если consumers больше partitions лишние простаивают.
 
-- Если consumer < partitions → некоторые consumer'ы обслуживают несколько.
-- Если consumer > partitions → часть consumer'ов простаивает.
+Отсюда важное следствие. Partition это единица parallelism. Хочешь больше parallelism — создавай больше partitions. Меньше partitions чем ожидаемых consumers — waste resources.
 
-Отсюда: **partition = единица параллелизма**. Хочешь больше параллелизма → больше partitions.
-
-### 3.2 Разные group
-
-Если разные group подписаны на тот же topic → каждая получает **свою копию** сообщений.
-
+Разные groups подписанные на same topic получают каждая свою копию сообщений:
 ```
 Topic "orders"
     │
@@ -238,62 +208,37 @@ Topic "orders"
     └─ Group "analytics" (consumers E) — все сообщения
 ```
 
-Это как **fanout** в Rabbit.
+Это equivalent fanout pattern в RabbitMQ. Каждая group processes independently — не влияют друг на друга.
 
-### 3.3 Rebalancing
+## Rebalancing
 
-**Rebalance** — перераспределение partitions между consumer'ами группы. Триггеры:
-- Новый consumer join.
-- Consumer покинул (нормально или crash).
-- Изменение partition count в topic.
+Rebalance это перераспределение partitions между consumers группы. Triggered в нескольких сценариях. Новый consumer join группу. Consumer покинул (normal shutdown или crash). Изменение partition count в topic.
 
-Во время rebalance — **вся группа не потребляет** (freeze). Может занять секунды.
+Во время rebalance вся группа не потребляет — freeze. Может занять секунды. Всё group operations paused до completion.
 
-Проблема **rebalancing storm** — частые rebalance при нестабильных consumer'ах. Тюнить heartbeat / session.timeout.
+Rebalancing storm это проблема когда consumers нестабильны и rebalances происходят часто. Fixing через настройку heartbeat.interval.ms и session.timeout.ms.
 
-### 3.4 Стратегии assignor
+Стратегии assignor определяют как partitions распределяются между consumers. RangeAssignor default — topics в alphabetical order, partitions в ranges. RoundRobinAssignor — round-robin по всем topics вместе. StickyAssignor минимизирует reassignment при rebalance — preserves previous assignments где возможно. CooperativeStickyAssignor (Kafka 2.4+) — incremental rebalance, не полный freeze.
 
-Как partitions распределяются:
-- **RangeAssignor** (default) — топики по алфавиту, partitions по диапазонам.
-- **RoundRobinAssignor** — по кругу, все topics вместе.
-- **StickyAssignor** — минимизирует reassignment при rebalance.
-- **CooperativeStickyAssignor** — incremental rebalance (Kafka 2.4+), не freeze.
+Правило для новых consumers — CooperativeStickyAssignor. Значительно меньше disruption во время rebalance.
 
-Правило для новых consumer'ов: **CooperativeStickyAssignor** — меньше freeze.
+## Offset management
 
----
+__consumer_offsets это специальный Kafka topic где consumers commit свои offsets. Format `(group.id, topic, partition) → offset`. Consumer при starting reads свой offset и продолжает с этой position.
 
-## 4. Offset management
+Auto commit через enable.auto.commit=true (default). Kafka автоматически commits каждые auto.commit.interval.ms (default 5 секунд).
 
-### 4.1 __consumer_offsets
+Проблема auto commit. Commit происходит независимо от обработки. Возможен crash между commit и обработкой — потеря message. Или обратный — обработал но crashed до next auto commit — reprocess при restart (duplicate).
 
-Специальный topic Kafka. Consumer commit'ит свои offsets туда.
+Правило для важных сообщений — отключить auto-commit. enable.auto.commit=false.
 
-Формат: `(group.id, topic, partition) → offset`.
-
-### 4.2 Auto commit
-
-`enable.auto.commit=true` (default) — Kafka автоматически commit'ит каждые `auto.commit.interval.ms` (default 5 сек).
-
-**Проблема**: commit происходит **до** обработки → возможна потеря при crash между commit и обработкой.
-
-Или наоборот — обработал → до auto-commit крашнулся → снова обработает (duplicate).
-
-**Правило**: **отключить auto-commit** для важных сообщений.
-
-### 4.3 Manual commit
-
-```properties
-enable.auto.commit=false
-```
-
-Явно:
+Manual commit явно:
 ```java
 consumer.commitSync();     // блокирующий, надёжный
 consumer.commitAsync();    // не блокирует, callback
 ```
 
-Обычная схема:
+Стандартная схема at-least-once:
 ```java
 while (running) {
     ConsumerRecords<...> records = consumer.poll(...);
@@ -304,66 +249,48 @@ while (running) {
 }
 ```
 
-**At-least-once**: commit **после** обработки. Если crash до commit — сообщения обработаются снова (idempotency важна).
+Обработать сначала, только потом commit. Если crash до commit — messages обрабатываются снова при restart (idempotency важна для safety).
 
-### 4.4 Ручной offset
-
+Ручной offset control:
 ```java
 // commit конкретных offsets
 Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
 offsets.put(new TopicPartition("orders", 0), new OffsetAndMetadata(42L));
 consumer.commitSync(offsets);
 
-// seek
-consumer.seek(new TopicPartition("orders", 0), 100L);   // прочитать с offset 100
+// seek к конкретному offset
+consumer.seek(new TopicPartition("orders", 0), 100L);
 consumer.seekToBeginning(...);
 consumer.seekToEnd(...);
 ```
 
-Использование seek: replay событий, skip poisoned messages.
+seek useful для replay событий (start from earlier point), skip poisoned messages (jump past known bad offset).
 
-### 4.5 commitSync vs commitAsync
+commitSync vs commitAsync trade-offs. Sync блокирует до подтверждения — надёжно but slow. Async не блокирует plus callback — быстро но crash before callback loss commit.
 
-- **commitSync** — блокирует до подтверждения. Надёжно, но медленно.
-- **commitAsync** — не блокирует, callback. Быстро, но при crash до callback — не commit'нулся.
+Практика — commitSync после каждого batch. commitAsync between batches если want быстрый intermediate commits. Combination gives reliability plus reasonable performance.
 
-Правило: **commitSync** после каждого batch + **commitAsync** между.
+## Delivery semantics в consumer
 
----
-
-## 5. Delivery semantics
-
-### 5.1 At-most-once
-
-Commit **до** обработки:
+At-most-once — commit до обработки:
 ```java
 consumer.commitSync();
 process(record);   // если упало здесь → сообщение потеряно
 ```
 
-Использование: метрики (потеря одной ок).
+Использование для metrics где потеря одной ок.
 
-### 5.2 At-least-once (default recommendation)
-
-Commit **после** обработки:
+At-least-once (default recommendation) — commit после обработки:
 ```java
 process(record);
 consumer.commitSync();
 ```
 
-Дубли возможны (crash между process и commit).
+Дубли возможны (crash между process и commit). Always идемпотентный consumer.
 
-**Всегда идемпотентный consumer**.
+Exactly-once комбо всех features. Idempotent producer. Transactional producer для multi-partition writes. isolation.level=read_committed на consumer чтобы читать только committed transactions. Обработка plus commit внутри Kafka-транзакции.
 
-### 5.3 Exactly-once
-
-Комбо:
-- **Idempotent producer** (`enable.idempotence=true`).
-- **Transactional producer** для multi-partition atomic writes.
-- **`isolation.level=read_committed`** на consumer.
-- **Обработка + commit** внутри Kafka-транзакции.
-
-Пример stream processing:
+Пример stream processing exactly-once:
 ```java
 producer.beginTransaction();
 try {
@@ -378,33 +305,25 @@ try {
 }
 ```
 
-Не всегда возможно (если writes идут не только в Kafka). Подробно — `42-kafka-prod.md`.
+Не всегда возможно если writes идут не только в Kafka (например также в БД). Тогда либо outbox pattern либо accept at-least-once plus idempotency.
 
----
+## Heartbeat и session
 
-## 6. Heartbeat и session
+Consumer посылает heartbeat coordinator'у чтобы «я жив». Два разных timing параметра.
 
-Consumer посылает heartbeat coordinator'у чтобы «я жив».
+heartbeat.interval.ms=3000 — как часто (default 3 секунды). Идёт в отдельном thread от processing.
 
-- `heartbeat.interval.ms=3000` — как часто (default 3 сек).
-- `session.timeout.ms=10000` — если нет heartbeat N мс → dead → rebalance (default 10 сек, макс 30 сек до 3.0, 45 сек в 3.0+).
+session.timeout.ms=10000 — если нет heartbeat за N миллисекунд consumer считается dead и triggers rebalance. Default 10 секунд, максимум 30 секунд до Kafka 3.0, 45 секунд в 3.0+.
 
-Плюс `max.poll.interval.ms=300000` (5 мин) — если между poll больше — dead.
+max.poll.interval.ms=300000 (5 минут) — независимый timeout. Если между poll calls больше — dead. Ловит случаи где heartbeat thread живой но main processing застрял.
 
-Разница:
-- Heartbeat идёт в отдельном потоке — независимо от обработки.
-- max.poll.interval — время обработки batch.
+Разница important. Heartbeat в отдельном thread — независимо от processing time. max.poll.interval для processing time — timeout batch handling.
 
-Если обработка долгая:
-- Увеличить `max.poll.interval.ms`.
-- Уменьшить `max.poll.records`.
-- Пауза-возобновление partition (`pause`, `resume`) — chunk-обработка.
+Если обработка долгая — options. Увеличить max.poll.interval.ms. Уменьшить max.poll.records (обрабатывать меньшие batches). Pause и resume partition для chunk-обработки — pause preventing next poll while processing continues, resume when ready.
 
----
+## Rebalance listener
 
-## 7. Rebalance listener
-
-Callback на rebalance:
+Callback выполняющийся при rebalance:
 ```java
 consumer.subscribe(List.of("orders"), new ConsumerRebalanceListener() {
     @Override
@@ -419,44 +338,43 @@ consumer.subscribe(List.of("orders"), new ConsumerRebalanceListener() {
 });
 ```
 
-Полезно для graceful commit при shutdown / rebalance.
+onPartitionsRevoked вызывается перед losing partitions. Хорошее место для commit offsets того что already processed чтобы не reprocess после rebalance.
 
----
+onPartitionsAssigned вызывается при getting new partitions. Инициализация state, seek к desired offset if applicable, cleanup previous state.
 
-## 8. Дедуп на consumer стороне
+Полезно для graceful commit при shutdown или rebalance scenarios.
 
-Даже с idempotent producer — дубли возможны при retry / rebalance.
+## Дедуп на consumer стороне
 
-Правило: consumer **должен быть идемпотентен**:
+Даже с idempotent producer дубли возможны при retry или rebalance scenarios. Consumer должен быть идемпотентен.
 
-**A) Уникальный messageId + processed table**:
+Уникальный messageId plus processed table:
 ```java
 if (processedRepo.existsById(record.key())) return;
 process(record);
 processedRepo.save(new Processed(record.key()));
 ```
 
-**B) Идемпотентные UPDATE**:
+Идемпотентные UPDATE через condition:
 ```sql
 UPDATE orders SET status='PROCESSED' WHERE id=? AND status='NEW';
--- второй раз ничего не изменит
+-- второй раз ничего не изменит потому что status уже PROCESSED
 ```
 
-**C) UPSERT**:
+UPSERT для inserts:
 ```sql
 INSERT ... ON CONFLICT DO NOTHING;
 ```
 
----
+## Многопоточная обработка
 
-## 9. Многопоточная обработка
+По default Kafka consumer однопоточный — один поток на consumer instance.
 
-По умолчанию Kafka consumer — **однопоточный** (один поток на consumer).
+Для parallelism два подхода.
 
-Для параллелизма:
-1. **Больше consumers в группе** (до количества partitions).
-2. **Внутри одного consumer — thread pool** для обработки:
+Первый — больше consumers в группе (до количества partitions). Каждый consumer в своём thread обрабатывает свой subset partitions. Простой approach — leverage built-in parallelism.
 
+Второй — thread pool внутри одного consumer для обработки:
 ```java
 ExecutorService pool = Executors.newFixedThreadPool(10);
 
@@ -471,54 +389,31 @@ while (running) {
 }
 ```
 
-Кавет: теряется порядок обработки внутри partition. Если нужен порядок — не делать multi-threading внутри partition.
+Caveat — теряется ordering обработки внутри partition. Если ordering matters — не делать multi-threading внутри partition.
 
-Spring Kafka имеет `concurrency` (см. `41-spring-kafka.md`) — по сути это несколько consumer'ов в одном приложении.
+Spring Kafka имеет concurrency setting который по сути создаёт несколько consumers в одном приложении. Более structured approach.
 
----
+## Real-world типичные ошибки
 
-## 10. Real-world: типовые ошибки
+Медленный consumer plus rebalance. max.poll.interval.ms истёк — coordinator убил — rebalance — after rebalance тот же consumer снова медленный — loop.
 
-### 10.1 Медленный consumer → rebalance
+Fix. Уменьшить max.poll.records плюс увеличить max.poll.interval.ms. Или профилировать почему обработка медленная.
 
-`max.poll.interval.ms` истёк → coordinator убил → rebalance → снова тот же сценарий. Loop.
+Poison pill. Message с invalid форматом — Deserializer падает при poll — poll throws exception — бесконечный retry потому что offset не commited.
 
-Fix: уменьшить `max.poll.records` или увеличить `max.poll.interval.ms`.
+Fix. ErrorHandlingDeserializer (Spring Kafka) оборачивает parsing и отправляет problematic messages в DLT (Dead Letter Topic). Или custom code с try/catch десериализации.
 
-### 10.2 Poison pill
+Дубли из-за crash между process и commit. Обычная реальность at-least-once semantics. Идемпотентность consumer'а обязательна — no way around.
 
-Сообщение с невалидным форматом → Deserializer падает → poll бросает exception → бесконечный retry.
+Offset lag растёт. Consumer не догоняет producer. Причины. Медленный consumer processing time exceeds message arrival rate. Мало consumers в группе. Мало partitions (нельзя добавить больше consumers чем partitions). Downstream БД или API тормозит.
 
-Fix:
-- `ErrorHandlingDeserializer` (Spring Kafka) — оборачивает + отправляет в DLT.
-- Custom code — try/catch десериализации.
+Мониторить consumer lag = latest_offset - current_offset per partition. Grafana dashboards с alerts на growing lag.
 
-### 10.3 Дубли из-за crash между process и commit
+Hot partition — один key берёт большую часть трафика — одна partition перегружена, другие простаивают. Fix через sharding ключа либо custom partitioner distributing load more evenly.
 
-Обычная реальность. **Идемпотентность consumer'а** — обязательна.
+## Kafka Streams кратко
 
-### 10.4 Offset lag растёт
-
-Consumer не догоняет producer. Причины:
-- Медленный consumer.
-- Мало consumers в группе.
-- Мало partitions (нельзя добавить больше consumers чем partitions).
-- Downstream БД/API тормозит.
-
-Мониторить: **consumer lag** = `latest_offset - current_offset` per partition.
-
-### 10.5 Hot partition
-
-Один ключ занимает большую часть трафика → одна partition перегружена, другие пустуют.
-
-Fix: sharding ключа, custom partitioner.
-
----
-
-## 11. Kafka Streams (кратко)
-
-Библиотека для stream processing поверх Kafka.
-
+Библиотека для stream processing поверх Kafka. Declarative API для transformations:
 ```java
 KStream<String, Order> orders = builder.stream("orders");
 orders
@@ -527,41 +422,32 @@ orders
     .to("big-orders");
 ```
 
-Exactly-once, stateful (RocksDB), joins, aggregations.
+Возможности. Exactly-once semantics built-in. Stateful operations через RocksDB local state stores. Joins между streams. Windowed aggregations по времени. Full stream processing capabilities.
 
-Не в этом файле, но знать что существует.
+Отдельная тема — не в этом file. Важно знать что existence — для сложных stream processing scenarios Kafka Streams мощнее чем raw consumer.
 
----
+## Итоги
 
-## 12. Собесные вопросы
+Producer. acks=all plus enable.idempotence=true plus reasonable batching через linger.ms и batch.size. compression.type=zstd для network efficiency.
 
-1. **Как producer выбирает partition?** — hash(key) % partitions; без ключа round-robin / sticky.
-2. **Что такое acks?** — Уровень надёжности: 0 (fire), 1 (leader), all (все ISR).
-3. **Идемпотентный producer — что даёт?** — Retry не даст дублей в рамках одной partition.
-4. **Что такое consumer group?** — Группа consumer'ов, делят partitions одного topic.
-5. **Разные consumer groups и один topic?** — Каждая группа получает всю копию (fanout).
-6. **Что происходит при rebalance?** — Партиции перераспределяются; вся группа не потребляет.
-7. **poll timeout — что делает?** — Как долго ждать при отсутствии данных; также идёт heartbeat.
-8. **auto-commit vs manual commit?** — Auto: каждые N мс (риск потери/дублей); manual: явный контроль.
-9. **commitSync vs commitAsync?** — Sync блокирует до подтверждения; Async не блокирует, callback.
-10. **Delivery semantics?** — At-most-once (commit до), at-least-once (после), exactly-once (idempotent + transactional).
-11. **Что такое offset lag?** — Разница latest_offset и current_offset consumer'а; растущий = отстаёт.
-12. **auto.offset.reset — когда earliest vs latest?** — При первом запуске: earliest — с начала topic; latest — только новые.
-13. **Как обеспечить идемпотентность consumer?** — processed_id table / UPSERT / conditional UPDATE.
-14. **max.poll.interval.ms — что?** — Максимум времени между poll'ами; иначе dead → rebalance.
-15. **Разница heartbeat.interval.ms и session.timeout.ms?** — Heartbeat как часто; session сколько без heartbeat = dead.
+Ключ равно partition равно ordering. Same key routes к same partition preserving order per business entity.
 
----
+Consumer group делит partitions между consumers. Partition единица parallelism.
 
-## Итог
+Rebalance freezes group during redistribution. CooperativeStickyAssignor минимизирует disruption.
 
-- **Producer**: acks=all + idempotence + компрессия.
-- **Ключ** = partition = порядок.
-- **Consumer group** делит partitions.
-- **Rebalance** = freeze; минимизировать через Cooperative assignor.
-- **Manual commit** после обработки.
-- **At-least-once** + **идемпотентность** = стандартный setup.
-- **max.poll.interval.ms** > время обработки batch.
-- Мониторить **consumer lag**.
+Manual commit после обработки. commitSync для reliability. commitAsync between batches для performance.
 
-Следующий — `41-spring-kafka.md`.
+At-least-once plus идемпотентность = стандартный setup. Exactly-once требует transactions plus consumer в read_committed mode.
+
+max.poll.interval.ms больше времени обработки batch. Иначе rebalance loop.
+
+Poison pill handling через ErrorHandlingDeserializer или explicit try/catch.
+
+Мониторить consumer lag. Growing lag indicates capacity problem или downstream issue.
+
+Multi-threading внутри consumer теряет partition ordering. Better увеличить consumers в группе если ordering не критичен.
+
+Kafka Streams для сложных stream processing scenarios.
+
+Дальше — Spring Kafka как high-level abstraction над raw Kafka client в Spring экосистеме.
