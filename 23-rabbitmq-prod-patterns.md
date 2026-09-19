@@ -1,373 +1,168 @@
-# 23. RabbitMQ: паттерны и troubleshooting в проде
+# 23. RabbitMQ: паттерны и troubleshooting в production
 
-Кластеризация, паттерны использования, мониторинг, частые проблемы.
+## Паттерны использования
 
----
+RabbitMQ применяется в различных сценариях каждый со своими характеристиками. Понимание базовых паттернов помогает выбирать правильный подход для конкретной задачи.
 
-## 1. Паттерны использования
-
-### 1.1 Work queue
-
-**Одна очередь, много consumer'ов**. Классика.
+Work queue паттерн — самый классический. Одна очередь и много consumers обрабатывающих сообщения параллельно. Broker распределяет сообщения между consumers по round-robin с учётом prefetch и ack. Используется для распределённой обработки задач — распечатать тысячу отчётов, обработать пачку изображений, отправить множество email:
 
 ```
-publisher → work.queue → [consumer1, consumer2, consumer3, ...]
+publisher → work.queue → ┌─► consumer1
+                         ├─► consumer2
+                         └─► consumer3
 ```
 
-Broker раскидывает по round-robin (с учётом prefetch и ack).
+Каждое сообщение попадает только к одному consumer. Общая throughput растёт линейно с количеством consumers до момента когда broker или подлежащие ресурсы становятся bottleneck. Простой и надёжный паттерн для распараллеливания однотипной работы.
 
-Использование: распределённая обработка задач. Например, распечатать 1000 отчётов — 10 consumer'ов быстро закроют.
-
-### 1.2 Pub-Sub (fanout)
-
-**Один exchange fanout → много очередей → много подписчиков**.
+Pub-sub паттерн через fanout exchange реализует broadcast — одно событие доставляется многим независимым подписчикам. Producer публикует в fanout exchange, каждая bound очередь получает копию сообщения, каждый consumer работает со своей независимой копией:
 
 ```
-publisher → fanout.exchange → [queue1, queue2, queue3]
-                                  ↓        ↓        ↓
-                              consumer1 consumer2 consumer3
+                       ┌─► queue1 → consumer1 (audit)
+publisher → fanout.ex ─┼─► queue2 → consumer2 (notifications)
+                       └─► queue3 → consumer3 (analytics)
 ```
 
-Использование: broadcast событий, инвалидация кэша.
+Использование для broadcast событий вроде инвалидации кэша, распространения новостей, отправки одного события множеству отделов системы. Каждый подписчик обрабатывает сообщение независимо, добавление нового подписчика не влияет на существующих.
 
-### 1.3 Topic routing
-
-**Fanout по паттерну**.
+Topic routing использует topic exchange для маршрутизации по pattern matching. Producer публикует с иерархическим routing key. Consumers подписываются на конкретные patterns через wildcards:
 
 ```
-publisher → topic.exchange
-                │
-   ├─ "orders.kz.new"  → kz-orders queue
-   ├─ "orders.uz.new"  → uz-orders queue
-   └─ "orders.*.new"   → all-orders queue
+                          ┌─ "orders.kz.new"  → kz-orders queue → kz-consumer
+publisher → topic.ex ─────┼─ "orders.uz.new"  → uz-orders queue → uz-consumer
+                          └─ "orders.*.new"   → all-orders queue → analytics
 ```
 
-Использование: routing по бизнес-контексту.
+Использование для routing по бизнес-контексту. Разные consumers могут интересоваться разными подмножествами событий. Wildcards дают гибкость — analytics слушает все создания заказов независимо от страны, регион-specific consumers обрабатывают только свои.
 
-### 1.4 RPC (request/reply)
+RPC pattern через request-reply queues возможен но обычно нежелателен. Синхронное общение через асинхронный broker сложнее чем прямой HTTP. Использовать редко когда конкретная ситуация оправдывает — обычно routing через exchange для service discovery или сложная топология уже настроена.
 
-Синхронное общение через Rabbit. Producer публикует запрос с `reply-to` = его temporary queue, ждёт ответ.
+Priority queue поддерживает приоритеты через x-max-priority аргумент. Producer устанавливает priority от 0 до максимума, broker отдаёт сообщения с высоким приоритетом первыми. Использование для срочных операций перегоняющих обычные — критическая нотификация приоритетнее рутинного audit.
 
-```
-client → request.queue → server
-   ↑                        │
-   └── reply.queue (temp) ──┘
-```
+Delayed messages реализуются через плагин rabbitmq-delayed-message-exchange или через TTL плюс DLX трюк. С плагином — special exchange принимающий x-delay header, публикующий сообщение в bound queue через указанное время. Без плагина — очередь-holder с TTL и DLX указывающим на целевую queue, сообщение висит TTL time и потом через DLX попадает куда нужно. Использование для retry backoff, отложенных напоминаний, scheduled tasks.
 
-**Плохо** для микросервисов — сложнее HTTP. Использовать редко.
-
-### 1.5 Priority queue
-
-Очередь с приоритетами:
-```
-x-max-priority: 10
-```
-
-Producer ставит priority (0-10). Broker отдаёт с высшим priority первым.
-
-Использование: срочные сообщения перегоняют обычные.
-
-### 1.6 Delayed / scheduled messages
-
-Плагин `rabbitmq-delayed-message-exchange`:
-```java
-props.setHeader("x-delay", 60000);   // отправить через 60 сек
-```
-
-Или через TTL + DLX «дедаловский» трюк:
-1. Отправить в holding-queue с TTL=60000.
-2. TTL истёк → сообщение → DLX → целевая queue.
-
-Использование: retry backoff, «напомнить через час».
-
-### 1.7 Saga / choreography
-
-Каждый сервис реагирует на события, публикует свои. Нет единого дирижёра.
+Saga pattern через choreography реализует сложные workflow через events. Каждый сервис реагирует на relevant события публикуя свои. Нет центрального дирижёра — координация decentralized:
 
 ```
 OrderCreated → InventoryService → InventoryReserved →
     PaymentService → PaymentReceived → OrderConfirmed
 ```
 
-Если что-то падает — компенсирующие события (`InventoryReleased`, `PaymentRefunded`).
+При failure — компенсирующие события отменяющие проделанные шаги. InventoryReleased после PaymentFailed, OrderCancelled после InventoryReleased. Сложно моделировать и debugging но хорошо масштабируется в микросервисной архитектуре без единой точки отказа.
 
-Сложно моделировать и отлаживать, но масштабируется.
+## Кластеризация
 
----
+RabbitMQ поддерживает кластеризацию для высокой доступности. Несколько узлов образуют кластер, metadata реплицируется между всеми узлами, connections могут идти к любому узлу. Однако сами queues по умолчанию живут только на одном узле — если этот узел падает, queue становится недоступной пока не поднимется.
 
-## 2. Кластеризация
+Classic mirroring был классическим решением для HA до RabbitMQ 3.8. Queue зеркалируется между узлами кластера — master плюс slaves. Каждое сообщение реплицируется на master и slaves. При failure master один из slaves становится новым master. Проблемы включают возможность split-brain при сетевом разделении, медленную синхронную репликацию, риск потери данных при определённых failure scenarios. Deprecated в новых версиях RabbitMQ в пользу quorum queues.
 
-### 2.1 Classic mirroring (deprecated)
+Quorum queues заменили classic mirroring как рекомендуемый подход для HA начиная с 3.8. Основаны на Raft consensus algorithm — тот же алгоритм что используется в etcd, Consul, других distributed системах. Обычно 3 или 5 replicas, quorum большинства записывает и подтверждает сообщение перед ack producer. Automatic failover без split-brain. Более надёжные и производительные чем classic mirroring в failure scenarios.
 
-Классический кластер: очереди зеркалируются между узлами. Master + slaves. При падении master'а — один из slaves становится новым master'ом.
+Активация quorum queue при создании через QueueBuilder метод quorum. Практическое правило — для новых очередей всегда quorum, для важных данных обязательно. Classic queues остаются для temporary или non-critical сценариев где реплицирование overhead неоправдан.
 
-Проблемы:
-- Split-brain при сетевом разделении.
-- Медленно (репликация синхронная).
-- Deprecated в новых версиях RabbitMQ.
+Federation и Shovel решают задачи multi-datacenter или asymmetric топологии между отдельными кластерами. Federation создаёт «мосты» между кластерами для обмена сообщениями — сообщение из exchange одного кластера автоматически передаётся в связанный exchange другого. Shovel настраивает fixed transfer из queue одного кластера в queue или exchange другого — более гибкий но менее «прозрачный».
 
-### 2.2 Quorum queues
+Использование для disaster recovery когда основной DC теряется и трафик переключается на резервный. Для геораспределённых систем где локальные consumers обрабатывают локальные события с eventual синхронизацией. Для migration сценариев при переезде на новый кластер.
 
-**Современный подход** (RabbitMQ 3.8+). Основан на **Raft** — тот же алгоритм что у etcd, Consul.
+## Мониторинг
 
-- Обычно 3 или 5 replicas.
-- Кворум записывает и подтверждает.
-- Automatic failover.
-- Нет split-brain.
+Комплексный мониторинг критически важен для production RabbitMQ. Основные метрики которые необходимо отслеживать разделяются на несколько категорий.
 
-```java
-QueueBuilder.durable("my.q")
-    .quorum()
-    .build();
-```
+Queue metrics показывают состояние отдельных очередей. Messages ready — сколько сообщений ждёт обработки, рост означает отставание consumer. Messages unacknowledged — сколько в работе, чрезмерное значение может указывать на медленный consumer или отсутствие ack. Publish rate и consume rate — балансировка publish и consumption, если publish значительно превышает consume в течение времени queue будет расти.
 
-**Правило**: для новых очередей — quorum. Для важных данных — обязательно.
+Consumer metrics отслеживают активность consumers. Consumer count per queue — сколько активных consumers, значение 0 при наличии сообщений критическая проблема. Redeliver rate — частота повторных доставок, рост означает проблемы с обработкой (consumers падают или nack).
 
-### 2.3 Federation и Shovel
+Connection metrics касаются состояния сети. Connection count — количество активных соединений, слишком высокое значение может указывать на leak. Channel count — каналы внутри соединений, аналогично. Blocked connections — producers заблокированные из-за flow control, признак memory или disk давления.
 
-Для multi-datacenter или asymmetric топологии:
-- **Federation** — «мосты» между кластерами для обмена сообщениями.
-- **Shovel** — перекачка из очереди A на кластере 1 в очередь B на кластере 2.
+Broker resource metrics показывают состояние самого broker. Memory usage — общее использование памяти, приближение к vm_memory_high_watermark активирует flow control. Disk free — свободное место на диске, приближение к порогу активирует disk alarm. File descriptors и socket descriptors — лимиты OS которые могут стать bottleneck при большом количестве connections.
 
-Используется для DR (disaster recovery), геораспределённых систем.
+Cluster metrics для кластеризованных установок. Network partitions — split-brain индикаторы, требуют немедленного внимания. Node availability — какие узлы кластера live. Queue leader distribution — балансировка queue leaders между узлами.
 
----
+Management UI на порту 15672 предоставляет визуальный интерфейс для ad-hoc мониторинга. Показывает все обсуждённые метрики в реальном времени, историю за последние периоды, детальную информацию по exchanges, queues, connections, channels. Полезно для explorаторной диагностики.
 
-## 3. Мониторинг
+Prometheus интеграция через rabbitmq_prometheus плагин экспортирует метрики в стандартном формате. Grafana dashboards визуализируют тренды. Alerting rules настраиваются на превышение критических порогов. Стандартный setup для production observability.
 
-### 3.1 Что мониторить
+Alerting должен покрывать критические сценарии. Queue depth превышает N (например 10000) в течение времени — indicates отставание consumer или другую проблему. Consumer count zero при наличии сообщений — критическая ситуация, обработка остановилась. Memory alarm active — broker в состоянии back-pressure. DLQ размер растёт — систематические ошибки обработки требуют внимания команды.
 
-- **Queue depth** (`messages_ready`) — сколько ждёт обработки. Рост = отставание consumer'а.
-- **Consumer count** — сколько consumer'ов на очереди. 0 → alarm.
-- **Publish rate / Consume rate** — балансировка.
-- **Redeliver rate** — сколько повторных доставок. Рост → проблемы обработки.
-- **Connection count, Channel count**.
-- **Memory usage broker'а** — приближается к `vm_memory_high_watermark`.
-- **Disk free** — memory alarm.
-- **Network partitions** — split-brain кластера.
+## Частые проблемы
 
-### 3.2 Management UI
+Реальные production проблемы обычно сводятся к нескольким типичным сценариям диагностируемым по определённым симптомам.
 
-`http://rabbit:15672/`. Показывает всё в реальном времени.
+«Сообщения теряются» — самая тревожная жалоба. Первый чеклист включает проверку durability на всех уровнях. Queue durable true? Message persistent через deliveryMode 2? Consumer использует manual ack и ack вызывается только после успешной обработки? Publisher confirms включены? Mandatory плюс returns callback для обнаружения routing проблем? В большинстве случаев проблема — один из этих пунктов не выполнен и создаёт брешь в цепочке надёжности.
 
-### 3.3 Prometheus
+«Consumer стоит, ничего не берёт» диагностируется через несколько проверок. Подписался ли consumer на очередь через basic.consume? Prefetch не равен 0 (accidentally 0 означает что broker не отправляет ничего)? Все сообщения in-flight (unacknowledged) — возможно предыдущие обработки зависли не отправив ack? Connection не упал молча — spring-rabbit обычно переподключается но иногда с ошибками? Case autoAck при exception сообщения теряются молча без alert.
 
-Плагин `rabbitmq_prometheus`:
-```
-http://rabbit:15672/metrics
-```
+«Broker медленный» может иметь несколько причин. Memory alarm означает что очереди в RAM переполняют лимит — необходимо lazy queues или увеличить watermark. Disk alarm — WAL журнал растёт быстрее чем очищается. Слишком много каналов на connection превышают channel_max лимит. Слишком много connections упираются в connection_max. Flow control замедляет producers что видно в блокировке publish operations.
 
-Grafana dashboard с queue depth, rates, resource usage.
+Redelivery loop — классическая проблема infinite reprocessing одного сообщения. Consumer падает при обработке, сообщение возвращается в queue через requeue, снова падает, снова возвращается. Причины включают retry без max-attempts, default-requeue-rejected равный true, deserialization error который никогда не пройдёт. Лечение через max-attempts плюс RejectAndDontRequeueRecoverer отправляющий в DLX после исчерпания попыток и default-requeue-rejected false как безопасный default.
 
-### 3.4 Alerting
+«Producer отправил но не пришло» может произойти по нескольким причинам. Publisher confirms не включены — producer не знает дошло ли. Exchange не существует или имя опечатано — сообщение отбрасывается broker. Routing key не сматчился с binding — сообщение silently потеряно (mandatory спасает от этого случая). Consumer вообще не подписан — проверить через management UI. Каждая из причин имеет свой fix, но начинать диагностику стоит с проверки publisher confirms поскольку без них многие проблемы остаются невидимыми.
 
-- Queue depth > N (например 10000) → alert.
-- No consumers → alert.
-- Memory alarm active → critical.
-- DLQ growing → team review.
+Дубли сообщений появляются в предсказуемых ситуациях. Consumer не acknowledge и broker переотправил после timeout — normal behavior at-least-once semantics. Publisher retry без idempotency key на consumer стороне. Multiple bindings queue к одному exchange с overlapping patterns — сообщение попадает в очередь несколько раз. Всегда идемпотентный consumer обязательное требование.
 
----
+Порядок нарушен — типично при concurrent consumers на одной очереди. Concurrency больше 1 означает parallel обработку без гарантии порядка. Nack requeue возвращает в head что нарушает порядок. Sharding по бизнес-ключу через consistent routing даёт порядок внутри shard.
 
-## 4. Частые проблемы
+## Backpressure
 
-### 4.1 «Сообщения теряются»
+Что делать когда producer быстрее consumer? Классическая проблема которая требует явного решения на архитектурном уровне.
 
-Проверка:
-1. Queue **durable=true**?
-2. Message **persistent** (`deliveryMode=2`)?
-3. Consumer **manual ack** и ack вызывается **после** обработки?
-4. **Publisher confirms** включены?
-5. **Mandatory + returns** для отлова unroutable?
+Queue растёт при дисбалансе publish и consume rates. Варианты решения включают увеличение количества consumers через scaling — новые instances consumer добавляются пока queue depth не стабилизируется. Batch processing позволяет consumer обрабатывать несколько сообщений за один цикл увеличивая throughput. Оптимизация consumer через profiling — часто bottleneck не в CPU обработки а в external calls к database или сторонним API.
 
-Обычно проблема — одно из этого пункта не выполнено.
+Drop old policy через x-max-length и overflow drop-head активно ограничивает размер queue сбрасывая старые сообщения при переполнении. Полезно для сценариев где старые сообщения перестают быть актуальными — real-time уведомления, high frequency updates.
 
-### 4.2 «Consumer стоит, ничего не берёт»
+Reject publish policy через x-max-length и overflow reject-publish не принимает новые сообщения когда queue полна создавая backpressure на producer. Producer получает nack на publisher confirms и должен решать что делать — retry позже, буферизация локально, dropping.
 
-- Consumer подписан? Смотри `basic.consume-ok`.
-- Prefetch не 0 (случайно поставили 0 = broker не шлёт).
-- Все сообщения in-flight (unacked) — увеличь prefetch или разберись почему не ack'аются.
-- Connection упал — `spring-rabbit` авто-переподключит, но иногда молча.
-- `noAck` = auto с ошибкой = сообщения теряются молча.
+Rate limiting на producer стороне — приложение сама ограничивает publish rate. Полезно для сценариев где известна максимальная capacity downstream. Проактивное ограничение предотвращает переполнение вместо реактивного разбирательства.
 
-### 4.3 «Broker медленный»
+Ограничение по размеру через x-max-length-bytes задаёт лимит суммарного объёма сообщений в очереди. Полезно для очередей с большими сообщениями где количество не отражает реальный memory footprint.
 
-- Memory alarm — очереди в RAM переполнили. Пересмотри lazy queues, увеличь `vm_memory_high_watermark`.
-- Disk alarm — журнал WAL растёт.
-- Много каналов на connection — `channel_max` лимит.
-- Много connections — `connection_max` лимит.
-- Flow control — producer'ы замедлены.
+## Безопасность
 
-### 4.4 Redelivery loop
+Base security практики для RabbitMQ включают несколько обязательных элементов для production установок.
 
-Сообщение обрабатывается → падает → requeue → снова падает → ...
+Users и passwords — никогда guest/guest в production. Guest пользователь работает только с localhost по default, но всё равно опасен если случайно открыт. Отдельные пользователи per service с уникальными паролями. Password rotation при уходе персонала или подозрении на компрометацию.
 
-Причины:
-- Retry без max-attempts.
-- `default-requeue-rejected: true`.
-- Deserialization error (не сможешь распарсить никогда).
+Permissions per vhost ограничивают доступ пользователей. Каждый service имеет свой vhost и user только с правами на этот vhost. Read permissions ограничивают какие очереди можно читать. Write permissions какие exchange можно публиковать. Configure permissions какие сущности можно создавать/удалять.
 
-Лечение:
-- `max-attempts` + `RejectAndDontRequeueRecoverer` → в DLX.
-- `default-requeue-rejected: false`.
+TLS для encrypted connections через порт 5671 вместо plain 5672. Обязательно для connections через недоверенную сеть — public internet, cross-datacenter. Certificates управляются через standard PKI infrastructure. Rotation certificates перед истечением.
 
-### 4.5 Producer «отправил», но не пришло
+Sensitive data в сообщениях требует внимания. Payload обычно не encrypted внутри broker — administrator с доступом видит содержимое. Для чувствительных данных — client-side encryption перед публикацией. Alternative — ограничение доступа к broker infrastructure на operational уровне.
 
-- Publisher confirms НЕ включены → ты не знаешь дошло ли.
-- Exchange не существует / другое имя.
-- Routing key не сматчился → сообщение выброшено (mandatory спасает).
-- Consumer вообще не подписан (можно проверить в UI).
+## HA hitrosti
 
-### 4.6 Дубли сообщений
+Idempotent consumer это фундаментальное требование. Реализация через таблицу processed_messages с индексом на message_id и TTL cleanup старых записей. Каждый consumer перед обработкой проверяет — уже обработано? Если да — skip. Иначе — process и record. В одной транзакции чтобы избежать гонки.
 
-- Consumer не ack'нул → broker re-delivered.
-- Publisher retry без idempotency ключа.
+Transactional outbox решает проблему атомарности database commit и message publish. Обычная последовательность — commit транзакции в БД потом publish в Rabbit — не атомарна. Если между ними падение то inconsistent state — БД имеет изменения но событие не опубликовано (или наоборот при обратном порядке).
 
-Всегда идемпотентный consumer.
+Outbox pattern использует таблицу outbox в БД для промежуточного хранения событий. В основной транзакции — сохранить бизнес-данные плюс запись в outbox таблицу. Атомарность гарантирована транзакцией БД. Отдельный job (scheduled task или CDC listener) читает outbox → публикует в Rabbit → удаляет обработанные записи. Гарантия end-to-end — если БД коммит прошёл то outbox запись есть и рано или поздно опубликуется.
 
-### 4.7 Порядок нарушен
+Consumer graceful shutdown критически важен для не потерять сообщения при deployment. При получении SIGTERM consumer должен прекратить принимать новые сообщения из broker, дообработать уже полученные in-flight сообщения, ack всё успешно завершённое, close channel и connection корректно. Spring AMQP делает это через SmartLifecycle интерфейс, но необходимо проверить что shutdown-timeout в OS достаточен для завершения in-flight работы. Слишком короткий timeout — kill 9 обрывает in-flight обработку и сообщения возвращаются через redelivery mechanism что приводит к дубли обработки при необидентичных consumer.
 
-- Concurrent consumers → нет гарантии порядка.
-- Nack requeue возвращает в head.
-- Sharding нужен по бизнес-ключу.
+## Реальные кейсы КНП
 
-Если порядок важен → один consumer, `prefetch=1`, никаких requeue.
+Memory кейс knp-fo-sync-notification-bugs содержит шесть багов NotificationSyncService связанных с надёжной обработкой очередей. ProcessedDate микросекунды молча теряются из-за неправильной обработки timestamp precision в конверсии. @Transactional мёртв из-за self-invocation что даёт LazyInit exceptions при обращении к lazy полям в неисправно управляемой транзакции. Тихий skip на определённых ошибках вроде MAX offset без явного логирования проблемы. printStackTrace вместо log.error означает что ошибки не попадают в ELK и остаются невидимыми для мониторинга. Контекст на цикл создаёт memory leak. PeriodValue равный нулю обрабатывается некорректно.
 
----
+Фикс через merge request 369 включал явные транзакции с правильной изоляцией, structured logging через log.error с exception, правильный retry mechanism. Общий урок — правильный consumer это несколько дисциплин соблюдаемых одновременно и одна пропущенная деталь ломает всё.
 
-## 5. Backpressure
+Кейс knp-fno-outer-sync-esb-dead-route демонстрирует другой класс проблем. Sync сервис для OUTER_FNO_INFO падал 1586 раз за 13 часов из-за отсутствующего SOAP маршрута. Формально не проблема RabbitMQ, но урок общий — retry на не-фиксимую проблему создаёт шум и лишние потери. Каждая retry попытка стоит ресурсов, генерирует alerts, потенциально усугубляет проблемы через дополнительную нагрузку. Правильное решение включает circuit breaker для остановки retry при systematic ошибках, feature flag через @ConditionalOnProperty для явного отключения проблемного функционала до починки, четкая escalation процедура для не-фиксимых проблем чтобы не оставлять их в noise.
 
-Что делать когда producer быстрее consumer'а?
+Общие уроки для consumers в КНП. Все consumers должны быть идемпотентными через messageId и processed messages таблицу. Structured logging через SLF4J и log.error вместо printStackTrace. Явные транзакции без self-invocation ловушек. DLQ на все критические очереди с alerting на его рост. Метрики per queue включая rate ack, nack, redeliver.
 
-### 5.1 Queue растёт
+## Итоги
 
-Варианты:
-1. **Больше consumer'ов** — scale.
-2. **Batch** — обрабатывать пачками.
-3. **Оптимизация consumer'а** — профайлинг.
-4. **Дропать старое** — TTL, max-length.
-5. **Замедлить producer** — publisher rate limit.
+RabbitMQ поддерживает множество паттернов использования от простого work queue до сложных saga workflow. Выбор паттерна определяется требованиями к routing, гарантиям доставки, ordering, масштабированию.
 
-### 5.2 max-length
+Quorum queues заменяют classic mirroring как рекомендуемый подход для HA. Federation и Shovel решают задачи multi-datacenter и migration сценариев.
 
-```
-x-max-length: 100000
-x-overflow: drop-head    # или reject-publish (не принимать новые)
-```
+Мониторинг критически важен для production. Queue depth, consumer count, publish/consume rate, redeliver rate, resource usage broker — основные метрики. Prometheus плюс Grafana стандартный setup. Alerting на пороговые значения обязательно.
 
-При переполнении — старое дропается (или в DLX).
+Типичные проблемы имеют предсказуемые причины и стандартные fixes. Missing durability, missing publisher confirms, redelivery loop без max-attempts, backpressure без rate limiting — все встречаются регулярно и решаются известными подходами.
 
-### 5.3 max-length-bytes
+Backpressure требует явного решения — scaling, batching, TTL, max-length, rate limiting. Игнорирование ведёт к падению системы при пиковых нагрузках.
 
-Ограничение по размеру:
-```
-x-max-length-bytes: 1000000000   # 1 GB
-```
+Безопасность включает users/passwords, permissions per vhost, TLS, careful handling чувствительных данных. Guest/guest в production никогда.
 
----
+Идемпотентность consumer, transactional outbox, graceful shutdown — HA-хитрости отделяющие toy proof-of-concept от production-ready системы.
 
-## 6. Безопасность
+Реальные кейсы КНП подтверждают что теоретически правильная архитектура ломается на dozens мелких деталей — printStackTrace, self-invocation, missing DLX, retry без circuit breaker. Правильный consumer это дисциплина всех этих деталей.
 
-- **Users + passwords** — не guest/guest в проде.
-- **Permissions per vhost** — user только к нужному vhost.
-- **TLS** — encrypted connections (порт 5671).
-- **Sensitive data** — не в message body или зашифрованы (при недоверенном сегменте).
-
----
-
-## 7. HA-хитрости
-
-### 7.1 Idempotent consumer
-
-Обязательно:
-```java
-if (processedRepo.existsByMessageId(msgId)) return;
-process(...);
-processedRepo.save(msgId);
-```
-
-Таблица processed_messages с индексом на message_id + TTL cleanup.
-
-### 7.2 Transactional outbox
-
-Проблема: как атомарно сохранить в БД + опубликовать в Rabbit? Если между ними падение → inconsistency.
-
-**Outbox**:
-1. В транзакции: сохранить бизнес-данные + запись в `outbox` таблицу.
-2. Отдельный job читает outbox → публикует в Rabbit → удаляет из outbox.
-3. Гарантия: если БД коммит прошёл — outbox запись есть → рано или поздно опубликуется.
-
-### 7.3 Consumer graceful shutdown
-
-При SIGTERM:
-1. Прекратить принимать новые.
-2. Дообрабатывать текущие.
-3. Ack всё завершённое.
-4. Close channel/connection.
-
-Spring AMQP делает это через `SmartLifecycle`. Проверяй что shutdown-timeout достаточен.
-
----
-
-## 8. Реальные кейсы из ИСНА
-
-### 8.1 `knp-fo-sync-notification-bugs`
-
-6 багов NotificationSyncService:
-- processedDate-мкс молча теряется.
-- `@Transactional` мёртв (self-invocation) → LazyInit.
-- Тихий скип на ошибке (MAX offset).
-- `printStackTrace` → ELK-слепая зона.
-- Контекст-на-цикл (утечка).
-- periodValue=0.
-
-Фикс: MR !369 с явными транзакциями, structured logging, ретрай.
-
-### 8.2 `knp-fno-outer-sync-esb-dead-route`
-
-Sync-сервис для OUTER_FNO_INFO падал 1586×/13ч SOAP «маршрут не поднят». Не задача Rabbit, но урок: **retry на не-фиксимую проблему = шум и лишние потери**. Правильно — circuit breaker + флаг `@ConditionalOnProperty` для отключения.
-
-### 8.3 Уроки
-
-1. Все consumer'ы **идемпотентные** и **логирующие**.
-2. `printStackTrace` = зло. Structured `log.error(msg, e)`.
-3. Явные транзакции без self-invocation.
-4. DLQ + alerting на его рост.
-5. Метрики per очередь: rate ack/nack/redeliver.
-
----
-
-## 9. Собесные вопросы
-
-1. **Паттерны использования Rabbit?** — Work queue, pub-sub, topic routing, RPC, priority, delayed, saga.
-2. **Разница quorum и classic queues?** — Quorum на Raft (Boot-in HA); classic — mirroring (deprecated).
-3. **Что мониторить в проде?** — Queue depth, consumer count, publish/consume rate, redeliver rate, memory/disk broker'а.
-4. **Что такое memory alarm?** — Broker останавливает producer'ов когда RAM > watermark.
-5. **Как избежать redelivery loop?** — max-attempts + RejectAndDontRequeueRecoverer + defaultRequeueRejected=false.
-6. **Как обеспечить порядок в Rabbit?** — Один consumer, prefetch=1, no requeue (или sharding по ключу).
-7. **Transactional outbox — зачем?** — Атомарность БД-commit + publish; job читает outbox → публикует.
-8. **Backpressure — что делать?** — Scale consumers / batch / TTL / max-length / rate limit producer.
-9. **Federation vs Shovel?** — Federation — «мост» между кластерами; shovel — перекачка queue A → queue B.
-10. **Как поступить с «плохим» сообщением?** — nack requeue=false → DLX → DLQ → alert → ручной разбор.
-
----
-
-## Итог
-
-- **Паттерны**: work queue, pub-sub, topic, RPC (редко), saga.
-- **Quorum queues** для новых очередей.
-- **Мониторинг**: queue depth, rates, DLQ growth, memory/disk.
-- **Backpressure**: scale, batch, TTL, max-length.
-- **Идемпотентность consumer'а** = обязательное свойство.
-- **Transactional outbox** — атомарность БД + Rabbit.
-- **Никогда** `printStackTrace`, `default-requeue-rejected: true`, `guest/guest`.
-
----
-
-## Итог блока RabbitMQ
-
-- 20 — AMQP основы (exchange, queue, binding, routing).
-- 21 — гарантии доставки (ack, confirms, DLX, retry, идемпотентность).
-- 22 — Spring AMQP (RabbitTemplate, @RabbitListener, prod-конфиг).
-- 23 — паттерны и troubleshooting (кластеры, monitoring, кейсы).
-
-Следующий блок — Spring Security + Keycloak (24-27). Начинаю с `24-spring-security-basics.md`.
+Итог блока RabbitMQ — файлы 20-23 покрыли AMQP основы, гарантии доставки, Spring AMQP реализацию, production паттерны и troubleshooting. Дальше начинается блок Spring Security и Keycloak с файла 24 spring-security-basics.

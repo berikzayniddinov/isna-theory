@@ -1,398 +1,206 @@
 # 21. RabbitMQ: гарантии доставки
 
-Ack modes, publisher confirms, dead-letter, retry, идемпотентность.
+## Три модели доставки
 
----
+Обсуждение любой messaging системы начинается с понимания трёх фундаментальных моделей доставки сообщений. At-most-once означает «максимум один раз» — сообщение может быть потеряно но никогда не задублируется. Обычно достигается через отсутствие acknowledgment — producer публикует, consumer получает, никто ничего не подтверждает. Простая модель но с рисками потери данных, применяется когда потеря отдельного сообщения не критична.
 
-## 1. Три модели доставки
+At-least-once означает «минимум один раз» — сообщение гарантированно доставится но может продублироваться. Достигается через явные acknowledgments — consumer подтверждает обработку после успешного завершения, при отсутствии ack система повторяет доставку. Дубликаты возможны когда consumer обработал сообщение но не успел отправить ack до падения — при next доставке идентичное сообщение приходит снова.
 
-- **At-most-once** — «максимум один раз». Сообщение может потеряться, но не задвоится. Без ack.
-- **At-least-once** — «минимум один раз». Не потеряется, может задвоиться. С ack + возможным re-delivery.
-- **Exactly-once** — «ровно один раз». Идеал, но дорог. Достигается через at-least-once + идемпотентность consumer'а.
+Exactly-once означает «ровно один раз» — идеальная семантика без потерь и без дублей. Технически невозможна в distributed системах в общем виде но практически достигается через комбинацию at-least-once с идемпотентностью consumer. При получении дубликата consumer определяет что уже обработал такое сообщение и просто игнорирует его. Результат — эффект exactly-once с точки зрения бизнес-логики.
 
-**Правило**: RabbitMQ даёт at-least-once. Идемпотентность на твоей стороне.
+Практическое правило работы с RabbitMQ — брокер даёт at-least-once, идемпотентность обеспечивается на стороне consumer. Это фундаментальная ответственность разработчика при построении надёжных систем на message broker.
 
----
+## Consumer acknowledgments
 
-## 2. Consumer acknowledgments — глубже
+Механизм ack является ключевым для надёжности consumption. Существует два основных режима — auto и manual. Auto ack означает что broker считает сообщение доставленным как только отправил consumer, независимо от того успел ли consumer обработать или упал в процессе. Быстрее но неfнадёжно — при падении consumer до обработки сообщение теряется. Используется только когда потеря отдельного сообщения приемлема.
 
-### 2.1 Ack modes
+Manual ack требует явного подтверждения от consumer после успешной обработки. Единственный надёжный способ для критических данных. Consumer получает сообщение с deliveryTag, обрабатывает, вызывает basicAck с этим тэгом. Broker удаляет сообщение из очереди после ack. Пока ack не пришёл сообщение считается in-flight и не будет доставлено другому consumer но и не будет удалено.
 
-- **auto (autoAck=true)** — сообщение считается доставленным как только отправлено consumer'у.
-  - Плюсы: быстрее.
-  - Минусы: если consumer упал во время обработки — сообщение потеряно.
-- **manual (autoAck=false)** — consumer явно подтверждает `basicAck` после обработки.
-  - Единственный надёжный способ.
+Три основных операции подтверждения. basicAck с deliveryTag и параметром multiple подтверждает обработку — если multiple true подтверждаются все сообщения до этого deliveryTag сразу, полезно для bulk обработки. basicNack означает «не смог обработать» с параметром requeue определяющим что делать дальше — при requeue true сообщение возвращается в очередь для повторной доставки, при requeue false выбрасывается или отправляется в dead letter exchange если настроен. basicReject аналогичен nack но только для одного сообщения без bulk.
 
-Всегда manual.
+Важное поведение при отсутствии ack и nack — сообщение считается unacknowledged пока consumer держит канал. Если connection закрывается по любой причине включая crash consumer, broker автоматически возвращает все unacked сообщения обратно в очередь для доставки другим consumers. Отсюда критическое следствие — crash consumer не приводит к потере сообщений при условии manual ack и durable queue. Это основа надёжности consumption в RabbitMQ.
 
-### 2.2 Ack, Nack, Reject
+При повторной доставке сообщения после nack requeue или crash consumer, broker устанавливает redelivered флаг в true. Consumer может использовать этот флаг для специальной логики — например для «поймать вторую попытку» и применить особую стратегию обработки. Полезно для debug сценариев и определённых patterns error handling.
 
-- **`basicAck(deliveryTag, multiple)`** — «обработал успешно».
-  - `multiple=true` — акнулись все до этого тэга (bulk).
-- **`basicNack(deliveryTag, multiple, requeue)`** — «не смог».
-  - `requeue=true` — вернуть в очередь (будет доставлено снова).
-  - `requeue=false` — выбросить (или в DLX, см. §5).
-- **`basicReject(deliveryTag, requeue)`** — то же что nack на одно сообщение.
+## Publisher confirms
 
-### 2.3 Что если не ack и не nack?
+Проблема которую решают publisher confirms проявляется при обычной публикации. Метод basicPublish возвращает управление сразу после отправки в TCP socket — это по сути fire-and-forget без гарантий что сообщение дошло до broker. Broker мог упасть в момент publish, network мог потерять пакет, буфер broker мог быть переполнен — producer не узнает об этих проблемах и будет считать что сообщение отправлено.
 
-Сообщение «в работе» (unacknowledged) пока consumer держит канал. Если connection закрыт (crash, disconnect) — broker автоматически re-queue это сообщение → другой consumer получит.
+Publisher confirms решают эту проблему через явное подтверждение от broker что сообщение принято и persist. Активация через channel confirmSelect включает режим подтверждений для канала. После этого broker отправляет ack producer после того как сообщение записано в durable queue или в memory для non-durable. Producer знает что сообщение сохранено и может считать publish успешным.
 
-Отсюда следствие: **crash consumer'а = сообщение не теряется**, при условии manual ack и durable queue.
+Синхронный способ ожидания confirm через waitForConfirms с timeout — блокирует producer thread пока не получит подтверждение или не истечёт timeout. Прост в использовании но медленный — каждая публикация блокирует thread на время round-trip до broker. Подходит для случаев редкой публикации важных сообщений где надёжность важнее throughput.
 
-### 2.4 Redelivered flag
+Асинхронный способ через addConfirmListener позволяет producer продолжать работу без блокировки. Регистрируется callback который вызывается broker когда сообщение подтверждено или отвергнуто. Значительно быстрее но требует более сложной логики — producer должен помнить корреляцию между отправленными сообщениями и подтверждениями. Обычно используется для high-throughput сценариев.
 
-Когда сообщение re-delivered (после nack requeue / crash) — у него `redelivered=true`. Consumer может использовать для «поймать вторую попытку».
+Publisher retries необходимы когда получен nack или истёк timeout. Producer должен повторить публикацию до достижения максимального количества попыток. Осторожность требуется потому что retry может привести к дублированию — сообщение возможно уже дошло до broker но ack потерялся в network. Идемпотентность consumer через messageId становится обязательным свойством при использовании retry.
 
----
+## Mandatory и returns
 
-## 3. Publisher confirms
+Существует специфическая проблема — что происходит когда producer публикует сообщение в exchange у которого нет binding подходящего под routing key. По умолчанию broker silently отбрасывает такое сообщение без уведомления producer. Producer считает что publish успешен, publisher confirms получены, но сообщение никуда не попало и никто его не получит.
 
-### 3.1 Проблема
+Параметр mandatory при publish меняет это поведение. При mandatory true broker вместо silent отбрасывания возвращает сообщение обратно producer через return listener. Producer может обработать возврат — залогировать проблему, сохранить сообщение для manual разбора, отправить alert. Никаких silent потерь не остаётся.
 
-`basicPublish` возвращает управление сразу — TCP-write и forget. Не знаешь дошло ли до brokerа. Broker упал в момент send — сообщение потеряно.
+Использовать mandatory рекомендуется всегда для критических сообщений. Стоимость минимальная — только когда сообщение действительно не может быть маршрутизировано срабатывает return callback. Польза значительная — обнаружение конфигурационных ошибок вроде удалённого binding или измененного routing key которые иначе могли бы остаться незамеченными продолжительное время.
 
-### 3.2 Confirms
+## Dead Letter Exchange
 
-`ch.confirmSelect()` — включает режим подтверждений. Дальше можно:
+Что делать когда consumer не может обработать сообщение? Не то что временно упал и retry поможет а то что сообщение битое или отражает состояние которое consumer не умеет обрабатывать. Такие сообщения не должны бесконечно застревать в очереди блокируя обработку последующих. Dead Letter Exchange предоставляет механизм изоляции таких сообщений.
 
-**Синхронно** (медленно):
-```java
-ch.basicPublish(...);
-if (ch.waitForConfirms(5000)) {
-    // подтверждено
-} else {
-    // timeout / nack
-}
-```
+Настройка очереди с DLX выполняется через аргументы x-dead-letter-exchange и x-dead-letter-routing-key при создании queue. Эти аргументы указывают куда направлять сообщения которые попадают в dead letter состояние. Само DLX это обычный exchange принимающий сообщения по указанному routing key.
 
-**Асинхронно** (быстро):
-```java
-ch.addConfirmListener(
-    (deliveryTag, multiple) -> log.debug("acked {}", deliveryTag),
-    (deliveryTag, multiple) -> log.error("nacked {}", deliveryTag)
-);
-ch.basicPublish(...);
-// продолжаем
-```
+Сообщение попадает в DLX по нескольким причинам. Первая — consumer явно отверг сообщение через nack или reject с requeue false что означает не возвращать в очередь. Вторая — истёк TTL сообщения если он был установлен, сообщение слишком долго ждало обработки. Третья — переполнение max length очереди с политикой overflow drop-head, старые сообщения вытесняются новыми.
 
-Broker подтверждает после того как сообщение записано в durable queue (или в memory для non-durable).
-
-### 3.3 Publisher retries
-
-Если publish failed (nack или timeout) — retry:
-```java
-int attempts = 0;
-while (attempts < 3) {
-    try {
-        ch.basicPublish(...);
-        if (ch.waitForConfirms(5000)) break;
-    } catch (Exception e) { }
-    attempts++;
-}
-```
-
-Осторожно с дублями. Идемпотентность consumer'а обязательна.
-
----
-
-## 4. Mandatory + returns
-
-Что если publish в exchange, у которого нет bindings?
-
-**По умолчанию** — сообщение silently выкидывается. **Producer не знает.**
-
-**С `mandatory=true`** — broker вернёт сообщение через `ReturnListener`:
-```java
-ch.addReturnListener(returned -> {
-    log.warn("Unroutable: {}, exchange={}, routingKey={}",
-        returned.getReplyText(), returned.getExchange(), returned.getRoutingKey());
-    // сохранить/повторить/alert
-});
-ch.basicPublish(exchange, routingKey, true /* mandatory */, false, props, body);
-```
-
-Использовать всегда — иначе тихие потери когда кто-то удалил binding.
-
----
-
-## 5. Dead Letter Exchange (DLX)
-
-Что делать с сообщениями которые consumer не может обработать?
-
-### 5.1 Схема
-
-Настраиваешь очередь с DLX:
-```
-Queue: my-queue
-  arguments:
-    x-dead-letter-exchange: my.dlx
-    x-dead-letter-routing-key: my-queue.failed
-```
-
-Сообщение попадает в DLX если:
-1. **nack/reject с `requeue=false`** — consumer явно выбросил.
-2. **TTL истёк** — сообщение слишком долго в очереди.
-3. **max-length превышен** — очередь переполнена, старые вытесняются.
-
-Из DLX сообщение маршрутизируется в **dead-letter queue** — обычно для ручного разбора.
+Из DLX сообщение маршрутизируется в dead letter queue где ожидает manual analysis. Классическая схема выглядит следующим образом:
 
 ```
-                          ┌─── my-queue ───┐
-producer ──► my.exchange ─►│                │──► consumer
-                          │                │       │
-                          │                │       │ nack requeue=false
-                          │                │       ▼
-                          │  x-dead-letter │──► my.dlx ──► my.dlq (dead-letter queue)
-                          └────────────────┘             │
-                                                         ▼
-                                                    manual review / alert
+                          ┌─── my-queue ────────┐
+producer ──► my.exchange ─►│                    │──► consumer
+                          │                     │       │
+                          │                     │       │ nack requeue=false
+                          │                     │       ▼
+                          │  x-dead-letter-exch │──► my.dlx ──► my.dlq
+                          │  x-dead-letter-rk   │              │
+                          └─────────────────────┘              ▼
+                                                          manual review
+                                                          alert oncall
+                                                          metrics.dlq.size
 ```
 
-### 5.2 Зачем
+Смысл DLX в изоляции проблем. Битое сообщение не блокирует нормальную обработку остальных сообщений в очереди. Оно не теряется — сохраняется в DLQ для последующего разбора. Alerting на рост DLQ позволяет команде видеть проблемы своевременно и предпринимать действия — исправить bug в consumer, обновить формат сообщения, добавить обработку нового случая.
 
-- Не терять «плохие» сообщения (нельзя обработать, но нельзя и потерять — надо разобраться).
-- Изолировать: плохое сообщение не блокирует остальные.
-- Alerting: DLQ растёт → шлём алерт SRE.
+Практический пример из КНП — приёмка ФНО из очереди knp.approvals в tax-rep. Если полученная ФНО битая и парсинг падает с exception, consumer nack сообщение и оно уходит в knp.approvals.dlq. Команда получает alert о новых сообщениях в DLQ, разбирается что за формат прислали, обновляет parser или связывается с отправителем чтобы исправить источник проблемы.
 
-### 5.3 Пример из ИСНА
+## Retry с backoff
 
-Приёмка ФНО из очереди `knp.approvals` в tax-rep. Если ФНО битое (парсинг упал) — в `knp.approvals.dlq`. Команда разбирается.
+Простой retry без задержки создаёт классическую проблему — consumer падает, сообщение возвращается через requeue, снова падает, снова возвращается и так далее. Infinite loop нагружающий consumer и broker без прогресса. Особенно проблематично когда причина падения не мгновенно проходящая — недоступность downstream сервиса, database timeout, transient сетевые проблемы требующие времени на восстановление.
 
----
+Retry с backoff решает эту проблему добавлением задержки между попытками. Первая попытка сразу, вторая через секунду, третья через 5 секунд, четвёртая через минуту. Экспоненциальный рост даёт времени на восстановление transient проблем без излишней нагрузки. Максимальное количество попыток ограничивает retry чтобы после исчерпания сообщение отправилось в DLQ вместо бесконечных повторов.
 
-## 6. Retry с backoff
+Retry topic pattern реализует backoff через комбинацию нескольких очередей с TTL. Основная очередь для нормальной обработки. Retry queue с TTL 5 секунд и DLX указывающим обратно на основную queue. Сообщение при первой ошибке отправляется в retry queue, ждёт 5 секунд, автоматически через DLX возвращается в основную. При повторной ошибке отправляется в retry queue с TTL 30 секунд, потом 5 минут и так далее. Header x-retry-count в сообщении считает количество попыток чтобы после N-й окончательно отправить в failure queue.
 
-Проблема: consumer упал → сообщение re-queued → сразу опять пришло → опять упал. **Infinite loop.**
+Spring AMQP предоставляет RetryInterceptor как более простой способ настройки. Параметры maxAttempts, initialInterval, multiplier, maxInterval конфигурируют backoff. Recoverer определяет что делать после исчерпания попыток — RejectAndDontRequeueRecoverer nack без requeue что при настроенном DLX отправит в dead letter. RepublishMessageRecoverer явно публикует в другой exchange для более гибкой обработки. Custom recoverer позволяет arbitrary логику. Ограничение — RetryInterceptor использует Thread.sleep что блокирует consumer thread на время backoff. Для медленных retry retry topic pattern предпочтительнее.
 
-Решения.
+Реализация retry внутри самого consumer через явные проверки counter и sleep возможна но обычно проигрывает в поддерживаемости системным решениям. Thread.sleep в consumer блокирует его thread что снижает throughput. При использовании pooled connections блокировка thread может привести к connection starvation. Retry topic pattern через выделенные queues всегда лучше подходит для production сценариев.
 
-### 6.1 Retry topic pattern
+## Time to Live
 
-Основная очередь → retry.5s → retry.30s → retry.5m → DLQ.
+TTL контролирует время жизни сообщений и очередей. Три основных вида TTL решают разные задачи. Per-message TTL устанавливается при публикации через expiration property. Через указанное время сообщение либо отправляется в DLX если настроен либо просто удаляется. Полезно для сообщений с ограниченной актуальностью — уведомление о временной акции устаревает через час, состояние сессии актуально 30 минут.
 
-Каждая retry-очередь с TTL. Сообщение попадает в retry, ждёт TTL, потом в основную (или следующий retry). Header `x-retry-count` считает попытки.
+Per-queue TTL задаётся при создании queue через аргумент x-message-ttl. Применяется ко всем сообщениям в этой очереди независимо от свойств отдельного сообщения. Удобнее чем указывать TTL при каждой публикации если все сообщения в очереди имеют одинаковую политику. Часто используется для «уведомлений которые устаревают» — все нотификации в очереди актуальны только N времени.
 
-### 6.2 Spring Retry
+Queue TTL задаётся через x-expires и определяет время жизни самой очереди без активности. Если нет consumers и нет новых сообщений в течение указанного времени queue удаляется. Полезно для temporary queues специфических клиентов или сессий которые могут не отключиться корректно.
 
-Через Spring AMQP (см. следующий файл) `RetryInterceptor`:
-```java
-@Bean
-RetryOperationsInterceptor retryInterceptor() {
-    return RetryInterceptorBuilder.stateless()
-        .maxAttempts(3)
-        .backOffOptions(1000, 2.0, 10000)   // start=1s, multiplier=2, max=10s
-        .recoverer(new RejectAndDontRequeueRecoverer())   // после N попыток → DLX
-        .build();
-}
-```
+Комбинация TTL с DLX создаёт мощный механизм. Сообщение с истёкшим TTL уходит в DLX где может быть обработано по-другому. Например можно определить что «просроченные» сообщения требуют специального handling — превращения в события истечения времени, отправки reminder пользователю, изменения статуса в базе данных.
 
-### 6.3 В consumer'е самостоятельно
+## Идемпотентность consumer
 
-```java
-int retries = getRetries(delivery);
-if (retries > 3) {
-    ch.basicNack(tag, false, false);   // → DLX
-    return;
-}
-try {
-    process(delivery);
-    ch.basicAck(tag, false);
-} catch (RetryableException e) {
-    Thread.sleep(backoff(retries));
-    ch.basicNack(tag, false, true);    // requeue
-}
-```
+At-least-once семантика означает возможные дубли, которые consumer должен обработать корректно. Идемпотентность — свойство операции при котором её повторное выполнение с теми же параметрами даёт тот же результат что и одно выполнение. Обязательное свойство consumer в message-based системе.
 
-Плохо блокировать поток `Thread.sleep`. Лучше через retry-очереди.
+Наиболее общий подход к идемпотентности через уникальный ключ операции. Каждое сообщение несёт messageId или бизнес-ключ идентифицирующий операцию. Consumer перед обработкой проверяет была ли уже обработана операция с этим ключом через отдельную таблицу processed_messages в базе данных. Если да — просто игнорирует сообщение отправляя ack. Если нет — обрабатывает и записывает ключ в processed_messages. Всё в одной транзакции чтобы не было гонок.
 
----
+Более элегантный подход через идемпотентные операции. Update с проверкой текущего состояния «UPDATE table SET status='PROCESSED' WHERE id=X AND status='NEW'» может быть выполнен любое количество раз с одинаковым результатом — первое выполнение переводит статус, последующие не находят подходящую запись. Аналогично insert on conflict do nothing для вставки без дубликатов, upsert для комбинации insert и update без разночтения при повторе.
 
-## 7. TTL
+Выбор подхода зависит от специфики операции. Простое изменение статуса — conditional update. Создание записи которая может быть повторена — upsert или insert on conflict. Сложная логика с multiple side effects — таблица processed_messages как явное отслеживание.
 
-Время жизни сообщения / очереди.
+Отсутствие идемпотентности приводит к серьёзным проблемам. Двойное списание с баланса, дублирование уведомлений пользователю, двойная отправка формы отчётности в шину — все реальные сценарии из практики enterprise систем. Идемпотентность не опциональная фича, а обязательная часть архитектуры при использовании message broker.
 
-### 7.1 Per-message TTL
+## Ordering
 
-```java
-props.setExpiration("60000");   // 60 сек
-ch.basicPublish(exchange, key, props, body);
-```
+RabbitMQ гарантирует определённый порядок сообщений но с существенными ограничениями. Гарантия действует только для одной очереди при одном consumer без requeue. Стоит нарушить любое условие — гарантия исчезает.
 
-Через 60 сек — DLX (если настроен) или выбрасывается.
+Несколько consumers на одной очереди приводят к concurrent обработке. Consumer A получает сообщение 1, начинает обработку. Consumer B получает сообщение 2, обрабатывает быстрее и завершает первым. Порядок обработки нарушен относительно порядка получения. Для операций где порядок важен это проблема.
 
-### 7.2 Per-queue TTL
+Reject с requeue возвращает сообщение обратно в head очереди — перед всеми другими сообщениями. Если сообщение 1 rejected после того как сообщение 2 было доставлено consumer, при next получении сообщение 1 придёт после того как сообщение 2 уже обрабатывается. Нарушение порядка даже с одним consumer.
 
-```
-x-message-ttl: 60000
-```
+Sharding по бизнес-ключу решает проблему для сценариев где важен порядок только внутри группы. Например все события одного клиента должны обрабатываться по порядку, но события разных клиентов независимы. Sharding routing key по client_id направляет все события клиента в одну queue где один consumer обрабатывает их последовательно. Параллельность достигается через много queues обрабатываемых разными consumers, каждый работает со своим подмножеством клиентов.
 
-Все сообщения в очереди с TTL. Полезно для «уведомлений которые устаревают».
+Если порядок критически важен и sharding не подходит — один consumer с prefetch 1 без requeue. Пропускная способность низкая но порядок гарантирован. Обычно такое ограничение неприемлемо для production нагрузки, поэтому sharding по возможности предпочтительнее.
 
-### 7.3 Queue TTL
+## Prefetch — тонкая настройка
 
-```
-x-expires: 3600000
-```
+Prefetch задаёт сколько сообщений broker может отправить consumer до получения acknowledgment. Настройка балансирует между throughput отдельного consumer и fairness распределения между несколькими consumers.
 
-Очередь удаляется если нет consumer'ов и не используется 1 час.
+Prefetch равный 1 означает что consumer получает следующее сообщение только после ack предыдущего. Подходит для медленных задач где обработка каждого сообщения занимает 10 и более секунд. Гарантирует честное распределение — если два consumer работают на одной очереди, они делят нагрузку примерно поровну.
 
----
+Prefetch 10-50 подходит для типичных задач с временем обработки 100 миллисекунд до 1 секунды. Consumer может держать несколько сообщений in-flight что уменьшает latency между обработкой — не нужен round-trip до broker после каждого ack. Хороший баланс throughput и fairness для большинства сценариев.
 
-## 8. Идемпотентность consumer'а
+Prefetch 100 и более используется для очень быстрых задач где обработка занимает миллисекунды. Хорошая throughput но fairness страдает — один consumer может забрать большую часть очереди пока другие простаивают. Мониторить распределение между consumers важно.
 
-At-least-once → возможны дубли. Как избежать проблем?
+Слишком большой prefetch создаёт проблемы — при переполнении очереди один consumer забирает много сообщений но обработать быстро не может. Остальные consumer простаивают. Throughput системы деградирует несмотря на теоретически высокий предел. Слишком маленький prefetch создаёт unnecessary chattiness между consumer и broker снижая throughput. Оптимальное значение подбирается экспериментально с учётом характеристик задачи.
 
-### 8.1 Уникальный ключ операции
+## Flow control и lazy queues
 
-Каждое сообщение имеет `messageId` (или бизнес-ключ). Consumer проверяет — уже обработано?
+Broker может замедлить producer если ресурсы приближаются к пределам. Memory alarm срабатывает при превышении настройки vm_memory_high_watermark обычно 40 процентов от общей RAM. Disk alarm при исчерпании места. При активном alarm producer блокируется на basicPublish или получает nack на publisher confirms. Consumers продолжают работать нормально помогая освободить очереди.
 
-```java
-@Transactional
-void receive(FnoSubmittedEvent event) {
-    if (processedRepo.existsByMessageId(event.getMessageId())) {
-        log.info("Skip duplicate {}", event.getMessageId());
-        return;
-    }
-    processFno(event);
-    processedRepo.save(new ProcessedMessage(event.getMessageId(), Instant.now()));
-}
-```
+Мониторинг alarm критически важен. Frequent memory alarm означает что broker не справляется с memory footprint очередей — либо consumers слишком медленные, либо необходимо увеличить память broker, либо перейти на lazy queues. Frequent disk alarm требует расширения дискового пространства или архивации старых сообщений.
 
-### 8.2 Идемпотентные операции
+Lazy queues хранят сообщения на диске а не в RAM. Обычные queues держат сообщения в памяти для быстрого доступа плюс дублируют на диск для durable. Lazy держат только на диске с минимальным memory footprint. Медленнее чтение из-за disk I/O но не убивают broker памятью при больших объёмах сообщений.
 
-`UPDATE ... WHERE id=X SET status='PROCESSED' AND status='NEW'` — дубль не сработает второй раз (условие уже не выполнится).
+Активация через x-queue-mode lazy при создании queue. Подходит для очередей где накапливается миллион и более сообщений — например batch обработка которая накапливает работу в течение дня для обработки ночью. Quorum queues по умолчанию имеют lazy-подобное поведение что делает их безопасными для больших объёмов.
 
-### 8.3 UPSERT
+## Полная надёжная схема
 
-`INSERT ... ON CONFLICT DO NOTHING/UPDATE` — вставка не задваивается.
-
-Идемпотентность — **обязательное свойство** consumer'а в message-based системе.
-
----
-
-## 9. Ordering
-
-RabbitMQ гарантирует порядок **в одной очереди при одном consumer'е**.
-
-Проблемы:
-- Несколько consumer'ов на одной очереди → порядок не гарантируется.
-- Rejects с requeue → сообщение возвращается в **head очереди** (нарушает порядок).
-- Sharding: разные очереди — независимый порядок.
-
-Если критичен порядок:
-- Один consumer per queue (низкая пропускная способность).
-- Sharding по бизнес-ключу (одна orderId всегда в одну queue → один consumer per queue → порядок внутри клиента).
-
----
-
-## 10. Prefetch — тонкая настройка
-
-Prefetch = сколько сообщений broker может отдать consumer'у без ack.
-
-- **prefetch=1** — по одному. Для медленных задач (10+ сек). Гарантия честного распределения между consumer'ами.
-- **prefetch=10-50** — для типичной задачи (100 мс - 1 сек).
-- **prefetch=100+** — только очень быстрые задачи (< 10 мс).
-
-Слишком много → один consumer забирает всё, остальные простаивают. Слишком мало → низкая throughput.
-
----
-
-## 11. Flow control
-
-Broker может замедлить producer'а если очереди переполняются:
-- **Memory alarm** — превышен `vm_memory_high_watermark`.
-- **Disk alarm** — мало места.
-
-Producer блокируется на `basicPublish` (или confirms nack). Consumer'ы работают дальше.
-
-Мониторинг критичен — memory alarm надо ловить и разбираться.
-
----
-
-## 12. Lazy queues
-
-Обычные queues — сообщения в RAM + disk (если persistent). Lazy — только disk, минимум RAM.
-
-Для больших очередей (миллионы сообщений):
-```
-x-queue-mode: lazy
-```
-
-Медленнее чтение, но не убивает broker памятью.
-
-Quorum queues по умолчанию похожи на lazy.
-
----
-
-## 13. Пример: полная надёжная схема
+Комбинация всех обсуждённых механизмов даёт end-to-end надёжность системы обмена сообщениями:
 
 ```
 producer
   │  publisherConfirms=true, mandatory=true
-  │  set messageId, timestamp
+  │  set messageId, timestamp, deliveryMode=PERSISTENT
   ▼
 exchange (durable=true)
   │
+  │  binding по routing key
   ▼
-queue (durable=true, x-dead-letter-exchange=my.dlx, x-message-ttl=3600000)
+queue (durable=true,
+       x-dead-letter-exchange=my.dlx,
+       x-dead-letter-routing-key=my.dlq,
+       x-message-ttl=3600000)
   │
-  │  basicConsume manualAck, prefetch=10
+  │  basicConsume manualAck=true, prefetch=10
   ▼
 consumer
-  │  дедуп по messageId
-  │  process
-  │  ↳ success → basicAck
-  │  ↳ retryable → nack requeue=true (или через retry-топик)
-  │  ↳ fatal → nack requeue=false → DLX → DLQ → alert
+  │  дедуп по messageId (idempotency)
+  │  process(...)
+  │
+  ├─ success ────────► basicAck(tag, false)
+  │
+  ├─ retryable ──────► nack requeue=true
+  │                    (или через retry-topic queue с TTL)
+  │
+  └─ fatal ──────────► nack requeue=false
+                       │
+                       ▼
+                     x-dead-letter-exchange
+                       │
+                       ▼
+                     dlq (durable=true)
+                       │
+                       ▼
+                     alert oncall + manual review
 ```
 
----
+Каждый элемент этой схемы решает свою часть проблем надёжности. Publisher confirms гарантируют что сообщение достигло broker. Mandatory обнаруживает routing проблемы. Durable exchange и queue переживают перезапуск. Persistent messages сохраняются на диск. Manual ack защищает от потери при crash consumer. Prefetch балансирует throughput и fairness. Idempotency защищает от дублей. DLX изолирует необработуемые сообщения. Мониторинг DLQ обеспечивает своевременное реагирование на проблемы.
 
-## 14. Реальный кейс из ИСНА
+## Реальные кейсы из КНП
 
-Memory `knp-fo-sync-notification-bugs`: NotificationSyncService — 6 багов, часть связана с очередями:
-- `printStackTrace` вместо log.error → ELK не видит error → «тихие» потери.
-- Тихий скип на ошибке (MAX offset) → потеря сообщений.
-- @Transactional мёртв → грязные commits.
+Memory кейс knp-fo-sync-notification-bugs выявил несколько типичных ошибок в реализации consumer. NotificationSyncService имел шесть багов часть из которых связаны с надёжностью очередей. printStackTrace вместо log.error означал что ошибки не попадают в ELK, «тихие» потери без возможности алертинга. Тихий skip сообщения при определённых условиях (например при достижении MAX offset) приводил к молчаливым потерям критичных нотификаций. Мёртвый @Transactional из-за self-invocation создавал грязные commits — часть операций проходила без транзакционной изоляции.
 
-Правильный consumer:
-1. Structured logging (не printStackTrace).
-2. Явный ack/nack с валидными аргументами.
-3. Метрики: rate ack/nack/redeliver.
-4. Alert на DLQ.
+Правильный consumer соблюдает несколько принципов. Structured logging через log.error с exception как второй аргумент вместо printStackTrace. Явные ack/nack с валидными аргументами без предположений о default поведении. Метрики per consumer — rate успешных ack, nack, redelivery. Alert на рост DLQ.
 
----
+Кейс knp-fno-outer-sync-esb-dead-route показал что retry на не-фиксимую проблему создаёт шум и лишние потери. Sync сервис для OUTER_FNO_INFO падал 1586 раз за 13 часов из-за отсутствующего маршрута SOAP. Правильное решение — circuit breaker для остановки retry при systematic ошибках плюс feature flag через @ConditionalOnProperty для явного отключения проблемного функционала до его починки.
 
-## 15. Собесные вопросы
+## Итоги
 
-1. **Три модели доставки?** — at-most-once, at-least-once, exactly-once.
-2. **Что даёт RabbitMQ и как достичь exactly-once?** — At-least-once; exactly-once = at-least-once + идемпотентность.
-3. **Что такое publisher confirms?** — Broker подтверждает получение сообщения; sync или async.
-4. **Что делает mandatory?** — Возвращает сообщение producer'у если не сматчилось ни на одну очередь.
-5. **Что такое DLX?** — Exchange для «плохих» сообщений (nack, TTL истёк, max-length).
-6. **Когда сообщение попадает в DLX?** — nack/reject с requeue=false, TTL expired, max-length exceeded.
-7. **Как избежать redelivery loop?** — Retry с backoff, max-attempts, потом DLX.
-8. **Что такое prefetch?** — Сколько сообщений может быть unacked у consumer'а; настройка concurrency.
-9. **Почему нужна идемпотентность?** — At-least-once = возможны дубли; consumer должен быть идемпотентен.
-10. **Как обеспечить идемпотентность?** — Уникальный messageId + processed_messages таблица, или идемпотентные UPDATE/UPSERT.
-11. **Что такое TTL?** — Время жизни сообщения (per-message или per-queue).
-12. **Что такое flow control?** — Broker замедляет producer'а при memory/disk alarm.
-13. **Ordering в Rabbit — какие условия?** — Один consumer, одна queue, без requeue.
-14. **Разница quorum и classic queues в failure?** — Quorum: replicated Raft, автоматический failover; classic: single-node или mirror-based (deprecated).
+RabbitMQ предоставляет at-least-once семантику доставки. Exactly-once достигается через комбинацию at-least-once и идемпотентности consumer. Идемпотентность через messageId или через идемпотентные операции обязательное свойство архитектуры message-based систем.
 
----
+Manual ack единственный надёжный способ acknowledgment. Publisher confirms плюс mandatory обеспечивают надёжность на стороне producer. Sочетание durable queue, persistent messages, publisher confirms даёт end-to-end гарантии.
 
-## Итог
+Dead Letter Exchange изолирует необработуемые сообщения не блокируя нормальную обработку. Retry с backoff через retry topic pattern или Spring RetryInterceptor обрабатывает transient ошибки. TTL контролирует время жизни сообщений и очередей.
 
-- **At-least-once** default; идемпотентность обязательна.
-- **Manual ack** — единственный надёжный способ.
-- **Publisher confirms + mandatory** — гарантии на producer'е.
-- **DLX + retry** — для «плохих» сообщений.
-- **TTL** — устаревшие сообщения.
-- **Prefetch** — контроль concurrency.
-- **Идемпотентность** — через messageId / UPSERT / conditional UPDATE.
-- **Ordering** — только при 1 consumer + 1 queue + no requeue.
+Ordering гарантируется только для одной очереди с одним consumer без requeue. Sharding по бизнес-ключу решает проблему порядка при необходимости parallelism. Prefetch балансирует throughput и fairness между consumers.
 
-Следующий — `22-spring-amqp.md`.
+Flow control защищает broker от переполнения через blocking producer при memory или disk alarm. Lazy queues позволяют работать с большими объёмами сообщений минимизируя memory footprint.
+
+Реальные кейсы КНП подтверждают критичность правильной реализации consumer — structured logging, explicit acks, метрики, alerting на DLQ. Без этих практик даже теоретически правильная архитектура превращается в источник трудно диагностируемых проблем.
+
+Дальше — Spring AMQP как практическая реализация всех этих концепций в Spring Boot приложениях.
