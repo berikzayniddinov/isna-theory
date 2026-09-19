@@ -1,43 +1,34 @@
-# 63. SOAP API теория
+# 63. SOAP API: envelope, WSDL, XSD, WS-standards, JAX-WS
 
-Что такое SOAP, WSDL, XSD, WS-* стандарты, зачем ещё существует.
+## Зачем понимать SOAP
 
----
+Разработчик работающий preimущestvenno с REST APIs может думать — SOAP это legacy, не важно. Реальность enterprise Java окружения приносит SOAP в жизнь неожиданно. Government integration требует SOAP. Banking partners использует SOAP. Regulatory compliance systems SOAP-based. Даже modern applications interfacing с legacy systems часто encounter SOAP.
 
-## 1. Что такое SOAP
+Разница между разработчиком «избегающим SOAP» и «понимающим SOAP» проявляется в capability engaging enterprise integrations. Первый видит SOAP endpoint plus не знает где начать. Второй знает SOAP envelope structure — Header plus Body. Знает WSDL как contract describing operations, types, endpoints. Знает XSD для strict type definitions. Знает WS-Security для message-level signing/encryption. Знает JAX-WS annotations для Spring integration. Может generate client code из WSDL через wsimport. Может configure SOAP endpoint в Spring через Apache CXF или Spring Web Services.
 
-**SOAP** = **S**imple **O**bject **A**ccess **P**rotocol.
+В этом файле разберём SOAP глубоко. Что такое SOAP fundamentally. SOAP envelope structure. Пример request/response cycles. SOAP Fault error format. WSDL — Web Services Description Language. XSD — XML Schema Definition. WS-* standards семейство. RPC vs Document style. Java стек (JAX-WS, Apache CXF, Spring Web Services). Kalkan ЭЦП в казахстанском context. Инструменты (SoapUI, wsimport). Почему SOAP ещё существует. Проблемы SOAP. Реальный ИСНА workflow с ЕСБ.
 
-Разработан Microsoft в 1998, стандартизирован W3C.
+## Что такое SOAP
 
-Не совсем "simple" — на практике довольно тяжёлый.
+SOAP = Simple Object Access Protocol. Разработан Microsoft в 1998, стандартизирован W3C. Не совсем «simple» — на практике довольно тяжёлый.
 
-Ключевые черты:
-- **Протокол** (не архитектурный стиль как REST).
-- **XML** для всего.
-- **Envelope** (Header + Body).
-- **Transport-agnostic** — обычно HTTP, но может быть SMTP, JMS.
-- **Contract-first** — сначала WSDL, потом код.
-- **Enterprise features** — WS-Security, WS-Transaction, WS-Addressing.
+Ключевые черты. Протокол (не архитектурный стиль как REST). XML для всего. Envelope (Header plus Body). Transport-agnostic — обычно HTTP но может быть SMTP, JMS. Contract-first — сначала WSDL, потом код. Enterprise features — WS-Security, WS-Transaction, WS-Addressing.
 
----
+Historical context. SOAP emerged когда XML был dominant data format. Web services concept driven by enterprise integration needs. WS-* ecosystem grew из committee-driven standardization. Complex specifications создавали competitive advantage для enterprise vendors.
 
-## 2. SOAP Envelope
+## SOAP Envelope
 
 Всё сообщение — XML с фиксированной структурой:
-
 ```xml
 <?xml version="1.0"?>
 <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
 
   <soap:Header>
-    <!-- Метаданные: security tokens, correlation, routing -->
     <auth:Token xmlns:auth="...">abc123</auth:Token>
     <wsa:MessageID>uuid:12345</wsa:MessageID>
   </soap:Header>
 
   <soap:Body>
-    <!-- Полезная нагрузка -->
     <ord:CreateOrder xmlns:ord="http://example.com/orders">
       <ord:CustomerId>c1</ord:CustomerId>
       <ord:Amount>100.00</ord:Amount>
@@ -47,16 +38,15 @@
 </soap:Envelope>
 ```
 
-Всегда:
-- Envelope — корневой элемент.
-- Header (optional) — метаданные.
-- Body — данные операции.
+Всегда. Envelope — корневой элемент. Header (optional) — метаданные. Body — данные операции.
 
----
+Namespace-heavy. soap: namespace для envelope structure. Custom namespaces для application-specific elements. WS-* namespaces для standard extensions.
 
-## 3. Пример SOAP-запрос/ответ
+Verbose но strict. Every element namespaced. Types validated against XSD. No implicit conversions.
 
-**Request** (POST):
+## Пример SOAP request/response
+
+Request (POST):
 ```
 POST /orders HTTP/1.1
 Host: example.com
@@ -74,7 +64,7 @@ SOAPAction: "http://example.com/orders/create"
 </soap:Envelope>
 ```
 
-**Response** (200):
+Response (200):
 ```xml
 <?xml version="1.0"?>
 <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
@@ -87,16 +77,13 @@ SOAPAction: "http://example.com/orders/create"
 </soap:Envelope>
 ```
 
-Обрати внимание:
-- HTTP status всегда **200** (даже при ошибке — в body SOAP fault).
-- `SOAPAction` header — уточняет операцию.
+Обрати внимание. HTTP status всегда 200 (даже при ошибке — в body SOAP fault). SOAPAction header уточняет операцию.
 
----
+SOAP ignores HTTP semantics. HTTP просто transport. Everything в SOAP layer. Cannot leverage HTTP caching, methods, status codes.
 
-## 4. SOAP Fault
+## SOAP Fault
 
 Ошибки — тоже в SOAP body:
-
 ```xml
 <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
   <soap:Body>
@@ -117,19 +104,15 @@ SOAPAction: "http://example.com/orders/create"
 </soap:Envelope>
 ```
 
-Fault codes:
-- **soap:Sender** — ошибка клиента (аналог 4xx).
-- **soap:Receiver** — ошибка сервера (5xx).
-- **soap:VersionMismatch**.
-- **soap:MustUnderstand** — Header с mustUnderstand не понят.
+Fault codes. soap:Sender — ошибка клиента (аналог 4xx). soap:Receiver — ошибка сервера (5xx). soap:VersionMismatch. soap:MustUnderstand — Header с mustUnderstand не понят.
 
-HTTP status обычно всё равно 200 (или 500).
+HTTP status обычно всё равно 200 (или 500). Errors indicated в SOAP body not HTTP status. Different error handling model от REST.
 
----
+Structured error details. Application-specific fault types в Detail element. Enables typed exception handling in client code.
 
-## 5. WSDL — Web Services Description Language
+## WSDL: Web Services Description Language
 
-XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
+XML-описание SOAP-сервиса. Аналог OpenAPI для REST но mandatory not optional.
 
 Пример (упрощённо):
 ```xml
@@ -138,7 +121,6 @@ XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
              xmlns:tns="http://example.com/orders"
              targetNamespace="http://example.com/orders">
 
-  <!-- Типы данных (XSD) -->
   <types>
     <schema xmlns="http://www.w3.org/2001/XMLSchema">
       <element name="CreateOrder">
@@ -160,7 +142,6 @@ XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
     </schema>
   </types>
 
-  <!-- Сообщения -->
   <message name="CreateOrderRequest">
     <part name="body" element="tns:CreateOrder"/>
   </message>
@@ -168,7 +149,6 @@ XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
     <part name="body" element="tns:CreateOrderResponse"/>
   </message>
 
-  <!-- Порт (интерфейс) -->
   <portType name="OrdersPortType">
     <operation name="CreateOrder">
       <input message="tns:CreateOrderRequest"/>
@@ -176,7 +156,6 @@ XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
     </operation>
   </portType>
 
-  <!-- Binding (протокол) -->
   <binding name="OrdersBinding" type="tns:OrdersPortType">
     <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
     <operation name="CreateOrder">
@@ -186,7 +165,6 @@ XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
     </operation>
   </binding>
 
-  <!-- Service (адрес) -->
   <service name="OrdersService">
     <port name="OrdersPort" binding="tns:OrdersBinding">
       <address location="http://example.com/orders"/>
@@ -196,19 +174,13 @@ XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
 </definitions>
 ```
 
-Ключевые элементы:
-- **types** — типы данных (через XSD).
-- **message** — SOAP-сообщения.
-- **portType** — операции (что можно).
-- **binding** — как (протокол, encoding).
-- **service** — где (URL).
+Ключевые элементы. types — типы данных (через XSD). message — SOAP-сообщения. portType — операции (что можно). binding — как (протокол, encoding). service — где (URL).
 
----
+Comprehensive service description. Type-safe. Enables tooling для automatic code generation.
 
-## 6. XSD — XML Schema Definition
+## XSD: XML Schema Definition
 
-Строгая типизация XML.
-
+Строгая типизация XML:
 ```xml
 <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <xsd:element name="Order">
@@ -225,35 +197,21 @@ XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
 </xsd:schema>
 ```
 
-Типы:
-- Простые: `xsd:string`, `xsd:int`, `xsd:decimal`, `xsd:boolean`, `xsd:date`, `xsd:dateTime`, `xsd:base64Binary`.
-- Complex: с sequence, choice, all.
-- Ограничения: `minOccurs`, `maxOccurs`, `pattern` (regex), `enumeration`.
+Типы. Простые. xsd:string, xsd:int, xsd:decimal, xsd:boolean, xsd:date, xsd:dateTime, xsd:base64Binary. Complex — с sequence, choice, all. Ограничения — minOccurs, maxOccurs, pattern (regex), enumeration.
 
-Плюсы:
-- Строгая валидация (сервер / клиент проверяют).
-- Автогенерация Java-классов.
+Плюсы. Строгая валидация (сервер / клиент проверяют). Автогенерация Java-классов.
 
-Минусы:
-- Многословно.
-- Сложно писать вручную.
+Минусы. Многословно. Сложно писать вручную. Verbose XML syntax.
 
----
+Trade-off strong typing vs verbosity. Enterprise values type safety enough to accept verbosity.
 
-## 7. WS-* стандарты
+## WS-* стандарты
 
-**WS-** прибавка — целое семейство стандартов расширения SOAP.
+WS- prefix — целое семейство стандартов расширения SOAP.
 
-### 7.1 WS-Security
+WS-Security. Безопасность на уровне сообщения (не транспорта). Encryption body. Signature. Username tokens. SAML tokens. Позволяет end-to-end безопасность через intermediary'ов (в отличие от TLS который прерывается на прокси).
 
-Безопасность на уровне сообщения (не транспорта):
-- Encryption body.
-- Signature.
-- Username tokens.
-- SAML tokens.
-
-Позволяет **end-to-end** безопасность через intermediary'ов (в отличие от TLS который прерывается на прокси).
-
+Example header:
 ```xml
 <soap:Header>
   <wsse:Security>
@@ -266,53 +224,29 @@ XML-описание SOAP-сервиса. Аналог OpenAPI для REST.
 </soap:Header>
 ```
 
-### 7.2 WS-Addressing
+Message-level security. Sensitive parts can be encrypted while others plain. Fine-grained control.
 
-Routing и correlation:
-- `MessageID`, `RelatesTo`.
-- `To`, `ReplyTo`, `FaultTo`.
+WS-Addressing. Routing и correlation. MessageID, RelatesTo. To, ReplyTo, FaultTo. Для async messaging. Enables message flow patterns beyond simple request-response.
 
-Для async messaging.
+WS-ReliableMessaging. Гарантии доставки (at-least-once, exactly-once). Protocol-level reliability. Similar semantics к Kafka acks но SOAP-based.
 
-### 7.3 WS-ReliableMessaging
+WS-Transaction (WS-AT, WS-BA). Distributed transactions (2PC поверх SOAP). Rarely used practically. Enterprise systems сложно координировать transactions across boundaries.
 
-Гарантии доставки (at-least-once, exactly-once).
+WS-Policy. Описание требований (security, reliability) в WSDL. Declarative policy expression.
 
-### 7.4 WS-Transaction (WS-AT, WS-BA)
+WS-Trust, WS-Federation. Federated identity (Single Sign-On). Enterprise SSO patterns predating OAuth.
 
-Distributed transactions (2PC поверх SOAP).
+UDDI. Реестр веб-сервисов. Deprecated, никто не использует. Failed vision of automatic service discovery.
 
-### 7.5 WS-Policy
+BPEL. Business Process Execution Language — оркестрация SOAP-сервисов. Workflow definition language. Executed by BPEL engines.
 
-Описание требований (security, reliability) в WSDL.
+Реальность. Спецификаций сотни. На практике реально используются. WS-Security, WS-Addressing, иногда WS-ReliableMessaging. Остальное — enterprise legacy.
 
-### 7.6 WS-Trust, WS-Federation
-
-Federated identity (Single Sign-On).
-
-### 7.7 UDDI
-
-Реестр веб-сервисов. Deprecated, никто не использует.
-
-### 7.8 BPEL
-
-Business Process Execution Language — оркестрация SOAP-сервисов.
-
-### 7.9 Реальность
-
-Спецификаций **сотни**. На практике реально используются: WS-Security, WS-Addressing, иногда WS-ReliableMessaging.
-
-Остальное — enterprise legacy.
-
----
-
-## 8. Style: RPC vs Document
+## Style: RPC vs Document
 
 Два стиля SOAP.
 
-### 8.1 RPC
-
-Body содержит имя операции + параметры:
+RPC. Body содержит имя операции plus параметры:
 ```xml
 <soap:Body>
   <createOrder>
@@ -322,11 +256,9 @@ Body содержит имя операции + параметры:
 </soap:Body>
 ```
 
-Похоже на вызов метода.
+Похоже на вызов метода. Method name explicit в body.
 
-### 8.2 Document
-
-Body содержит XML-документ (по XSD schema):
+Document. Body содержит XML-документ (по XSD schema):
 ```xml
 <soap:Body>
   <Order xmlns="http://example.com/orders">
@@ -336,17 +268,15 @@ Body содержит XML-документ (по XSD schema):
 </soap:Body>
 ```
 
-**Document/literal** — модерный стандарт. Более гибкий (schema-driven).
+Document/literal — модерный стандарт. Более гибкий (schema-driven). Recommended style.
 
----
+Difference subtle но important. RPC binds operation name in message. Document allows schema evolution более гибко.
 
-## 9. Java стек
+## Java стек
 
-### 9.1 JAX-WS (стандарт Java EE)
+JAX-WS стандарт Java EE. Стандарт для SOAP в Java.
 
-Стандарт для SOAP в Java.
-
-**Producer**:
+Producer:
 ```java
 @WebService
 public class OrderService {
@@ -355,7 +285,6 @@ public class OrderService {
     public Long createOrder(
         @WebParam(name = "customerId") String customerId,
         @WebParam(name = "amount") BigDecimal amount) {
-        // ...
         return orderId;
     }
 }
@@ -366,12 +295,14 @@ Publish:
 Endpoint.publish("http://localhost:8080/orders", new OrderService());
 ```
 
-**Consumer** — генерируется из WSDL через **`wsimport`**:
+Simple embedded SOAP endpoint. Development convenience.
+
+Consumer генерируется из WSDL через wsimport:
 ```bash
 wsimport -keep -d target/generated -p com.example.client http://server/orders?wsdl
 ```
 
-Сгенерируется Java-код (клиент + все DTO по WSDL/XSD).
+Сгенерируется Java-код (клиент plus все DTO по WSDL/XSD).
 
 Использование:
 ```java
@@ -380,13 +311,11 @@ OrdersPortType port = service.getOrdersPort();
 Long orderId = port.createOrder("c1", BigDecimal.valueOf(100));
 ```
 
-### 9.2 Apache CXF
+Type-safe Java client generated from WSDL. Compilation errors для incompatible API changes.
 
-Популярная реализация JAX-WS + расширения (WS-Security и т.д.).
+Apache CXF. Популярная реализация JAX-WS plus расширения (WS-Security и т.д.). Feature-rich enterprise Java SOAP stack. Alternative to reference JAX-WS.
 
-### 9.3 Spring Web Services
-
-Spring-based framework для SOAP:
+Spring Web Services. Spring-based framework для SOAP:
 ```java
 @Endpoint
 public class OrderEndpoint {
@@ -399,39 +328,27 @@ public class OrderEndpoint {
 }
 ```
 
-Более удобно чем чистый JAX-WS.
+Более удобно чем чистый JAX-WS. Spring integration plus contract-first approach.
 
----
-
-## 10. Klass "Kalkan" ЭЦП в Казахстане
+## Kalkan ЭЦП в Казахстане
 
 В ИСНА / КНП SOAP используется активно.
 
-Из memory:
-- **SOAP-шина** — центральная integration bus.
-- **ЕСБ** (единая система баланса) — SOAP-based.
-- `save-fno-<code>` — SOAP endpoint для приёмки ФНО.
-- `BT_OUTER_FNOSYNC_OUTER_TAXREP_SYNC` — маршрут в ЕСБ.
-- **Kalkan** — библиотека ЭЦП, тоже часто через SOAP.
+Из memory. SOAP-шина — центральная integration bus. ЕСБ (единая система баланса) — SOAP-based. save-fno-<code> — SOAP endpoint для приёмки ФНО. BT_OUTER_FNOSYNC_OUTER_TAXREP_SYNC — маршрут в ЕСБ. Kalkan — библиотека ЭЦП, тоже часто через SOAP.
 
-Реальный кейс `knp-fno-outer-sync-esb-dead-route` — SOAP "Requested service is not found" (маршрут не поднят).
+Реальный кейс knp-fno-outer-sync-esb-dead-route — SOAP «Requested service is not found» (маршрут не поднят).
 
-Причина: интеграция с гос. системами — исторически SOAP + WSDL + WS-Security.
+Причина. Интеграция с гос. системами — исторически SOAP plus WSDL plus WS-Security. Government regulations и existing infrastructure sustained SOAP usage.
 
----
+Kalkan — казахстанская crypto library для ЭЦП (электронная цифровая подпись). Integrated into SOAP через WS-Security signatures. Government-approved cryptographic operations.
 
-## 11. Инструменты для SOAP
+## Инструменты
 
-### 11.1 SoapUI
+SoapUI. Классика для тестирования SOAP APIs. GUI plus XML editor. Loads WSDL, generates sample requests, executes calls, validates responses.
 
-Классика для тестирования SOAP APIs. GUI + XML editor.
+Postman. Тоже поддерживает SOAP (просто отправить XML). Not SOAP-specialized но works для basic scenarios.
 
-### 11.2 Postman
-
-Тоже поддерживает SOAP (просто отправить XML).
-
-### 11.3 curl
-
+curl:
 ```bash
 curl -X POST \
   -H "Content-Type: text/xml" \
@@ -440,122 +357,89 @@ curl -X POST \
   http://example.com/orders
 ```
 
-### 11.4 wsimport / cxf-codegen
+Command-line testing. Scripting-friendly.
 
-Java tools для генерации клиента из WSDL.
+wsimport / cxf-codegen. Java tools для генерации клиента из WSDL. Compile-time code generation.
 
----
+## Почему SOAP ещё существует
 
-## 12. Почему SOAP ещё существует
+Где-то используется. Banking — legacy интеграции. Government — legacy (Казахстан ИСНА пример). Enterprise B2B (EDI, SAP integrations). Telecom (OSS/BSS). Financial exchanges (FIX частично).
 
-Где-то используется:
-- **Banking** — legacy интеграции.
-- **Government** — legacy (Казахстан ИСНА пример).
-- **Enterprise B2B** (EDI, SAP integrations).
-- **Telecom** (OSS/BSS).
-- **Financial exchanges** (FIX частично).
+Причины. Legacy — работает годами, переписывать дорого. Contract-first — WSDL/XSD даёт строгую типизацию. WS-Security — end-to-end signing/encryption. Требование партнёров.
 
-Причины:
-- **Legacy** — работает годами, переписывать дорого.
-- **Contract-first** — WSDL/XSD даёт строгую типизацию.
-- **WS-Security** — end-to-end signing/encryption.
-- **Требование** партнёров.
+Новые проекты — REST plus JSON. SOAP только когда обязательно. Compatibility with existing infrastructure главная driver.
 
-Новые проекты — **REST + JSON**. SOAP только когда обязательно.
+## Проблемы SOAP
 
----
+Verbose. XML вдесятеро больше JSON. Bandwidth waste. Network costs multiplied.
 
-## 13. Проблемы SOAP
+Сложность. WSDL plus XSD plus WS-Security — недели на настройку. Learning curve steep.
 
-### 13.1 Verbose
+Отладка кошмар. Сложные XML namespaces, невнятные faults. XML tooling required.
 
-XML вдесятеро больше JSON. Bandwidth waste.
+Contract-first. Изменение WSDL — генерация нового клиента — deploy — тестирование. Медленный цикл. Slower iteration чем REST.
 
-### 13.2 Сложность
+Плохо кэшируется. Всегда POST, всегда XML — HTTP-кэш не работает. Read-heavy scenarios inefficient.
 
-WSDL + XSD + WS-Security — недели на настройку.
+Нет из browser'а. JavaScript плохо работает с SOAP (нужны parsing XML libraries). Frontend integration awkward.
 
-Отладка кошмар — сложные XML namespaces, невнятные faults.
+Tooling. REST — любой язык, любой инструмент. SOAP — enterprise Java/.NET/mid-tier. Ecosystem более narrow.
 
-### 13.3 Contract-first
+## Пример полного SOAP-цикла в ИСНА
 
-Изменение WSDL → генерация нового клиента → deploy → тестирование. Медленный цикл.
+Приёмка ФНО через ЕСБ demonstrates practical usage.
 
-### 13.4 Плохо кэшируется
+АРМ (АРМ инспектора) вызывает save-fno-<code> SOAP:
+```xml
+<soap:Envelope>
+  <soap:Header>
+    <wsse:Security>
+      <ds:Signature>...</ds:Signature>   ← ЭЦП через Kalkan
+    </wsse:Security>
+  </soap:Header>
+  <soap:Body>
+    <SaveFno>
+      <RegNum>...</RegNum>
+      <Fno>...</Fno>
+    </SaveFno>
+  </soap:Body>
+</soap:Envelope>
+```
 
-Всегда POST, всегда XML — HTTP-кэш не работает.
+ЕСБ маршрутизирует на isna-fno.
 
-### 13.5 Нет из browser'а
+isna-fno. Валидирует ЭЦП (Kalkan). Парсит XML — Java-объект. Сохраняет в БД. Возвращает SOAP-response.
 
-JavaScript плохо работает с SOAP (нужны parsing XML libraries).
+АРМ показывает результат.
 
-### 13.6 Tooling
+Complete flow demonstrates. ЭЦП integration через WS-Security. Routing через integration bus. Enterprise SOAP patterns в government context.
 
-REST — любой язык, любой инструмент. SOAP — enterprise Java/.NET/mid-tier.
+## Итоги
 
----
+SOAP protocol на XML для web services. Contract-first через WSDL. Transport-agnostic (обычно HTTP).
 
-## 14. Пример полного SOAP-цикла в ИСНА
+SOAP Envelope structure. Header optional (metadata, security, addressing). Body required (operation data). Namespace-heavy.
 
-Приёмка ФНО через ЕСБ:
+SOAP Fault для errors в body. HTTP status обычно 200 regardless of application-level outcomes. Different from REST error model.
 
-1. **АРМ** (АРМ инспектора) вызывает `save-fno-<code>` SOAP:
-   ```xml
-   <soap:Envelope>
-     <soap:Header>
-       <wsse:Security>
-         <ds:Signature>...</ds:Signature>   ← ЭЦП
-       </wsse:Security>
-     </soap:Header>
-     <soap:Body>
-       <SaveFno>
-         <RegNum>...</RegNum>
-         <Fno>...</Fno>
-       </SaveFno>
-     </soap:Body>
-   </soap:Envelope>
-   ```
+WSDL описание сервиса. Types (XSD). Messages. PortType (operations). Binding (protocol details). Service (endpoint).
 
-2. **ЕСБ** маршрутизирует на `isna-fno`.
+XSD schema definitions. Строгая типизация. Complex types. Ограничения. Автогенерация Java classes через tooling.
 
-3. `isna-fno`:
-   - Валидирует ЭЦП (Kalkan).
-   - Парсит XML → Java-объект.
-   - Сохраняет в БД.
-   - Возвращает SOAP-response.
+WS-* стандарты семейство. WS-Security для message-level protection. WS-Addressing для routing/correlation. WS-Transaction для distributed tx (редко). WS-Federation для SSO. Многие others.
 
-4. АРМ показывает результат.
+RPC vs Document style. Document/literal — modern standard. Schema-driven flexibility.
 
----
+Java стек. JAX-WS стандарт. Apache CXF popular implementation. Spring Web Services для Spring integration.
 
-## 15. Собесные вопросы
+Kalkan ЭЦП в казахстанском context. Government-approved cryptographic library. Integrated через WS-Security signatures.
 
-1. **Что такое SOAP?** — Protocol на XML для web services; envelope с Header/Body.
-2. **Разница REST и SOAP?** — REST архитектурный стиль на HTTP + JSON; SOAP protocol на XML.
-3. **Что такое WSDL?** — XML-описание сервиса (types, operations, endpoint).
-4. **Что такое XSD?** — XML Schema; типизация XML документов.
-5. **SOAP Envelope структура?** — Envelope → Header (optional) + Body.
-6. **SOAP Fault — что?** — Стандартный формат ошибок в SOAP Body.
-7. **Какой HTTP status при SOAP fault?** — Обычно 200 (fault в body) или 500.
-8. **WS-Security — что даёт?** — End-to-end безопасность на уровне сообщения (encryption, signature).
-9. **RPC vs Document style?** — RPC: имя операции + params; Document: XML документ по schema.
-10. **JAX-WS — что?** — Java стандарт для SOAP; `@WebService`, `wsimport`.
-11. **Как сгенерировать SOAP-клиент из WSDL?** — `wsimport -keep -d target -p pkg URL_TO_WSDL`.
-12. **SOAPAction header — зачем?** — Уточняет какая операция вызывается.
-13. **Почему SOAP verbose vs REST?** — XML boilerplate, envelope, namespaces, WS-* headers.
-14. **Где SOAP ещё используется?** — Banking, government, enterprise B2B, legacy.
-15. **Что такое ESB?** — Enterprise Service Bus; централизованная шина для SOAP-сервисов.
+Инструменты. SoapUI standard для testing. wsimport для client generation.
 
----
+SOAP ещё существует в banking, government, enterprise B2B, telecom. Legacy plus compliance requirements sustained usage.
 
-## Итог
+Проблемы. Verbose XML. Сложность WSDL/XSD. Slow debugging. Slow iteration cycle. Poor caching. Weak browser support. Narrow tooling ecosystem.
 
-- **SOAP** = protocol на XML; envelope Header + Body.
-- **WSDL** описывает сервис; **XSD** — типы.
-- **JAX-WS** — Java стандарт.
-- **WS-*** — enterprise расширения (WS-Security главный).
-- **Verbose + сложно**, но **строгий contract**.
-- Используется в legacy / enterprise / government.
-- В **ИСНА**: SOAP-шина ЕСБ + Kalkan ЭЦП.
+В ИСНА. SOAP-шина ЕСБ plus Kalkan ЭЦП для government integration. Legacy sustained through regulations.
 
-Следующий — `64-rest-vs-soap.md`.
+Дальше — REST vs SOAP развёрнутое comparison. Когда что выбирать. Modern alternatives (gRPC, GraphQL).

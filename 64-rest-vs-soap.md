@@ -1,20 +1,24 @@
-# 64. REST vs SOAP — развёрнутое сравнение
+# 64. REST vs SOAP: развёрнутое сравнение, когда что выбирать
 
-Разбор различий. Когда что выбирать.
+## Зачем детально сравнивать
 
----
+Разработчик который знает и REST и SOAP обычно застревает при architectural decisions. Нужен API для нового сервиса — REST по умолчанию. Но что делать когда партнёр требует SOAP? Legacy system использует SOAP — как переезжать на REST? Enterprise integration — какие критерии выбора? Оба технологии имеют своё место но правильное selection depends на context.
 
-## 1. Природа
+Разница между разработчиком «знающим оба» и «понимающим trade-offs» проявляется в architectural leadership. Первый выбирает REST потому что «modern» или SOAP потому что «enterprise». Второй знает конкретные dimensions. Format (JSON vs XML). Contract (optional OpenAPI vs mandatory WSDL). HTTP usage (semantic vs transport). Security model (transport-level vs message-level). Transaction support (Saga/Outbox vs WS-Transaction). Performance (compact vs verbose). Tooling ecosystem. Знает hybrid approaches — SOAP для external partners, REST для internal microservices, adapter layer between.
 
-**REST** — **архитектурный стиль**. Набор принципов, не протокол.
+В этом файле сравним REST и SOAP comprehensively. Природа fundamental differences. Full comparison table. Сравнение сообщений на конкретных examples. Как каждый использует HTTP. Contract approaches. Security models. Transactions. Performance. Developer experience. Где что используется в реальности. Когда что выбрать. Гибридные подходы. Modern alternatives (gRPC, GraphQL). Migration paths. Реальные ИСНА scenarios.
 
-**SOAP** — **протокол**. Строгие правила формата и обмена.
+## Природа fundamental differences
 
-Разница фундаментальная: REST — "как строить APIs", SOAP — "как форматировать сообщения".
+REST — архитектурный стиль. Набор принципов, не протокол. Fielding's constraints. Как строить APIs.
 
----
+SOAP — протокол. Строгие правила формата и обмена. XML envelope. Как форматировать сообщения.
 
-## 2. Основные различия — таблица
+Разница фундаментальная. REST answers «how to structure APIs». SOAP answers «how to format messages». Different levels of abstraction.
+
+REST leverages HTTP as application protocol. Uses HTTP semantics (methods, status codes, caching). SOAP uses HTTP just as transport. Everything в SOAP layer.
+
+## Основные различия — таблица
 
 | | REST | SOAP |
 |---|---|---|
@@ -41,15 +45,15 @@
 | Learning curve | Пологий | Крутой |
 | Год появления | 2000 (Fielding) | 1998 (Microsoft) |
 
----
+Comprehensive picture. Trade-offs across multiple dimensions.
 
-## 3. Сравнение сообщений
+## Сравнение сообщений
 
 Одна и та же операция — создать order.
 
-### 3.1 REST + JSON
+REST plus JSON.
 
-**Request**:
+Request:
 ```
 POST /orders HTTP/1.1
 Host: api.example.com
@@ -62,7 +66,7 @@ Authorization: Bearer eyJ...
 }
 ```
 
-**Response**:
+Response:
 ```
 HTTP/1.1 201 Created
 Location: /orders/42
@@ -74,11 +78,11 @@ Content-Type: application/json
 }
 ```
 
-Размер: ~200 bytes.
+Размер приблизительно 200 bytes. Compact. Human-readable. Standard HTTP semantics.
 
-### 3.2 SOAP + XML
+SOAP plus XML.
 
-**Request**:
+Request:
 ```
 POST /orders HTTP/1.1
 Host: api.example.com
@@ -105,7 +109,7 @@ Content-Length: 500
 </soap:Envelope>
 ```
 
-**Response**:
+Response:
 ```
 HTTP/1.1 200 OK
 Content-Type: text/xml
@@ -121,38 +125,25 @@ Content-Type: text/xml
 </soap:Envelope>
 ```
 
-Размер: ~800-1500 bytes (в 5-10× больше).
+Размер приблизительно 800-1500 bytes (в 5-10 раз больше). Verbose. Namespace-heavy. HTTP status always 200.
 
----
+Difference profound. Same operation, dramatically different message sizes. Same HTTP status semantics wildly different (201 vs 200).
 
-## 4. Использование HTTP
+## Использование HTTP
 
-### 4.1 REST — использует полностью
+REST использует полностью. Methods — GET/POST/PUT/PATCH/DELETE — семантика. Status codes — 200/201/404/409/500 — разные ситуации. Headers — Cache-Control, ETag, Location. Content Negotiation через Accept.
 
-- **Methods**: GET/POST/PUT/PATCH/DELETE — семантика.
-- **Status codes**: 200/201/404/409/500 — разные ситуации.
-- **Headers**: Cache-Control, ETag, Location.
-- **Content Negotiation** через Accept.
+REST leverages HTTP full capabilities. HTTP not just transport — application protocol.
 
-### 4.2 SOAP — только транспорт
+SOAP только транспорт. Всё через POST. Всегда status 200 (или 500 for fault). Информация о fault — в body (не в HTTP). SOAPAction header уточняет операцию.
 
-- Всё через **POST**.
-- Всегда status **200** (или 500 for fault).
-- Информация о fault — в **body** (не в HTTP).
-- `SOAPAction` header уточняет операцию.
+По сути SOAP игнорирует HTTP-возможности. Мог бы быть на любом транспорте. Transport-agnostic design abstracts HTTP away.
 
-По сути SOAP игнорирует HTTP-возможности. Мог бы быть на любом транспорте.
+Fundamental philosophical difference. REST embraces HTTP. SOAP treats HTTP как transport pipe.
 
----
+## Contract
 
-## 5. Contract
-
-### 5.1 REST — обычно code-first
-
-Пишешь Spring controller → генерируется OpenAPI (через springdoc).
-
-Опционально. Многие REST APIs без формального contract.
-
+REST обычно code-first. Пишешь Spring controller — генерируется OpenAPI (через springdoc). Опционально. Многие REST APIs без формального contract:
 ```java
 @RestController
 class OrderController {
@@ -171,11 +162,9 @@ paths:
         '200': ...
 ```
 
-### 5.2 SOAP — обязательно contract-first
+Flexible. Contract может быть documented if needed. Not mandatory.
 
-1. Пишешь WSDL.
-2. Генерируешь код (wsimport → Java classes).
-3. Реализуешь методы.
+SOAP обязательно contract-first. Traditional flow. Пишешь WSDL. Генерируешь код (wsimport → Java classes). Реализуешь методы.
 
 Или code-first:
 ```java
@@ -185,275 +174,166 @@ public class OrderService {
 }
 ```
 
-Spring генерирует WSDL из аннотаций.
+Spring генерирует WSDL из аннотаций. Modern option — code-first with generated contract.
 
-### 5.3 Runtime validation
+Runtime validation. SOAP — сообщения валидируются против XSD автоматически. Invalid = SOAP fault. Runtime type safety enforced. REST — валидация ручная (Bean Validation через @Valid). Или через OpenAPI validator в middleware. Optional validation.
 
-- **SOAP**: сообщения валидируются против XSD **автоматически**. Invalid = SOAP fault.
-- **REST**: валидация ручная (Bean Validation через `@Valid`). Или через OpenAPI validator в middleware.
+Строгость SOAP — плюс для enterprise integration (партнёры хотят «гарантию»). Strict contracts reduce integration bugs.
 
-Строгость SOAP — плюс для enterprise integration (партнёры хотят "гарантию").
+## Security
 
----
+REST Transport-level. Обычно. HTTPS (TLS) — encryption in-transit. JWT / OAuth 2.0 для authentication. API keys для service-to-service.
 
-## 6. Security
+Security между клиентом и сервером. Через прокси / gateway — прерывается TLS. Encryption ends at endpoints.
 
-### 6.1 REST — Transport-level
+Простой, стандартный. Standard web security practices.
 
-Обычно:
-- **HTTPS (TLS)** — encryption in-transit.
-- **JWT / OAuth 2.0** для authentication.
-- **API keys** для service-to-service.
+SOAP Message-level (WS-Security). WS-Security позволяет. Encrypt конкретные части XML. Sign отдельные элементы. Username tokens в SOAP Header. SAML tokens.
 
-Security **между** клиентом и сервером. Через прокси / gateway — прерывается TLS.
+Плюс. End-to-end через intermediary'ов. Клиент — Gateway — Server — сообщение остаётся signed/encrypted всю дорогу. TLS terminates on gateway но message security continues.
 
-Простой, стандартный.
+Минус. Сложно, много boilerplate.
 
-### 6.2 SOAP — Message-level (WS-Security)
+Different security paradigm. REST relies на transport encryption. SOAP embeds security в message.
 
-**WS-Security** позволяет:
-- Encrypt конкретные части XML.
-- Sign отдельные элементы.
-- Username tokens в SOAP Header.
-- SAML tokens.
+Enterprise scenarios с multiple intermediary systems favor SOAP message-level security. Simpler scenarios REST transport security достаточен.
 
-Плюс: **end-to-end** через intermediary'ов. Клиент → Gateway → Server — сообщение остаётся signed/encrypted всю дорогу.
+## Transactions
 
-Минус: сложно, много boilerplate.
+REST. Локальная tx — обычная @Transactional. Distributed — Saga, Outbox, Idempotency (см. файлы 50, 51). Нет стандарта для distributed tx через REST.
 
----
+Modern approach — eventual consistency через compensating actions. Не 2PC.
 
-## 7. Transactions
+SOAP. WS-AtomicTransaction (WS-AT) — 2PC поверх SOAP. WS-BusinessActivity (WS-BA) — long-running compensations (аналог Saga).
 
-### 7.1 REST
+Enterprise-ready, но сложно plus требует cross-vendor совместимости.
 
-- **Локальная tx** — обычная @Transactional.
-- **Distributed** — Saga, Outbox, Idempotency (см. `50-saga-pattern.md`, `51-outbox-inbox-pattern.md`).
-- **Нет стандарта** для distributed tx через REST.
+На практике даже в SOAP-мире 2PC редко. Complexity plus availability trade-offs не warrant. Even enterprise moves к eventual consistency patterns.
 
-### 7.2 SOAP
+## Performance
 
-- **WS-AtomicTransaction (WS-AT)** — 2PC поверх SOAP.
-- **WS-BusinessActivity (WS-BA)** — long-running compensations (аналог Saga).
+Bandwidth. REST plus JSON — компактно. SOAP plus XML — verbose (namespaces, envelope, boilerplate). В 5-10 раз больше.
 
-Enterprise-ready, но сложно + требует cross-vendor совместимости.
+CPU (parsing). JSON — быстро парсится (Jackson). XML — медленнее (SAX/DOM/StAX). Text parsing overhead XML higher.
 
-На практике даже в SOAP-мире 2PC редко.
+Latency. REST — быстрее (компактнее, меньше overhead). SOAP — медленнее.
 
----
+Для high-throughput — REST. Predictable performance advantage.
 
-## 8. Performance
+Caching. REST — GET запросы кэшируются HTTP-кэшом, CDN. SOAP — всё POST, no caching.
 
-### 8.1 Bandwidth
+Big deal для read-heavy APIs. HTTP caching mechanisms sophisticated.
 
-REST + JSON — **компактно**.
+## Developer experience
 
-SOAP + XML — **verbose** (namespaces, envelope, boilerplate). В 5-10× больше.
+REST. Простой — браузер, curl, Postman. JSON — читаемо. Легко debug. Быстрый feedback. Онбординг за часы.
 
-### 8.2 CPU (parsing)
+SOAP. Нужен WSDL, XSD tooling. XML сложно писать/читать. SoapUI для тестирования. Дни на первый вызов. Онбординг за недели.
 
-- **JSON** — быстро парсится (Jackson).
-- **XML** — медленнее (SAX/DOM/StAX).
+Отсюда — популярность REST для web / mobile. Barrier to entry ниже.
 
-### 8.3 Latency
+Debugging comparison. REST error — read HTTP status, look at JSON message. SOAP error — parse SOAP Fault XML, understand fault codes, decode Detail element.
 
-- **REST** — быстрее (компактнее, меньше overhead).
-- **SOAP** — медленнее.
+Order of magnitude difference в developer productivity для similar tasks.
 
-Для high-throughput → REST.
+## Что где используется
 
-### 8.4 Caching
+REST examples. Публичные web APIs — GitHub, Twitter, Stripe, Slack. Mobile apps. SPA / React frontends. Микросервисы (внутренняя коммуникация).
 
-- **REST** — GET требования кэшируются HTTP-кэшом, CDN.
-- **SOAP** — всё POST, no caching.
+SOAP examples. Banking (SWIFT, ISO 20022 XML-based). Government (Казахстан ИСНА, ЕС ecosystems). Telecom (OSS/BSS). Enterprise B2B (EDI, SAP). Legacy integrations.
 
-Big deal для read-heavy APIs.
+Pattern clear. Consumer-facing plus modern services — REST. Legacy enterprise plus regulated industries — SOAP.
 
----
+## Когда что выбирать
 
-## 9. Developer experience
+REST большинство случаев. Микросервисы. Публичные APIs. Mobile / SPA backends. Simple CRUD. High-throughput read-heavy.
 
-### 9.1 REST
+По default REST. Modern development standard.
 
-- Простой: браузер, curl, Postman.
-- JSON — читаемо.
-- Легко debug.
-- Быстрый feedback.
-- Онбординг за часы.
+SOAP специфичные. Требование партнёра (банк / gov). Legacy integration (существующий SOAP). Строгий contract обязателен. WS-Security end-to-end требуется. Distributed transactions (2PC — редко). Complex enterprise workflows (BPEL).
 
-### 9.2 SOAP
+SOAP не выбирают greenfield. Только когда constraints требуют.
 
-- Нужен WSDL, XSD tooling.
-- XML сложно писать/читать.
-- SoapUI для тестирования.
-- Дни на первый вызов.
-- Онбординг за недели.
+Selection criteria checklist. External requirements (partner mandates)? Existing systems (legacy integration)? Compliance requirements (audit, strong contracts)? End-to-end security (message-level)? Complex workflows (BPEL)? If yes to any — consider SOAP. If no — REST.
 
-Отсюда — популярность REST для web / mobile.
+## Гибридные подходы
 
----
+Часто оба в одной системе. Внешние партнёры — SOAP (по их требованию). Внутренние сервисы — REST. Adapter переводит SOAP → REST.
 
-## 10. Что где используется — примеры
+Так в ИСНА. ЕСБ / SOAP-шина для интеграции с внешними гос-системами. Внутренние микросервисы — REST plus Feign. Gateway (Zuul) — L7 маршрутизация.
 
-### 10.1 REST
+Adapter pattern common. Facade REST в front of legacy SOAP. Gradual migration path enabled.
 
-- **Публичные web APIs**: GitHub, Twitter, Stripe, Slack.
-- **Mobile apps**.
-- **SPA / React**.
-- **Микросервисы** (внутренняя коммуникация).
+## Modern alternatives
 
-### 10.2 SOAP
+Не только REST vs SOAP. Landscape richer.
 
-- **Banking** (SWIFT, ISO 20022 XML-based).
-- **Government** (Казахстан ИСНА, ЕС ecosystems).
-- **Telecom** (OSS/BSS).
-- **Enterprise B2B** (EDI, SAP).
-- **Legacy integrations**.
+gRPC. Protobuf binary. HTTP/2. Contract-first (.proto). Быстрее REST. Streaming.
 
----
+Плюсы SOAP (strong contract, performance) без XML overhead. Modern binary alternative.
 
-## 11. Когда что выбрать
+Использование — internal microservices, high-throughput. Better для service-to-service чем client-facing.
 
-### 11.1 REST — большинство случаев
+GraphQL. Query language. Client запрашивает какие поля нужны. Один endpoint.
 
-- **Микросервисы**.
-- **Публичные APIs**.
-- **Mobile / SPA backends**.
-- **Simple CRUD**.
-- **High-throughput read-heavy**.
+Плюсы. Гибкие read (no over/under fetching). Efficient для complex UI queries.
 
-По default — REST.
+Использование. BFF для сложных UIs. Rich mobile apps с varied data needs.
 
-### 11.2 SOAP — специфичные
+JSON-RPC / XML-RPC. Legacy RPC. Redko used в new projects.
 
-- **Требование партнёра** (банк / gov).
-- **Legacy integration** (существующий SOAP).
-- **Строгий contract** обязателен.
-- **WS-Security** end-to-end требуется.
-- **Distributed transactions** (2PC — редко).
-- **Complex enterprise workflows** (BPEL).
+WebSocket / SSE. Для real-time. Bidirectional (WebSocket) или server-push (SSE).
 
----
+Правило современности. REST — стандарт. gRPC — internal high-performance. GraphQL — flexible reads для UI. SOAP — только когда обязательно. WebSocket — real-time push.
 
-## 12. Гибридные подходы
+## Миграция SOAP → REST
 
-Часто **оба** в одной системе:
-- **Внешние партнёры** — SOAP (по их требованию).
-- **Внутренние сервисы** — REST.
-- **Adapter** переводит SOAP ↔ REST.
+Если legacy SOAP и хочешь на REST. Не переписывай сразу — Strangler pattern. Facade — REST-фасад перед SOAP-backend. Постепенно — новые features REST, старые остаются SOAP. Deprecate SOAP — 6-12 месяцев параллельно. Delete SOAP.
 
-Так в ИСНА:
-- **ЕСБ / SOAP-шина** для интеграции с внешними гос-системами.
-- **Внутренние микросервисы** — REST + Feign.
-- **Gateway (Zuul)** — L7 маршрутизация.
+Incremental migration. Big-bang rewrites risky и often fail. Facade approach enables gradual transition.
 
----
+## Реальный кейс ИСНА
 
-## 13. Modern alternatives
+Из memory. knp-fno-outer-sync-esb-dead-route — SOAP интеграция с ЕСБ через BT_OUTER_FNOSYNC_OUTER_TAXREP_SYNC маршрут. knp-fno-reception-api-mgu-vs-knp — приёмка ФНО через MGU (REST) или КНП (SOAP).
 
-Не только REST vs SOAP.
+Гибрид. Внешние гос-системы — SOAP-шина. Внутренние микросервисы КНП — REST plus Feign.
 
-### 13.1 gRPC
+Historical accretion. New systems REST. Legacy government integrations SOAP. Bridge layer connects.
 
-- Protobuf binary.
-- HTTP/2.
-- Contract-first (.proto).
-- Быстрее REST.
-- Streaming.
+## Итоги
 
-Плюсы SOAP (strong contract, performance) без XML overhead.
+REST vs SOAP разные things. REST архитектурный стиль на HTTP. SOAP protocol на XML.
 
-Использование: internal microservices, high-throughput.
+Format. REST JSON (обычно). SOAP XML always.
 
-### 13.2 GraphQL
+HTTP usage. REST leverages methods, status codes, caching. SOAP transport only, always POST, 200 status.
 
-- Query language.
-- Client запрашивает какие поля нужны.
-- Один endpoint.
+Compactness. REST 5-10 раз меньше SOAP.
 
-Плюсы: гибкие read (no over/under fetching).
+Contract. REST optional (OpenAPI). SOAP mandatory (WSDL/XSD).
 
-Использование: BFF для сложных UIs.
+Runtime validation. REST manual. SOAP automatic via XSD.
 
-### 13.3 JSON-RPC / XML-RPC
+Security. REST transport-level (TLS + JWT). SOAP message-level (WS-Security) для end-to-end.
 
-Legacy RPC.
+Transactions. REST через Saga/Outbox eventual consistency. SOAP WS-Transaction 2PC (редко used).
 
-### 13.4 WebSocket / SSE
+Performance. REST faster. SOAP more overhead.
 
-Для real-time.
+Caching. REST HTTP-cache works. SOAP no caching.
 
-**Правило современности**: **REST** — стандарт, **gRPC** — internal, **GraphQL** — flexible reads, **SOAP** — только когда обязательно.
+Developer experience. REST simple. SOAP complex, weeks onboarding.
 
----
+Where used. REST public APIs, mobile, SPA, microservices. SOAP banking, government, enterprise legacy.
 
-## 14. Миграция SOAP → REST
+When SOAP. Requirement, legacy, strict contract, end-to-end security, complex workflows.
 
-Если legacy SOAP и хочешь на REST:
+When REST. Everything else. Default choice.
 
-1. **Не переписывай сразу** — Strangler pattern.
-2. **Facade** — REST-фасад перед SOAP-backend.
-3. **Постепенно** — новые features REST, старые остаются SOAP.
-4. **Deprecate SOAP** — 6-12 месяцев параллельно.
-5. **Delete** SOAP.
+Modern alternatives. gRPC для internal high-throughput. GraphQL для flexible UI queries. WebSocket для real-time.
 
----
+Migration path. Strangler pattern. Facade approach. Incremental replacement.
 
-## 15. Реальный кейс ИСНА
+В ИСНА hybrid. SOAP для ЕСБ external integration. REST для internal microservices.
 
-Из memory:
-- **`knp-fno-outer-sync-esb-dead-route`** — SOAP интеграция с ЕСБ через `BT_OUTER_FNOSYNC_OUTER_TAXREP_SYNC` маршрут.
-- **`knp-fno-reception-api-mgu-vs-knp`** — приёмка ФНО через MGU (REST) или КНП (SOAP).
-
-Т.е. **гибрид**:
-- Внешние гос-системы — SOAP-шина.
-- Внутренние микросервисы КНП — REST + Feign.
-
----
-
-## 16. Собесные вопросы
-
-1. **REST vs SOAP — главное отличие?** — REST архитектурный стиль на HTTP + JSON; SOAP protocol на XML.
-2. **Формат сообщений?** — REST: JSON (обычно); SOAP: XML always.
-3. **Кто использует HTTP-методы?** — REST (GET/POST/PUT/DELETE); SOAP всегда POST.
-4. **Кто использует status codes?** — REST (200/201/404/500); SOAP всегда 200 (fault в body).
-5. **Кто быстрее / компактнее?** — REST (JSON меньше XML в 5-10×).
-6. **Contract-first vs code-first?** — SOAP: contract-first (WSDL); REST: обычно code-first (или OpenAPI).
-7. **Runtime validation?** — SOAP: XSD автоматически; REST: ручная через @Valid.
-8. **Security?** — REST: HTTPS + JWT; SOAP: WS-Security (message-level end-to-end).
-9. **Caching?** — REST: HTTP-кэш; SOAP: плохо.
-10. **Когда SOAP?** — Требование партнёра, legacy, banking, government, strong contract.
-11. **Когда REST?** — Микросервисы, публичные APIs, mobile, SPA, high-throughput.
-12. **WS-Security vs OAuth?** — WS-Security на уровне сообщения; OAuth token в HTTP header.
-13. **Что такое ESB?** — Enterprise Service Bus — центральная шина для SOAP.
-14. **Modern alternatives?** — gRPC (fast, contract-first), GraphQL (flexible reads).
-15. **Гибрид SOAP + REST?** — Facade REST перед SOAP-backend; постепенная миграция.
-
----
-
-## Итог
-
-- **REST** = архитектурный стиль на HTTP + JSON. **Default для новых проектов**.
-- **SOAP** = protocol на XML + WS-*. Legacy / enterprise / government.
-- **REST**: простой, быстрый, кэшируется, HTTP semantics.
-- **SOAP**: verbose, contract-first, WS-Security, WS-Transaction.
-- **В ИСНА**: гибрид (SOAP для ЕСБ, REST для микросервисов КНП).
-- **Modern**: gRPC для internal, GraphQL для flexible reads.
-
----
-
-## Финальный итог блоков 32-64
-
-- **@Transactional** (32-35).
-- **Spring Cloud** (36).
-- **Nodes** (37).
-- **Логирование** (38).
-- **Kafka** (39-42).
-- **Java memory + Prometheus + Elastic + nginx + инфра** (43-47).
-- **Микросервисы** (48-52).
-- **Тестирование** (53-56).
-- **Config + Helm + Consul + Annotations + Controllers + REST + SOAP** (57-64).
-
-**Итого 64 файла в `isna-theory\`**.
-
-Дальше можно: **Redis** (in-memory кэш), **распределённые системы** (CAP теорема, eventual consistency), **DevOps / GitLab CI** углубленно, **криптография / ЭЦП** (Kalkan для ИСНА), **AWS/GCP** cloud базы, **алгоритмы + структуры данных** для собесов, **system design** interview. Скажи что.
+Дальше — Integration bus (ЕСБ) и ESB patterns. Enterprise integration middleware, when it makes sense, when modern alternatives better.

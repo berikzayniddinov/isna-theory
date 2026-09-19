@@ -1,18 +1,20 @@
-# 65. ИШ / Интеграционные шины / ESB
+# 65. Интеграционная шина (ЕСБ / ESB): enterprise integration middleware
 
-Что такое интеграционная шина, зачем нужна, где ещё используется.
+## Зачем понимать ESB в эпоху микросервисов
 
----
+Разработчик работающий преимущественно с микросервисами обычно думает — ESB это legacy что не касается его. Reality приносит ESB в жизнь через enterprise integration scenarios. Legacy monoliths interconnected через central bus. Government systems integrated via SOAP-based ESB. Financial institutions using enterprise integration platforms. Understanding ESB важно для effectively working в enterprise contexts даже когда сам ESB не любимая архитектура.
 
-## 1. Что такое интеграционная шина
+Разница между разработчиком «не знающим ESB» и «понимающим ESB» проявляется в enterprise integration projects. Первый видит ESB tickets и confused. Второй знает fundamental ESB concept — hub-and-spoke integration reducing N×N point-to-point complexity. Знает classical ESB functions — routing, transformation, mediation, enrichment. Знает Apache Camel patterns для route-based integration. Знает EAI patterns book Hohpe/Woolf как classical reference. Знает why ESB deprecated в микросервисах — «smart endpoints, dumb pipes» philosophy shift. Знает специфический ИСНА context — ЕСБ для government integration, каналы ЛС-ИШ-ОС как критические business paths.
 
-**Интеграционная шина** (ИШ / **ESB** — Enterprise Service Bus) — централизованное middleware для интеграции разных систем.
+В этом файле разберём ESB глубоко. Что такое интеграционная шина. Классические функции. ESB продукты. Apache Camel workflow. EAI patterns. Почему deprecated в микросервисах. Где ещё живёт. iPaaS modern reincarnation. ИШ в контексте ИСНА (ЕСБ, каналы ЛС-ИШ-ОС). ESB vs API Gateway. ESB vs Message Broker. ESB vs Service Mesh. Когда ещё нужен ESB. Anti-patterns. Modern integration подход.
 
-Идея:
-- Много приложений разной природы (Java monoliths, SAP, mainframe, БД, Web-сервисы).
-- Все нужно связывать (обмен данными, вызовы).
-- Вместо **N × N** point-to-point интеграций — все через **центральную шину**.
+## Что такое интеграционная шина
 
+Интеграционная шина (ИШ / ESB — Enterprise Service Bus) — централизованное middleware для интеграции разных систем.
+
+Идея. Много приложений разной природы (Java monoliths, SAP, mainframe, БД, Web-сервисы). Все нужно связывать (обмен данными, вызовы). Вместо N × N point-to-point интеграций — все через центральную шину.
+
+Без шины:
 ```
 Без шины (point-to-point):
 
@@ -26,7 +28,10 @@
 
   6 связей на 4 приложения.
   N × (N-1) / 2 связей.
+```
 
+С шиной:
+```
 С шиной (hub-and-spoke):
 
     App A       App B
@@ -40,101 +45,79 @@
   4 связи, каждое приложение только с шиной.
 ```
 
-Плюсы:
-- **Loose coupling** — приложения не знают друг о друге.
-- Централизованная логика (routing, security, monitoring).
-- Легко добавить новое приложение.
+Mathematical benefit. Point-to-point requires N(N-1)/2 connections. Hub-and-spoke requires just N. Massive reduction connection count с growth systems.
 
-Минусы:
-- ESB — SPOF (single point of failure).
-- Централизованная бизнес-логика ("smart pipe, dumb endpoints") — трудно поддерживать.
-- Vendor lock-in.
+Плюсы. Loose coupling — приложения не знают друг о друге. Централизованная логика (routing, security, monitoring). Легко добавить новое приложение — connect to bus not to every other system.
 
----
+Минусы. ESB — SPOF (single point of failure). Централизованная бизнес-логика («smart pipe, dumb endpoints») — трудно поддерживать. Vendor lock-in.
 
-## 2. Классические функции ESB
+## Классические функции ESB
 
-### 2.1 Routing
-
-Определить куда доставить сообщение. Content-based routing:
+Routing. Определить куда доставить сообщение. Content-based routing:
 ```
 Если Order.type = "EXPRESS" → shipping-service
 Если Order.type = "REGULAR" → warehouse-service
 ```
 
-### 2.2 Transformation
+Decision made в bus based on message content.
 
-Одна система шлёт XML, другая ожидает JSON. Одна — camelCase, другая — snake_case.
+Transformation. Одна система шлёт XML, другая ожидает JSON. Одна — camelCase, другая — snake_case. ESB преобразует на лету. Инструменты — XSLT (XML), XPath, JOLT (JSON), custom mapping.
 
-ESB преобразует **на лету**.
+Removes coupling через format differences. Systems don't need to agree on formats.
 
-Инструменты: XSLT (XML), XPath, JOLT (JSON), custom mapping.
+Mediation. Между несовместимыми протоколами. SOAP → REST. HTTP → JMS. File → Kafka. Protocol translation в bus.
 
-### 2.3 Mediation
+Protocol bridging. Клиент SOAP, backend REST. ESB — переводчик. Enables mixing technologies.
 
-Между несовместимыми протоколами:
-- SOAP → REST.
-- HTTP → JMS.
-- File → Kafka.
-
-### 2.4 Protocol bridging
-
-Клиент SOAP, backend REST. ESB — переводчик.
-
-### 2.5 Message enrichment
-
-Добавить данные из других систем в сообщение по пути:
+Message enrichment. Добавить данные из других систем в сообщение по пути:
 ```
 Order → [ESB: спросить у customer-service имя клиента] → order+customerName → dest
 ```
 
-### 2.6 Security
+Middleware layer enriches messages с additional context. Reduces individual system complexity.
 
-Централизованная аутентификация / шифрование.
+Security. Централизованная аутентификация / шифрование. Consistent security policy applied в bus.
 
-### 2.7 Auditing / Monitoring
+Auditing / Monitoring. Все сообщения через шину — легко логировать / метрики. Centralized observability.
 
-Все сообщения через шину — легко логировать / метрики.
+Guaranteed delivery. С persistent queues — сообщение не потеряется. Enterprise messaging reliability.
 
-### 2.8 Guaranteed delivery
+Comprehensive set функций. ESB does many things — often too many в one place.
 
-С persistent queues — сообщение не потеряется.
+## Классические ESB продукты
 
----
+Enterprise Java экосистема (1990-2010е).
 
-## 3. Классические ESB продукты
+Apache ServiceMix (open source). Community-driven ESB. Java-based. Used в some open source integrations.
 
-Enterprise Java экосистема (1990-2010е):
-- **Apache ServiceMix** (open source).
-- **MuleSoft** (сейчас Salesforce).
-- **IBM Integration Bus (IIB / DataPower)**.
-- **Oracle Service Bus (OSB)**.
-- **TIBCO BusinessWorks**.
-- **Microsoft BizTalk**.
-- **JBoss ESB** (deprecated).
-- **Apache Camel** — не ESB, но integration framework часто в связке.
+MuleSoft (сейчас Salesforce). Commercial popular platform. Now iPaaS focused.
 
-Все — тяжелые, dorogих enterprise systems.
+IBM Integration Bus (IIB / DataPower). Enterprise IBM product. Comprehensive but expensive.
 
----
+Oracle Service Bus (OSB). Oracle enterprise product. Common в Oracle-heavy shops.
 
-## 4. Пример работы (Camel-style)
+TIBCO BusinessWorks. Legacy enterprise integration platform.
 
-**Apache Camel** — популярный integration framework (может работать как lightweight ESB):
+Microsoft BizTalk. Microsoft enterprise integration. Windows/.NET-centric.
 
+JBoss ESB (deprecated). Red Hat's ESB product. Discontinued.
+
+Apache Camel — не ESB but integration framework часто в связке. Route-based DSL для integration patterns.
+
+Все — тяжелые, дорогие enterprise systems. License costs plus operational complexity substantial.
+
+## Apache Camel пример
+
+Apache Camel популярный integration framework (может работать как lightweight ESB):
 ```java
 @Component
 class OrderRoute extends RouteBuilder {
     @Override
     public void configure() {
-        // из JMS-очереди
         from("jms:queue:orders.incoming")
-            // трансформация XML → JSON
             .marshal().json(JsonLibrary.Jackson)
-            // enrichment
             .enrich("http://customer-service/api/customers/{customerId}",
                     new CustomerEnricher())
-            // routing по content
             .choice()
                 .when(header("type").isEqualTo("EXPRESS"))
                     .to("http://shipping-service/api/express")
@@ -147,140 +130,99 @@ class OrderRoute extends RouteBuilder {
 }
 ```
 
-Читабельно: **входящий JMS → transform → enrich → routing → outgoing HTTP/JMS**.
+Читабельно. Входящий JMS → transform → enrich → routing → outgoing HTTP/JMS.
 
-Camel — 300+ компонентов (JMS, HTTP, File, Kafka, Salesforce, S3, ...).
+Camel — 300+ компонентов (JMS, HTTP, File, Kafka, Salesforce, S3, ...). Comprehensive integration ecosystem.
 
----
+Lightweight alternative к heavy ESB. Programming model более developer-friendly. Route definitions в code not GUI.
 
-## 5. EAI patterns
+## EAI patterns
 
-**Enterprise Integration Patterns** (Hohpe & Woolf, 2003) — классическая книга.
+Enterprise Integration Patterns (Hohpe и Woolf, 2003) — классическая книга. Foundational reference для integration architecture.
 
-Ключевые паттерны:
-- **Message Channel** — очередь между sender и receiver.
-- **Message Endpoint** — как приложение подключается к каналу.
-- **Message Router** — выбирает канал по content.
-- **Message Translator** — трансформирует формат.
-- **Content Enricher** — добавляет данные.
-- **Content Filter** — убирает лишнее.
-- **Aggregator** — собирает связанные сообщения в одно.
-- **Splitter** — разбивает одно на много.
-- **Wire Tap** — копия для audit.
-- **Dead Letter Channel** — куда деть проблемные сообщения.
-- **Idempotent Receiver** — избежать дублей.
+Ключевые паттерны.
 
-Все реализуются в ESB / Camel / любом integration tool.
+Message Channel — очередь между sender и receiver. Basic communication primitive.
 
----
+Message Endpoint — как приложение подключается к каналу. Connection point.
 
-## 6. Почему ESB deprecated в новых системах
+Message Router — выбирает канал по content. Routing logic pattern.
+
+Message Translator — трансформирует формат. Format bridging.
+
+Content Enricher — добавляет данные. Message augmentation.
+
+Content Filter — убирает лишнее. Data reduction.
+
+Aggregator — собирает связанные сообщения в одно. Correlation and combination.
+
+Splitter — разбивает одно на много. Fan-out processing.
+
+Wire Tap — копия для audit. Non-intrusive monitoring.
+
+Dead Letter Channel — куда деть проблемные сообщения. Error handling.
+
+Idempotent Receiver — избежать дублей. Reliability pattern.
+
+Все реализуются в ESB / Camel / любом integration tool. Universal patterns transcending specific technologies.
+
+Book still relevant даже в микросервисах. Patterns apply к any integration scenario.
+
+## Почему ESB deprecated в новых системах
 
 С развитием микросервисов и cloud-native подход изменился.
 
-### 6.1 "Smart endpoints, dumb pipes"
+«Smart endpoints, dumb pipes». Мартин Фаулер. Логика — в приложениях, не в шине. Шина — просто транспорт.
 
-Мартин Фаулер: логика — в **приложениях**, не в шине. Шина — просто транспорт.
+ESB накапливает бизнес-логику — превращается в integration monolith. Одну строчку изменить — тестирование всей шины. Central bottleneck.
 
-ESB накапливает бизнес-логику → превращается в **integration monolith**. Одну строчку изменить → тестирование всей шины.
+Микросервисы вместо интеграции. Раньше приложения были монолитами (SAP + Oracle + custom Java). ESB интегрировала. Теперь приложения сами — набор микросервисов, общаются через HTTP/events. ESB не нужен.
 
-### 6.2 Микросервисы вместо интеграции
+Cloud-native альтернативы. API Gateway — routing plus auth (обычно). Message broker (Kafka/Rabbit/SQS) — async messaging. Service Mesh (Istio/Linkerd) — mTLS, retry, observability. Serverless / Cloud Functions — трансформации.
 
-Раньше приложения были монолитами (SAP + Oracle + custom Java). ESB интегрировала.
+Каждый инструмент делает одну вещь хорошо. Композиция > монолитный ESB. Best-of-breed vs monolithic platform.
 
-Теперь приложения сами — набор микросервисов, общаются через HTTP/events. ESB не нужен.
+DevOps / Continuous Deployment. ESB deploy — недели (изменения в central hub). Микросервисы — минуты. Iteration speed matters.
 
-### 6.3 Cloud-native альтернативы
+Vendor lock-in. Проприетарные ESB — тяжело мигрировать. Enterprise dependencies persist для years.
 
-- **API Gateway** — routing + auth (обычно).
-- **Message broker** (Kafka/Rabbit/SQS) — async messaging.
-- **Service Mesh** (Istio/Linkerd) — mTLS, retry, observability.
-- **Serverless / Cloud Functions** — трансформации.
+## Где ESB ещё живёт
 
-Каждый инструмент делает одну вещь хорошо. Композиция > монолитный ESB.
+Не всё умерло. ESB жив в specific contexts.
 
-### 6.4 DevOps / Continuous Deployment
+Enterprise Java (banking, insurance, gov). Legacy monoliths plus SAP plus mainframe требуют интеграции. Нельзя переписать всё. ESB как integration layer legacy investments.
 
-ESB deploy — недели (изменения в central hub). Микросервисы — минуты.
+Регулируемые отрасли. Строгий audit, security, contract compliance. ESB даёт централизованный контроль. Regulator wants «one point» integration.
 
-### 6.5 Vendor lock-in
+Государственные системы. Как ИСНА в Казахстане. Historical foundation SOAP-based ESB integration.
 
-Проприетарные ESB — тяжело мигрировать.
+Modern ESB — iPaaS. Integration Platform as a Service — cloud-based ESB. MuleSoft Anypoint Platform. Boomi. Workato. AWS Step Functions + EventBridge. Azure Logic Apps.
 
----
+Легче чем legacy ESB, но идея та же. Central integration platform с cloud economics. Managed service model.
 
-## 7. Где ESB ещё живёт
+## ИШ в контексте ИСНА
 
-Не всё умерло. ESB жив в:
+ЕСБ — Единая Сервисная Шина. В ИСНА есть ЕСБ — центральная integration bus для интеграции с внешними государственными системами.
 
-### 7.1 Enterprise Java (banking, insurance, gov)
+Через ЕСБ идут. Взаимодействие с системами других ведомств. Приёмка ФНО / ФО (save-fno-<code> SOAP endpoints). Синхронизация данных между налоговой и другими системами. Проверки ИИН/БИН, регистрационных данных.
 
-Legacy monoliths + SAP + mainframe требуют интеграции. Нельзя переписать всё.
+Из memory. knp-fno-outer-sync-esb-dead-route — SOAP «Requested service is not found» когда маршрут BT_OUTER_FNOSYNC_OUTER_TAXREP_SYNC не поднят на ЕСБ. Логика — KnpOuterSystemFnoSyncService вызывает ЕСБ — падает если маршрут не настроен — 1586 ошибок за 13 часов.
 
-### 7.2 Регулируемые отрасли
+Урок. Зависимость от ЕСБ равно зависимость от инфры. Circuit breaker plus флаг отключения важны. Central bus becomes SPOF.
 
-Строгий audit, security, contract compliance. ESB даёт централизованный контроль.
+Каналы ЛС-ИШ-ОС. Из memory knp-e2e-prod-smoke-scope-rules. «Не смокать мутирующие/опасные API (send/запись/запрос в ЛС-ИШ-ОС под ЭЦП владельца)».
 
-### 7.3 Государственные системы
-
-Как ИСНА в Казахстане.
-
-### 7.4 Modern ESB — iPaaS
-
-**iPaaS (Integration Platform as a Service)** — cloud-based ESB:
-- **MuleSoft Anypoint Platform**.
-- **Boomi**.
-- **Workato**.
-- **AWS Step Functions + EventBridge**.
-- **Azure Logic Apps**.
-
-Легче chем legacy ESB, но идея та же.
-
----
-
-## 8. ИШ в контексте ИСНА
-
-### 8.1 ЕСБ — Единая Сервисная Шина
-
-В ИСНА есть **ЕСБ** — центральная integration bus для интеграции с внешними государственными системами.
-
-Через ЕСБ идут:
-- Взаимодействие с системами других ведомств.
-- Приёмка ФНО / ФО (`save-fno-<code>` SOAP endpoints).
-- Синхронизация данных между налоговой и другими системами.
-- Проверки ИИН/БИН, регистрационных данных.
-
-Из memory:
-- **`knp-fno-outer-sync-esb-dead-route`** — SOAP "Requested service is not found" когда маршрут `BT_OUTER_FNOSYNC_OUTER_TAXREP_SYNC` не поднят на ЕСБ.
-- Логика: `KnpOuterSystemFnoSyncService` вызывает ЕСБ → падает если маршрут не настроен → 1586×/13ч ошибок.
-
-Урок: **зависимость от ЕСБ = зависимость от инфры**. Circuit breaker + флаг отключения важны.
-
-### 8.2 Каналы ЛС-ИШ-ОС
-
-Из memory `knp-e2e-prod-smoke-scope-rules`:
-> «не смокать мутирующие/опасные API (send/запись/запрос в ЛС-ИШ-ОС под ЭЦП владельца)»
-
-Что означает:
-- **ЛС** — **Личный Счёт** налогоплательщика (транзакции, разноска платежей).
-- **ИШ** — **Интеграционная Шина** (обмен с внешними системами).
-- **ОС** — **Отправка/Обмен Сообщениями** (или Openservice? "Отчётная Система").
+Что означает. ЛС — Личный Счёт налогоплательщика (транзакции, разноска платежей). ИШ — Интеграционная Шина (обмен с внешними системами). ОС — Отправка/Обмен Сообщениями (или Openservice, «Отчётная Система»).
 
 Три канала критичных операций требующих ЭЦП владельца.
 
-Правило смока: **не мутировать ничего в эти каналы** (не создавать нагрузки на прод / не влиять на состояние ЛС / не слать в ИШ / не отправлять в ОС).
+Правило смока. Не мутировать ничего в эти каналы (не создавать нагрузки на прод, не влиять на состояние ЛС, не слать в ИШ, не отправлять в ОС). Test scope restricted для business safety.
 
-### 8.3 SOAP vs REST в ИСНА
+SOAP vs REST в ИСНА. Внешний слой (интеграция с гос. системами) — SOAP через ЕСБ/ИШ. Внутренний слой (микросервисы КНП, АРМ) — REST через Feign + Consul. Gateway — isna-knp-gateway (Zuul) на входе, роутит.
 
-- **Внешний слой** (интеграция с гос. системами) — SOAP через ЕСБ/ИШ.
-- **Внутренний слой** (микросервисы КНП, АРМ) — REST через Feign + Consul.
-- **Gateway** — `isna-knp-gateway` (Zuul) на входе, роутит.
+Так исторически. SOAP был стандартом gov, REST пришёл позже для user-facing. Hybrid architecture reflects evolution.
 
-Так исторически: SOAP был стандартом gov, REST пришёл позже для user-facing.
-
----
-
-## 9. ESB vs API Gateway
+## ESB vs API Gateway
 
 Часто путают. Разница важна.
 
@@ -294,18 +236,13 @@ Legacy monoliths + SAP + mainframe требуют интеграции. Нель
 | Сложность | Высокая | Средняя |
 | Async | Естественная | Обычно sync (или facade over async) |
 
-**API Gateway** — edge для internet клиентов.
-**ESB** — hub для internal системной интеграции.
+API Gateway — edge для internet клиентов. ESB — hub для internal системной интеграции.
 
 Иногда сливаются в одном продукте (MuleSoft умеет оба).
 
-В ИСНА:
-- **isna-knp-gateway** — API Gateway (Zuul) для внешних клиентов.
-- **ЕСБ/ИШ** — ESB для интеграции с гос-системами.
+В ИСНА. isna-knp-gateway — API Gateway (Zuul) для внешних клиентов. ЕСБ/ИШ — ESB для интеграции с гос-системами. Different roles complement.
 
----
-
-## 10. ESB vs Message Broker
+## ESB vs Message Broker
 
 | | ESB | Broker (Rabbit/Kafka) |
 |---|---|---|
@@ -313,17 +250,17 @@ Legacy monoliths + SAP + mainframe требуют интеграции. Нель
 | Transformation | Да | Нет (в приложении) |
 | Routing | Content-based | Простой (queue/topic name) |
 | Enrichment | Да | Нет |
-| "Smartness" | Smart pipe | Dumb pipe |
+| «Smartness» | Smart pipe | Dumb pipe |
 
-**Broker** — простой транспорт. **ESB** — умный посредник.
+Broker — простой транспорт. ESB — умный посредник.
 
-Современный подход: **broker + smart consumers**.
+Современный подход. Broker plus smart consumers. Logic distributed to endpoints, transport dumb.
 
----
+Fundamental design philosophy shift. Microservices avoid centralized logic.
 
-## 11. ESB vs Service Mesh
+## ESB vs Service Mesh
 
-**Service Mesh** (Istio, Linkerd) — infrastructure layer для sidecar proxy.
+Service Mesh (Istio, Linkerd) — infrastructure layer для sidecar proxy.
 
 | | ESB | Service Mesh |
 |---|---|---|
@@ -332,108 +269,72 @@ Legacy monoliths + SAP + mainframe требуют интеграции. Нель
 | Функции | Transformation, routing, business logic | Retry, mTLS, tracing, LB |
 | Coupling | High (все через ESB) | Low (transparent) |
 
-Service Mesh — **cross-cutting infrastructure** без бизнес-логики.
+Service Mesh — cross-cutting infrastructure без бизнес-логики. Sidecars intercept traffic. Application unaware.
 
-ESB — **business-level integration**.
+ESB — business-level integration. Contains business logic within bus.
 
-Разные слои.
+Разные слои. Different concerns. Complementary rather than alternative usually.
 
----
+## Когда ещё нужен ESB
 
-## 12. Когда ещё нужен ESB
+Не для новых микросервис-проектов. Но specific scenarios.
 
-Не для новых микросервис-проектов. Но:
+Legacy integration. 10 monolithic apps, каждый со своим API — ESB решает. Bridge existing systems.
 
-### 12.1 Legacy integration
+B2B integration. Партнёры со своими протоколами (SOAP, EDI, файлы). ESB — точка перевода. Multi-protocol translation.
 
-10 monolithic apps, каждый со своим API → ESB решает.
+Enterprise workflows. Сложные orchestration (BPEL) — ESB часто включает workflow engine.
 
-### 12.2 B2B integration
+Централизованный audit / compliance. Регулятор требует «все сообщения через одну точку». Compliance driven.
 
-Партнёры со своими протоколами (SOAP, EDI, файлы). ESB — точка перевода.
+Gov / regulated. Как ИСНА — исторически SOAP plus ESB для gov integration.
 
-### 12.3 Enterprise workflows
+## Anti-patterns
 
-Сложные orchestration (BPEL) — ESB часто включает workflow engine.
+Business logic в ESB. Расчёты, валидации, decisions — в приложениях, не в шине. Rule ownership belongs в services owning business capability.
 
-### 12.4 Централизованный audit / compliance
+Огромный ESB monolith. Один ESB для всей компании — все зависят от одной команды. Правильно — несколько специализированных (по domain). Bounded contexts apply к ESBs too.
 
-Регулятор требует "все сообщения через одну точку".
+God's message. Одно сообщение несёт всё для всех. Sender не знает что receiver'ы возьмут — coupling скрыт. Explicit message contracts better.
 
-### 12.5 Gov / regulated
+Sync через async broker. RPC поверх Rabbit/Kafka — ждёшь ответ через тот же broker. Медленно, сложно debug. Async should be async fully.
 
-Как ИСНА — исторически SOAP + ESB для gov integration.
+## Modern подход к integration
 
----
+Choreography (см. файл 50 saga-pattern). Каждый сервис публикует events. Другие подписываются. Никого центрального посредника.
 
-## 13. Anti-patterns
+Инструменты. Kafka plus Schema Registry — event streaming backbone. Rabbit — task queues. API Gateway — HTTP edge. Service Mesh — infrastructure. Event Sourcing / CQRS — data.
 
-### 13.1 Business logic в ESB
+Distributed, cloud-native, микросервисы. ESB не нужен. Modern architecture composes лучших-of-breed tools instead of monolithic platform.
 
-Расчёты, валидации, decisions — в приложениях, не в шине.
+## Итоги
 
-### 13.2 Огромный ESB monolith
+ESB (Enterprise Service Bus) централизованное middleware для интеграции разных систем. Hub-and-spoke pattern reducing N×N connections.
 
-Один ESB для всей компании → все зависят от одной команды.
+Классические функции. Routing (content-based). Transformation (formats). Mediation (protocols). Enrichment (adding data). Security (centralized). Auditing. Guaranteed delivery.
 
-Правильно — **несколько специализированных** (по domain).
+ESB продукты. Apache ServiceMix, MuleSoft, IBM IIB, Oracle OSB, TIBCO, BizTalk. Все heavy enterprise systems.
 
-### 13.3 God's message
+Apache Camel как lightweight integration framework. Route DSL. Comprehensive component library.
 
-Одно сообщение несёт всё для всех. Sender не знает что receiver'ы возьмут → coupling скрыт.
+EAI patterns (Hohpe/Woolf) — foundational integration architecture patterns. Message Channel, Router, Translator, Enricher, Aggregator, Splitter, Dead Letter, Idempotent Receiver.
 
-### 13.4 Sync через async broker
+ESB deprecated в микросервисах. «Smart endpoints, dumb pipes» philosophy. Микросервисы plus broker plus gateway plus mesh replace monolithic ESB.
 
-RPC поверх Rabbit/Kafka — ждёшь ответ через тот же broker. Медленно, сложно debug.
+Ещё живёт в. Banking, insurance, government, regulated industries, legacy integration. Compliance plus existing investments sustain.
 
----
+iPaaS modern reincarnation. MuleSoft Anypoint, Boomi, Workato. Cloud-native ESB. Managed service.
 
-## 14. Modern подход к integration
+В ИСНА. ЕСБ для integration с external government systems. Каналы ЛС-ИШ-ОС критические business paths. SOAP-based enterprise integration.
 
-**Choreography** (см. `50-saga-pattern.md`):
-- Каждый сервис публикует events.
-- Другие подписываются.
-- Никого центрального посредника.
+ESB vs API Gateway. ESB internal integration hub. Gateway external entry point. Different roles.
 
-Инструменты:
-- **Kafka + Schema Registry** — event streaming backbone.
-- **Rabbit** — task queues.
-- **API Gateway** — HTTP edge.
-- **Service Mesh** — infrastructure.
-- **Event Sourcing / CQRS** — data.
+ESB vs Message Broker. ESB smart pipe. Broker dumb pipe. Modern preference broker plus smart consumers.
 
-Distributed, cloud-native, микросервисы. ESB не нужен.
+ESB vs Service Mesh. ESB business-level. Service Mesh infrastructure-level. Different concerns.
 
----
+Anti-patterns. Business logic в ESB. Огромный monolithic ESB. God messages. Sync через async broker.
 
-## 15. Собесные вопросы
+Modern integration через choreography. Kafka events. API Gateway edge. Service Mesh infrastructure. Composed tools not monolithic ESB.
 
-1. **Что такое ESB?** — Enterprise Service Bus — централизованное middleware для интеграции систем.
-2. **Функции ESB?** — Routing, transformation, mediation, enrichment, protocol bridging.
-3. **Плюсы ESB?** — Loose coupling, централизованная логика/security/monitoring.
-4. **Минусы ESB?** — SPOF, integration monolith, vendor lock-in, медленные deploys.
-5. **ESB vs API Gateway?** — ESB: internal integration hub; Gateway: external entry point.
-6. **ESB vs Message Broker?** — ESB smart pipe (transform, route); broker dumb pipe (просто транспорт).
-7. **ESB vs Service Mesh?** — ESB business-level integration; mesh infrastructure cross-cutting.
-8. **Почему ESB deprecated?** — Микросервисы + broker + gateway + mesh делают то же лучше.
-9. **Что такое Apache Camel?** — Java integration framework; часто в связке с ESB.
-10. **Что такое EAI patterns?** — Enterprise Integration Patterns (Hohpe/Woolf) — паттерны интеграции.
-11. **Где ESB ещё используется?** — Banking, insurance, government, regulated industries, legacy integration.
-12. **iPaaS — что?** — Integration Platform as a Service; cloud-based ESB.
-13. **"Smart endpoints, dumb pipes" — что значит?** — Логика в приложениях, шина — просто транспорт.
-14. **ЕСБ в ИСНА — для чего?** — Интеграция с внешними государственными системами (SOAP).
-15. **Anti-patterns ESB?** — Business logic в ESB, огромный monolith, sync-over-async.
-
----
-
-## Итог
-
-- **ESB** = централизованный middleware для интеграции.
-- Функции: **routing, transformation, mediation, enrichment**.
-- Deprecated в микросервисах (broker + gateway + mesh лучше).
-- Ещё используется в enterprise / government / legacy.
-- В **ИСНА**: **ЕСБ/ИШ** для интеграции с внешними гос-системами (SOAP-based).
-- **Каналы ЛС-ИШ-ОС** — критичные, не смокать mutating APIs.
-- Modern подход: **choreography** через events + smart consumers.
-
-Следующий — `66-sync-vs-async.md`.
+Дальше — sync vs async communication patterns. When to use which. Trade-offs.
