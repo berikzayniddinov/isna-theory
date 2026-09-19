@@ -1,12 +1,8 @@
-# 33. @Transactional изнутри: прокси, PlatformTransactionManager
+# 33. @Transactional изнутри: прокси и PlatformTransactionManager
 
-Как Spring на самом деле реализует `@Transactional`. Все детали, все подводные камни.
+## Общая картина
 
----
-
-## 1. Общая картина
-
-Когда ты пишешь:
+Когда разработчик пишет простую аннотацию:
 ```java
 @Service
 class OrderService {
@@ -18,86 +14,36 @@ class OrderService {
 }
 ```
 
-Что Spring делает под капотом:
+За кулисами Spring делает довольно сложную работу. При создании bean OrderService Spring оборачивает его в CGLib-прокси (subclass). Прокси-класс переопределяет метод createOrder добавляя вокруг оригинальной логики код управления транзакцией — beginTransaction, вызов оригинала, commit при успехе или rollback при exception. Везде где используется @Autowired OrderService возвращается прокси не оригинальный объект.
 
-1. При создании бина `OrderService` Spring **оборачивает его в CGLib-прокси** (subclass).
-2. Прокси-класс переопределяет метод `createOrder`, добавляя вокруг:
-   - `beginTransaction()`.
-   - Вызов оригинального метода.
-   - `commit()` при success или `rollback()` при exception.
-3. Везде, где ты `@Autowired OrderService` — получаешь **прокси**, не оригинал.
+Понимание этого механизма критически важно потому что multiple классические баги @Transactional происходят именно из ограничений proxy подхода. Разберём каждый компонент детально.
 
-Разберём каждый компонент.
+## Три ключевых участника
 
----
+TransactionInterceptor это AOP-совет (advice) выполняющийся вокруг каждого @Transactional-метода. Класс org.springframework.transaction.interceptor.TransactionInterceptor реализует MethodInterceptor интерфейс. Внутри TransactionAspectSupport.invokeWithinTransaction главный метод выполняющий последовательность. Извлекает TransactionAttribute (propagation, isolation, rollbackFor). Берёт нужный PlatformTransactionManager. Открывает транзакцию через getTransaction. Вызывает оригинальный метод. При success — commit. При exception — проверяет rollback rules и либо rollback либо commit.
 
-## 2. Три ключевых участника
+TransactionAttributeSource читает мета-информацию о transaction для метода. Основная реализация AnnotationTransactionAttributeSource ищет @Transactional аннотацию сначала на методе, потом на классе, потом на interface. Кэширует результат в Map Method to TransactionAttribute чтобы не парсить аннотации на каждый вызов.
 
-### 2.1 TransactionInterceptor
+PlatformTransactionManager это абстракция над конкретным механизмом transactions. Interface с тремя методами. getTransaction принимает TransactionDefinition и возвращает TransactionStatus представляющий open transaction. commit фиксирует изменения. rollback откатывает.
 
-`org.springframework.transaction.interceptor.TransactionInterceptor` — AOP-совет (advice), который выполняется вокруг каждого `@Transactional`-метода.
+Реализации PlatformTransactionManager для разных сценариев. DataSourceTransactionManager для plain JDBC — работает с DataSource напрямую. JpaTransactionManager для JPA plus Hibernate — управляет EntityManager plus underlying JDBC connection. JtaTransactionManager для XA distributed transactions — работает через JTA API. ChainedTransactionManager для best-effort объединения нескольких (deprecated). RabbitTransactionManager для Rabbit. KafkaTransactionManager для Kafka.
 
-Внутри — `TransactionAspectSupport.invokeWithinTransaction()` (главный метод):
-1. Извлечь `TransactionAttribute` (propagation, isolation, rollbackFor).
-2. Взять нужный `PlatformTransactionManager`.
-3. Открыть tx (`getTransaction()`).
-4. Вызвать оригинальный метод.
-5. При success → `commit()`.
-6. При exception → проверить rollback rules → `rollback()` или `commit()`.
+Spring Boot автоконфигурит JpaTransactionManager если есть spring-boot-starter-data-jpa dependency. Это самый частый случай в enterprise Spring приложениях.
 
-### 2.2 TransactionAttributeSource
+## Как создаётся прокси
 
-Читает мета-информацию о транзакции для метода. Основная реализация — `AnnotationTransactionAttributeSource`:
-- Ищет `@Transactional` на методе, потом на классе, потом на interface.
-- Кэширует результат в `Map<Method, TransactionAttribute>`.
+InfrastructureAdvisorAutoProxyCreator это BeanPostProcessor следящий за созданием beans. Метод postProcessAfterInitialization проверяет — «этому bean нужен прокси?». Если bean имеет метод с @Transactional (напрямую или через классовую аннотацию) — да, оборачивается в прокси.
 
-### 2.3 PlatformTransactionManager
+Выбор типа прокси. JDK Dynamic Proxy используется если bean реализует interfaces — прокси реализует те же interfaces. CGLib Proxy используется если bean не имеет interfaces — создаётся subclass через bytecode generation.
 
-Абстракция над конкретным механизмом транзакций.
-
-Реализации:
-- **`DataSourceTransactionManager`** — для plain JDBC.
-- **`JpaTransactionManager`** — для JPA/Hibernate.
-- **`JtaTransactionManager`** — для XA / distributed.
-- **`ChainedTransactionManager`** — «best-effort» для нескольких (без реального 2PC).
-- **`RabbitTransactionManager`** — для Rabbit.
-- **`KafkaTransactionManager`** — для Kafka.
-
-Spring Boot автоконфигурит **`JpaTransactionManager`** если есть JPA (spring-boot-starter-data-jpa).
-
-Интерфейс:
-```java
-public interface PlatformTransactionManager {
-    TransactionStatus getTransaction(TransactionDefinition definition);
-    void commit(TransactionStatus status);
-    void rollback(TransactionStatus status);
-}
-```
-
----
-
-## 3. Как создаётся прокси
-
-### 3.1 BeanPostProcessor
-
-`InfrastructureAdvisorAutoProxyCreator` — `BeanPostProcessor`, который на `postProcessAfterInitialization` смотрит: «этому бину нужен прокси?».
-
-Если бин имеет метод с `@Transactional` (напрямую или через классовую аннотацию) → да.
-
-### 3.2 Что выбирает Spring
-
-- **JDK Dynamic Proxy** — если бин реализует интерфейсы. Прокси реализует эти интерфейсы.
-- **CGLib Proxy** — если бин не имеет интерфейсов. Создаёт **subclass**.
-
-Настройка:
+Настройка через свойство:
 ```yaml
-spring.aop.proxy-target-class: true       # всегда CGLib (default для Spring Boot)
+spring.aop.proxy-target-class: true       # всегда CGLib (default в Spring Boot)
 ```
 
-По умолчанию Spring Boot использует CGLib. Плюс: работает даже если у бина есть интерфейсы.
+По default Spring Boot использует CGLib даже когда bean имеет interfaces. Причина — CGLib subclass proxy работает предсказуемо независимо от interface implementation. JDK proxy может создать subtle issues когда bean инжектится по class type а не interface type.
 
-### 3.3 Структура CGLib-прокси
-
+Структура CGLib прокси:
 ```
 Оригинал:
   OrderService
@@ -114,37 +60,21 @@ spring.aop.proxy-target-class: true       # всегда CGLib (default для S
     // internalMethod не переопределяется (private)
 ```
 
-Прокси имеет **тот же интерфейс что оригинал** — можно инжектить как `OrderService`.
+Прокси имеет тот же тип что оригинал (subclass) — можно инжектить как OrderService в других beans.
 
-### 3.4 Ограничения CGLib
+Ограничения CGLib подхода. Не может проксировать final классы потому что нельзя extend. Не может final методы потому что нельзя override. Не может private методы потому что не переопределяются в subclass. Не может static методы потому что не наследуются. Требует no-arg constructor или пустой super() потому что CGLib создаёт instance прокси который extends оригинал.
 
-- **Не может проксировать `final`-классы** — нельзя extend.
-- **Не может `final`-методы** — нельзя override.
-- **Не может `private`-методы** — не переопределяются в subclass.
-- **Не может `static`-методы** — не наследуются.
-- Требует no-arg constructor (или пустой super) — CGLib создаёт instance для прокси.
+Различия JDK Dynamic Proxy и CGLib. JDK требует interface, CGLib требует extendable class. JDK ограничения только методами interface, CGLib — final/private/static не работают. JDK немного быстрее в invocation, CGLib немного медленнее из-за bytecode dispatch. Default в Spring Boot — CGLib потому что более predictable behavior.
 
-### 3.5 JDK Dynamic Proxy vs CGLib
+## Self-invocation классический баг
 
-|| JDK | CGLib |
-|---|---|---|
-| Требует | Интерфейс | Extendable class |
-| Ограничения | Только методы интерфейса | final/private/static не работают |
-| Скорость | Немного быстрее | Немного медленнее |
-| Default в Boot | Нет | Да |
-
----
-
-## 4. Self-invocation — почему @Transactional не срабатывает
-
-**Классический баг**.
-
+Наиболее частая ошибка при работе с @Transactional. Проявляется когда метод внутри класса вызывает другой метод того же класса с @Transactional:
 ```java
 @Service
 class OrderService {
     public void processAll(List<Order> orders) {
         for (Order o : orders) {
-            this.processOne(o);      // ← вызов через this!
+            this.processOne(o);      // ← вызов через this
         }
     }
 
@@ -155,14 +85,9 @@ class OrderService {
 }
 ```
 
-Ожидание: `processOne` создаёт новую tx на каждой итерации.
-Реальность: **@Transactional не срабатывает**. Всё в одной tx (или без tx).
+Ожидаемое поведение — processOne создаёт новую транзакцию на каждой итерации. Реальность — @Transactional не срабатывает. Всё выполняется в одной transaction (или без transaction вообще).
 
-### 4.1 Почему
-
-Прокси перехватывает **внешние вызовы** — то есть вызовы через ссылку на прокси.
-
-Когда `processAll` вызван → идёт через прокси → но внутри метода `this` = **оригинальный объект** (не прокси!). Вызов `this.processOne(o)` — прямой вызов метода оригинала, минуя прокси, минуя транзакционную логику.
+Причина в природе proxy. Прокси перехватывает external calls — вызовы через reference на прокси. Когда processAll вызывается извне — идёт через прокси. Внутри метода this равно оригинальному объекту не прокси. Вызов this.processOne напрямую вызывает метод оригинала минуя прокси и минуя transactional advice.
 
 ```
 Внешний вызов          Внутренний вызов
@@ -172,13 +97,11 @@ class OrderService {
     │  Proxy   │  ──super─►   │ Original │──►┐
     └──────────┘              └──────────┘   │
         ↑                          │         │
-        │                          └─────────┘   ← this.processOne → напрямую!
+        │                          └─────────┘   ← this.processOne напрямую!
     call site                      минует прокси
 ```
 
-### 4.2 Как обойти
-
-**A) Извлечь в другой бин (правильно)**:
+Способы обойти self-invocation. Первый и правильный — извлечь вызываемый метод в другой bean:
 ```java
 @Service
 class OrderService {
@@ -186,7 +109,7 @@ class OrderService {
 
     public void processAll(List<Order> orders) {
         for (Order o : orders) {
-            processor.processOne(o);   // ← через прокси processor
+            processor.processOne(o);   // через прокси processor
         }
     }
 }
@@ -198,15 +121,17 @@ class OrderProcessor {
 }
 ```
 
-**B) Инжектить самого себя (некрасиво)**:
+Разделение responsibilities плюс обход self-invocation одним архитектурным решением.
+
+Второй способ — инжектить bean самого себя. Некрасиво но работает:
 ```java
 @Service
 class OrderService {
-    @Autowired OrderService self;   // ← прокси
+    @Autowired OrderService self;   // прокси через DI
 
     public void processAll(List<Order> orders) {
         for (Order o : orders) {
-            self.processOne(o);       // ← через прокси!
+            self.processOne(o);       // через прокси
         }
     }
 
@@ -215,80 +140,56 @@ class OrderService {
 }
 ```
 
-Внимание: circular dependency в Spring 2.6+ по умолчанию запрещён → `@Lazy`:
-```java
-@Autowired @Lazy OrderService self;
-```
+Caveat — circular dependency в Spring 2.6+ по default запрещён. Требуется @Lazy для self reference. Считается code smell — extract to another class обычно чище.
 
-**C) `AopContext.currentProxy()` (страшно)**:
+Третий способ — AopContext.currentProxy(). Ещё более wtf-style но иногда встречается:
 ```java
 ((OrderService) AopContext.currentProxy()).processOne(o);
 ```
 
-Требует `@EnableAspectJAutoProxy(exposeProxy = true)`. Некрасиво, но работает.
+Требует @EnableAspectJAutoProxy(exposeProxy = true). Работает но обычно проще extract to another class.
 
-**D) AspectJ compile-time weaving** — модифицирует байткод, все вызовы (внешние + внутренние) идут через advice. Не через прокси. Сложно настроить, редко используется.
+Четвёртый способ — AspectJ compile-time weaving. Модифицирует bytecode на этапе compilation — все вызовы (external plus internal) идут через advice. Не через прокси. Мощнее но требует Maven/Gradle plugin, специальные IDE setup, extra complexity. Редко используется в enterprise.
 
-### 4.3 Реальный кейс ИСНА
+Реальный кейс из КНП memory knp-fo-sync-notification-bugs — 6 багов включая @Transactional мёртв из-за self-invocation. Приводил к LazyInit и «грязным» commits. Урок универсальный — любой раз когда видишь this.methodWithAnnotation() внутри класса это красная лампа. Аннотация НЕ работает. Fix через extract to another bean.
 
-Memory `knp-fo-sync-notification-bugs`: 6 багов, включая `@Transactional` мёртв из-за self-invocation → LazyInit + грязные commits.
+## Другие ограничения @Transactional
 
-Урок: **любой раз когда вижу `this.methodWithAnnotation()` — красная лампа**. Аннотация НЕ работает.
+Помимо self-invocation существуют другие сценарии когда @Transactional silently не работает.
 
----
-
-## 5. Ограничения @Transactional (кроме self-invocation)
-
-### 5.1 @Transactional на private / protected / package-private
-
-**Не работает** для CGLib-прокси (нельзя переопределить private).
-
-Для `protected` — технически можно, но Spring не сканирует. По контракту — **только public**.
-
+@Transactional на private methods не срабатывает. CGLib не может override private методы в subclass — они не visible. Не будет ошибки, просто transaction не создаётся. Тихо ломается:
 ```java
 @Transactional
-private void x() { ... }   // ← НЕ РАБОТАЕТ, не будет ошибки, но tx не будет
+private void x() { ... }   // НЕ работает, no error
 ```
 
-Тихо ломается.
+@Transactional на protected или package-private технически возможен для CGLib но Spring не сканирует их. По контракту только public. Правило — @Transactional только на public методах.
 
-### 5.2 @Transactional на final method
+@Transactional на final method. CGLib не может override final. Не работает. Ошибки может не быть, просто silent failure.
 
-CGLib не может override `final`. **Не работает**.
+@Transactional на static методе. Static методы не наследуются subclass. Не работает.
 
-### 5.3 @Transactional на static
-
-Static методы не наследуются. **Не работает**.
-
-### 5.4 @Transactional внутри @PostConstruct
-
+@Transactional на @PostConstruct метод не работает:
 ```java
 @Component
 class InitBean {
     @PostConstruct
     @Transactional
-    public void init() { ... }   // ← НЕ работает
+    public void init() { ... }   // НЕ работает
 }
 ```
 
-Причина: `@PostConstruct` вызывается **до** того, как бин обёрнут в прокси. Транзакции не будет.
+Причина — @PostConstruct вызывается до того как bean обёрнут в прокси. На момент вызова proxy ещё не существует, transaction не создаётся. Fix через ApplicationRunner или @EventListener(ContextRefreshedEvent.class) для запуска init logic после completion context setup.
 
-Fix: `ApplicationRunner` или `@EventListener(ContextRefreshedEvent.class)`.
+@Transactional на конструкторе не поддерживается вообще. Constructor вызывается создание bean — proxy может быть только вокруг methods не constructor.
 
-### 5.5 @Transactional на конструкторе
+## TransactionSynchronizationManager
 
-Не поддерживается.
-
----
-
-## 6. TransactionSynchronizationManager
-
-Ключевой класс, связывающий транзакцию с текущим потоком.
-
+Ключевой класс связывающий transaction с текущим потоком. Всё через ThreadLocal:
 ```java
 public abstract class TransactionSynchronizationManager {
     private static final ThreadLocal<Map<Object, Object>> resources;
-    private static final ThreadLocal<TransactionSynchronization> synchronizations;
+    private static final ThreadLocal<Set<TransactionSynchronization>> synchronizations;
     private static final ThreadLocal<String> currentTransactionName;
     private static final ThreadLocal<Integer> currentTransactionIsolationLevel;
     private static final ThreadLocal<Boolean> currentTransactionReadOnly;
@@ -296,42 +197,31 @@ public abstract class TransactionSynchronizationManager {
 }
 ```
 
-Всё через `ThreadLocal`. Отсюда:
+Транзакция привязана к потоку через thread-local storage. Отсюда критическое следствие — при переключении потока (@Async, virtual thread, ExecutorService) транзакция теряется. Изменения не будут в контексте новой transaction.
 
-- **Транзакция привязана к потоку** — если ты переключаешь поток (`@Async`, virtual thread, ExecutorService) — теряешь tx.
-- Внутри метода: `TransactionSynchronizationManager.isActualTransactionActive()` — проверить есть ли tx.
+Внутри метода можно проверить активна ли транзакция:
+```java
+TransactionSynchronizationManager.isActualTransactionActive()
+```
 
-### 6.1 Resources
-
-Ключевое: **Connection / EntityManager привязаны к потоку через resources**.
-
+Resources хранят per-transaction ресурсы. Ключевое — Connection и EntityManager привязаны к потоку через resources:
 ```
 Thread-local resources map:
   DataSource → ConnectionHolder(Connection)
   EntityManagerFactory → EntityManagerHolder(EntityManager)
 ```
 
-При `getConnection()` в JDBC template — Spring смотрит thread-local, если есть tx → возвращает связанный Connection. Иначе новый.
+При getConnection() в JdbcTemplate Spring смотрит thread-local — если есть транзакция возвращает связанный Connection. Иначе создаёт новый. Все DAO и repository и native SQL внутри одного transactional метода получают тот же Connection автоматически.
 
-Отсюда: все DAO / repository / native SQL внутри одной tx-метода получают **тот же Connection**.
+Suspension для REQUIRES_NEW работает через store и restore resources. При начале REQUIRES_NEW Spring снимает текущие resources из thread-local (складывает в SuspendedResources). Создаёт новую transaction с новым Connection. По завершении новой transaction — восстанавливает старые resources в thread-local.
 
-### 6.2 Suspension для REQUIRES_NEW
+Это требует два connection одновременно — один для suspended outer transaction, второй для inner REQUIRES_NEW. При массовом использовании легко исчерпать pool.
 
-При REQUIRES_NEW:
-1. Spring снимает текущие resources из thread-local (складывает в `SuspendedResources`).
-2. Создаёт новую tx с новым Connection.
-3. По завершении новой tx → восстанавливает старые resources.
+## Жизненный цикл транзакции
 
-Это требует **два connection одновременно** — легко исчерпать пул.
+Разберём что происходит от вызова до commit подробно.
 
----
-
-## 7. Жизненный цикл транзакции (детально)
-
-Разберём что происходит от вызова до commit.
-
-### 7.1 Entering @Transactional method
-
+Entering @Transactional method:
 ```
 Call: proxy.createOrder(order)
     │
@@ -365,16 +255,9 @@ TransactionAspectSupport.invokeWithinTransaction
 Original method execution
 ```
 
-### 7.2 Original method
+Original method — ваш код. Внутри может использовать JdbcTemplate — берёт связанный Connection из thread-local. Использовать EntityManager — берёт связанный EntityManager. Вызвать другой @Transactional метод — участвует в текущей транзакции (REQUIRED default). Бросить exception — обрабатывается в exiting phase.
 
-Ваш код. Внутри может:
-- Использовать JdbcTemplate — берёт связанный Connection.
-- Использовать EntityManager — берёт связанный EntityManager.
-- Вызвать другой @Transactional метод — участвует в текущей tx (REQUIRED).
-- Bросить exception.
-
-### 7.3 Exiting — success
-
+Exiting при success:
 ```
 Success return
     │
@@ -396,8 +279,7 @@ txManager.commit(status)
          → unbind from TransactionSynchronizationManager
 ```
 
-### 7.4 Exiting — exception
-
+Exiting при exception:
 ```
 Exception thrown
     │
@@ -405,8 +287,8 @@ Exception thrown
 TransactionAspectSupport.completeTransactionAfterThrowing(txInfo, ex)
     │
     ├─ isRollback = txAttr.rollbackOn(ex)
-    │    → RuntimeException / Error → true
-    │    → checked → false (по умолчанию)
+    │    → RuntimeException / Error → true (default)
+    │    → checked exception → false (default!)
     │
     ├─ if isRollback:
     │    txManager.rollback(status)
@@ -422,11 +304,9 @@ TransactionAspectSupport.completeTransactionAfterThrowing(txInfo, ex)
 Rethrow exception
 ```
 
-**Важный кавет rollbackFor**: см. следующий файл.
+Критический caveat — по default checked exceptions приводят к COMMIT транзакции даже если exception пробрасывается наверх. Runtime exceptions приводят к rollback. Настраивается через rollbackFor атрибут. Детали в следующем файле.
 
----
-
-## 8. @Transactional на interface vs class
+## @Transactional на interface vs class
 
 ```java
 public interface OrderService {
@@ -440,22 +320,15 @@ public class OrderServiceImpl implements OrderService {
 }
 ```
 
-**Работает для JDK dynamic proxy**, потому что прокси видит аннотацию на интерфейсе.
+Работает для JDK dynamic proxy потому что прокси видит аннотацию на interface. Не всегда работает для CGLib — если bean не имеет interfaces CGLib смотрит только на класс. Если проксирование через CGLib и аннотация только на interface может не подхватить.
 
-**Не всегда работает для CGLib**: если у бина нет интерфейсов — CGLib смотрит только на класс. Если проксирование через CGLib и аннотация только на interface — может не подхватить.
+Правило универсальное — ставь @Transactional на реализацию (class) не на interface. Работает независимо от типа proxy. Единственное правильное место — на public method concrete class или на класс целиком.
 
-**Правило**: ставь `@Transactional` **на реализацию** (класс), не на интерфейс. Работает всегда.
+## Множественные PlatformTransactionManager
 
----
+Что если у приложения несколько БД или JMS плюс БД? Каждый TransactionManager управляет одним ресурсом.
 
-## 9. Множественные PlatformTransactionManager
-
-Что если у тебя несколько БД или JMS + БД?
-
-Каждый TransactionManager управляет **одним ресурсом**. Для нескольких:
-
-### 9.1 Multiple @Bean
-
+Для нескольких — multiple @Bean с named:
 ```java
 @Bean("primaryTx")
 DataSourceTransactionManager primaryTx(@Qualifier("primaryDs") DataSource ds) {
@@ -468,7 +341,7 @@ DataSourceTransactionManager secondaryTx(@Qualifier("secondaryDs") DataSource ds
 }
 ```
 
-Использование:
+Использование — указать нужный:
 ```java
 @Transactional("primaryTx")
 public void save(...) { ... }
@@ -477,34 +350,17 @@ public void save(...) { ... }
 public void saveElsewhere(...) { ... }
 ```
 
-### 9.2 ChainedTransactionManager (deprecated)
+Каждая транзакция работает с своим resource independently. Атомарность через ресурсы не гарантируется — если primary commit прошёл а secondary упал, primary остаётся committed.
 
-«Best-effort» для нескольких — начинает все параллельно, коммитит по цепочке. **Не 2PC** — атомарность не гарантируется.
+ChainedTransactionManager был попыткой solve этой проблемы. Best-effort объединение нескольких TransactionManagers — начинает все параллельно, коммитит по цепочке. Не 2PC — атомарность не гарантируется в full sense. Deprecated с Spring 3.0. Правильное решение — outbox pattern или JTA/XA.
 
-```java
-@Bean
-ChainedTransactionManager chainedTx(
-        PlatformTransactionManager jpa, PlatformTransactionManager rabbit) {
-    return new ChainedTransactionManager(jpa, rabbit);
-}
-```
+JTA/XA — настоящий 2PC через JTA provider (Atomikos, Narayana). Сложная настройка в Spring Boot. Для микросервисов избегай — используй Saga или Outbox.
 
-Deprecated с 3.0 — правильно **outbox pattern** или **JTA/XA**.
+## Программные транзакции
 
-### 9.3 JTA / XA
+Иногда нужен более гибкий контроль чем даёт @Transactional. Программные API дают dynamic control.
 
-Настоящий 2PC. Требует JTA-провайдера (Atomikos, Narayana) — сложно в Spring Boot.
-
-Для микросервисов — избегай, используй Saga / Outbox (см. `32-transactions-acid-isolation-propagation.md`).
-
----
-
-## 10. Программные транзакции (не через @Transactional)
-
-Иногда нужен более гибкий контроль:
-
-### 10.1 TransactionTemplate
-
+TransactionTemplate это удобная обёртка:
 ```java
 @Autowired PlatformTransactionManager txManager;
 
@@ -521,13 +377,9 @@ tx.execute(status -> {
 });
 ```
 
-Использование:
-- Гранулярный контроль.
-- Динамические propagation/isolation.
-- `setRollbackOnly()` без бросания exception.
+Гранулярный контроль per-invocation. Dynamic propagation и isolation. setRollbackOnly без бросания exception когда нужен just rollback.
 
-### 10.2 Ручной PlatformTransactionManager
-
+Ручной PlatformTransactionManager для полного low-level control:
 ```java
 DefaultTransactionDefinition def = new DefaultTransactionDefinition();
 def.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
@@ -542,19 +394,18 @@ try {
 }
 ```
 
-Мало где нужен. Обычно `TransactionTemplate` достаточно.
+Мало где нужен — TransactionTemplate обычно достаточен и проще.
 
----
+## @Transactional атрибуты полностью
 
-## 11. `@Transactional` метаданные (все поля)
-
+Все возможные атрибуты @Transactional:
 ```java
 @Transactional(
     value = "",                          // qualifier для TransactionManager
-    transactionManager = "",             // явное имя (алиас для value)
+    transactionManager = "",             // явное имя (alias для value)
     propagation = Propagation.REQUIRED,
     isolation = Isolation.DEFAULT,
-    timeout = -1,                        // секунды, -1 = default (обычно ∞)
+    timeout = -1,                        // секунды, -1 = default (обычно бесконечно)
     timeoutString = "",
     readOnly = false,
     rollbackFor = {},                    // Class<? extends Throwable>[]
@@ -565,14 +416,11 @@ try {
 )
 ```
 
-`readOnly`, `rollbackFor` — детально в `34-transactional-advanced.md`.
+Детали readOnly, rollbackFor, timeout — в файле 34-transactional-advanced. Здесь важно знать что все они существуют и могут настраиваться.
 
----
+## Как проверить что @Transactional работает
 
-## 12. Как понять что @Transactional работает
-
-### 12.1 Логирование
-
+Логирование через TRACE level Spring transaction package:
 ```yaml
 logging.level:
   org.springframework.transaction: TRACE
@@ -580,7 +428,7 @@ logging.level:
   org.springframework.orm.jpa: TRACE
 ```
 
-Увидишь:
+При работающих транзакциях увидишь логи:
 ```
 Getting transaction for [com.example.OrderService.createOrder]
 Creating new transaction with name [...]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
@@ -589,52 +437,35 @@ Beginning JPA transaction on [...]
 Committing JPA transaction on ...
 ```
 
-Если такого лога **нет** для твоего метода — Spring не оборачивает его. Причины:
-- Self-invocation.
-- `private` / `final`.
-- Забыл `@EnableTransactionManagement` (в Boot включён по умолчанию).
-- Метод не на прокси (например, вызван через `AopUtils.getTargetClass`).
+Если такого лога нет для твоего метода — Spring не оборачивает его. Причины стандартные. Self-invocation. private или final метод. Забыт @EnableTransactionManagement (в Boot включён по default). Метод вызван не через proxy — например через AopUtils.getTargetClass или reflection.
 
-### 12.2 Проверить прокси
-
+Проверка прокси на runtime:
 ```java
 System.out.println(orderService.getClass());
-// Обычный: class com.example.OrderService
+// Обычный класс: class com.example.OrderService
 // Прокси: class com.example.OrderService$$SpringCGLIB$$0
 ```
 
-Если не прокси — Spring вообще не обернул. Скорее всего нет @Transactional или бина не в контексте.
+CGLIB суффикс в class name — прокси есть. Обычный class без суффикса — Spring не обернул. Скорее всего нет @Transactional или bean не в контексте (создан через new вместо DI).
 
----
+## Итоги
 
-## 13. Собесные вопросы
+@Transactional это AOP-прокси (CGLib default) оборачивающий public метод в begin/commit/rollback logic. Прозрачно для application code но подчиняется ограничениям proxy подхода.
 
-1. **Как работает @Transactional?** — AOP-прокси (CGLib) оборачивает метод в begin/commit/rollback.
-2. **JDK dynamic proxy vs CGLib?** — JDK для интерфейсов; CGLib создаёт subclass (default в Spring Boot).
-3. **Self-invocation — почему @Transactional не работает?** — `this.method()` минует прокси, вызывает оригинал напрямую.
-4. **Как обойти self-invocation?** — Вытащить в другой бин / инжектить self через @Lazy / AopContext.currentProxy().
-5. **@Transactional на private?** — Не работает; CGLib не может override private.
-6. **@Transactional на final метод?** — Не работает.
-7. **@Transactional в @PostConstruct?** — Не работает; @PostConstruct до создания прокси.
-8. **Что такое TransactionInterceptor?** — AOP-совет, оборачивает `@Transactional`-методы.
-9. **Что такое PlatformTransactionManager?** — Абстракция над механизмом tx; JpaTransactionManager / DataSourceTransactionManager / JtaTransactionManager.
-10. **Как транзакция привязывается к потоку?** — Через `TransactionSynchronizationManager` — ThreadLocal с Connection/EntityManager.
-11. **@Transactional на interface или class?** — Ставь на реализацию (класс), работает всегда.
-12. **Как проверить что @Transactional работает?** — Логи `org.springframework.transaction: TRACE` или проверить `getClass()` на CGLib-суффикс.
-13. **TransactionTemplate — когда?** — Программный контроль tx, динамические настройки, `setRollbackOnly` без exception.
-14. **Multiple TransactionManager — как?** — Named @Bean + `@Transactional("txName")`.
-15. **ChainedTransactionManager — что и почему deprecated?** — Best-effort tx для нескольких ресурсов без 2PC; ненадёжно, используй Saga/Outbox.
+TransactionInterceptor это AOP advice. TransactionAspectSupport.invokeWithinTransaction главный метод. PlatformTransactionManager абстракция над transaction mechanism. JpaTransactionManager default в Spring Boot для JPA приложений.
 
----
+Self-invocation классический баг. this.method внутри класса минует proxy и вызывает оригинал напрямую. Аннотация не срабатывает. Fix через extract to another bean обычно правильный подход.
 
-## Итог
+Другие ограничения @Transactional. private, final, static, @PostConstruct — не работают. Правило только public methods concrete classes.
 
-- **@Transactional** = **CGLib-прокси** оборачивает public-метод.
-- **TransactionInterceptor** → **TransactionAspectSupport.invokeWithinTransaction()** → **PlatformTransactionManager**.
-- **JpaTransactionManager** для JPA (default в Spring Boot).
-- **TransactionSynchronizationManager** привязывает tx к потоку через ThreadLocal (Connection / EntityManager).
-- **Self-invocation** = самая частая ошибка; прокси перехватывает только внешние вызовы.
-- **Private / final / static / @PostConstruct** — не работает.
-- **TransactionTemplate** для программного контроля.
+TransactionSynchronizationManager связывает transaction с потоком через ThreadLocal. Connection и EntityManager привязаны к thread. @Async и virtual threads не пробрасывают transaction автоматически.
 
-Следующий — `34-transactional-advanced.md`.
+Жизненный цикл — прокси intercept, TransactionInterceptor invoke, PlatformTransactionManager begin/commit/rollback, cleanup resources. Detailed flow важен для troubleshooting.
+
+Multiple TransactionManagers через named beans plus @Transactional("name"). ChainedTransactionManager deprecated. JTA для настоящего 2PC редко используется.
+
+TransactionTemplate для программного контроля когда декларативный @Transactional недостаточно. TransactionAspectSupport.currentTransactionStatus.setRollbackOnly для forceful rollback без exception.
+
+Логи org.springframework.transaction TRACE plus проверка class name на CGLIB suffix — стандартный debugging arsenal.
+
+Дальше — advanced аспекты @Transactional включая rollback rules, readOnly, TransactionalEventListener, savepoints и тестирование.

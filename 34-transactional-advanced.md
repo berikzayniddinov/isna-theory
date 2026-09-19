@@ -1,17 +1,8 @@
 # 34. @Transactional продвинутое: rollback, listeners, savepoints, testing
 
-Правила rollback, `TransactionSynchronization`, `@TransactionalEventListener`, savepoints, timeouts, тестирование.
+## Rollback rules самое коварное
 
----
-
-## 1. Rollback rules — самое коварное
-
-### 1.1 Правила по умолчанию
-
-Spring откатывает транзакцию **только на unchecked exceptions**:
-- `RuntimeException` и потомки → **rollback**.
-- `Error` → **rollback**.
-- **Checked exceptions** (Exception и не-Runtime потомки) → **commit** (несмотря на exception!).
+Наиболее контр-интуитивное поведение @Transactional связано с rollback правилами. Spring откатывает транзакцию только на unchecked exceptions по default. RuntimeException и потомки приводят к rollback. Error класс также приводит к rollback. Checked exceptions (Exception и не-Runtime потомки) приводят к COMMIT транзакции несмотря на брошенное exception.
 
 Классический баг:
 ```java
@@ -20,135 +11,111 @@ public void save(Order o) throws IOException {
     repo.save(o);
     externalCall();       // бросает IOException
 }
-// IOException — checked → tx COMMITтится! Ордер сохранён.
 ```
 
-Ожидание: rollback. Реальность: commit.
+Ожидаемое поведение — при IOException транзакция откатывается, order не сохраняется. Реальность — IOException это checked exception, транзакция COMMIT-ится, order остаётся в БД. Только потом exception пробрасывается наверх. Полная mess-состояние — операция «упала» но частично сохранилась.
 
-### 1.2 rollbackFor
+Историческая причина такого поведения из Java EE традиции где checked exceptions считались business exceptions (recoverable) а unchecked считались system exceptions (unrecoverable). Business exception подразумевало что произошёл ожидаемый alternative flow — не системная ошибка. Практически это правило редко подходит и создаёт больше проблем чем решает.
 
-Явно указать какие исключения → rollback:
+rollbackFor атрибут явно указывает какие exceptions приводят к rollback:
 ```java
 @Transactional(rollbackFor = Exception.class)
 public void save(Order o) throws IOException {
-    ...
+    // ...
 }
 ```
 
-Теперь любое `Exception` (включая checked) → rollback.
+Теперь любое Exception (включая checked IOException) приводит к rollback. Rollback rules расширены и включают всё что наследуется от Exception.
 
-Или конкретно:
+Возможна конкретика — указать specific exception types:
 ```java
 @Transactional(rollbackFor = {IOException.class, TimeoutException.class})
 ```
 
-### 1.3 noRollbackFor
+Только IOException и TimeoutException приводят к rollback среди checked exceptions. Другие checked exceptions по-прежнему приводят к commit.
 
-Не откатывать на конкретные исключения:
+noRollbackFor исключает specific exceptions из rollback:
 ```java
 @Transactional(noRollbackFor = ExpectedBusinessException.class)
 public void process() { ... }
 ```
 
-Даже если бросит `ExpectedBusinessException` → commit.
+Даже если бросается ExpectedBusinessException (RuntimeException) — transaction commits. Полезно для «ожидаемых» exceptions которые не должны откатывать transaction.
 
-### 1.4 Best practice
+Best practice универсально безопасный approach — @Transactional(rollbackFor = Exception.class) для всех методов. Полностью удаляет surprise-behavior с checked exceptions.
 
-**Правило**: `@Transactional(rollbackFor = Exception.class)` — универсально безопасно.
-
-Или полностью custom `BusinessException` иерархию:
+Альтернатива — полностью custom BusinessException иерархия наследующаяся от RuntimeException:
 ```java
 public class BusinessException extends RuntimeException { ... }
 
-@Transactional  // default правила ок, потому что все свои исключения — Runtime
+@Transactional  // default rules ок, все свои exceptions Runtime
 ```
 
-### 1.5 Ручной setRollbackOnly
+Если все свои exceptions RuntimeException-based, default rollback rules работают правильно. Consistent approach через всё codebase.
 
-Иногда нужно откатить без бросания exception:
-
+Ручной setRollbackOnly когда нужно откатить transaction без бросания exception. Через TransactionAspectSupport:
 ```java
-@Autowired
-TransactionStatus status;    // не работает, статус привязан к текущей tx
-
-// правильно — через TransactionAspectSupport
 TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
 ```
 
-Или (лучше) — TransactionTemplate:
+Или через TransactionTemplate:
 ```java
 tx.execute(status -> {
     if (badCondition) {
         status.setRollbackOnly();
         return null;
     }
-    // work
+    // работа
 });
 ```
 
-### 1.6 Что если пометил rollbackOnly, но не бросил exception
+Полезно когда нужен rollback based на условии не приводящем к exception. Например validation в service returns error result вместо throwing.
 
-Tx помечена. Внешняя транзакция → на выходе всё равно rollback (даже если она REQUIRED).
+UnexpectedRollbackException это специфический caveat. Если внутренний REQUIRED метод пометил rollbackOnly а внешний метод не бросил exception — Spring на commit external transaction увидит что transaction помечена rollbackOnly и бросит UnexpectedRollbackException. Приложение может не ожидать этого exception если написано без учёта такого поведения.
 
-**Кавет UnexpectedRollbackException**: если внутренний REQUIRED-метод пометил rollbackOnly, а внешний не бросил exception → на commit внешней Spring увидит помеченный rollback → бросит `UnexpectedRollbackException`. Приложение может не ожидать этого.
+## readOnly оптимизация
 
----
-
-## 2. readOnly
-
+Атрибут readOnly даёт несколько оптимизаций для read-only операций:
 ```java
 @Transactional(readOnly = true)
 public List<Order> list() { ... }
 ```
 
-Что делает:
-1. **JDBC уровень**: `conn.setReadOnly(true)` → PostgreSQL может оптимизировать read-only tx.
-2. **JPA уровень**: Hibernate ставит `FlushMode.MANUAL` → не будет dirty checking + автоматический flush.
-3. **Явно документирует** намерение.
+Что происходит на разных уровнях. JDBC level — Connection.setReadOnly(true), PostgreSQL может оптимизировать read-only transactions используя менее restrictive locking. JPA level — Hibernate устанавливает FlushMode.MANUAL, не будет dirty checking plus automatic flush. Явно документирует намерение code — читатель видит что метод не изменяет данные.
 
-Плюсы:
-- Меньше памяти (без snapshot для сравнения).
-- Быстрее (без flush).
-- Некоторые БД оптимизируют.
+Плюсы. Меньше memory footprint потому что нет snapshot для dirty checking comparison. Быстрее потому что нет flush operations. Некоторые БД оптимизируют read-only transactions (например могут использовать read replicas или дополнительный parallelism).
 
-**Правило**: на всех read-only методах → `readOnly = true`.
+Правило универсальное — на всех read-only методах ставь readOnly = true. Как code review pattern облегчает понимание кода.
 
-Кавет: если внутри случайно `setter` на managed-сущности → изменение НЕ сохранится (нет flush). Молча теряется.
+Важный caveat — если в readOnly методе случайно выполняется setter на managed entity, изменение НЕ будет сохранено потому что нет flush. Молча теряется. Может быть сложным bug если полагаться на «случайное» изменение. Discipline — read-only методы действительно только читают.
 
----
+## Timeout
 
-## 3. Timeout
-
+Атрибут timeout ограничивает время transaction:
 ```java
 @Transactional(timeout = 30)   // секунды
 public void longOperation() { ... }
 ```
 
-Через N секунд tx автоматически откатывается.
+Через N секунд transaction автоматически откатывается — timeout exception генерируется.
 
-Реализация:
-- JDBC: `conn.setQueryTimeout(30)` — на каждый statement.
-- JPA: `em.createQuery(...).setHint("javax.persistence.query.timeout", 30000)`.
+Реализация зависит от resource. JDBC — Connection.setQueryTimeout(30) устанавливает на каждый statement max execution time. JPA — em.createQuery.setHint("javax.persistence.query.timeout", 30000) для каждого query.
 
-**Кавет**: timeout не всегда работает как ожидаешь. Часть операций (например, ожидание блокировки) может игнорировать. Полагайся на statement_timeout / lock_timeout на уровне PG:
-
+Caveat timeout не всегда работает как ожидается. Часть операций (например ожидание блокировки) может игнорировать statement timeout. Более надёжно установить statement_timeout и lock_timeout на уровне PostgreSQL:
 ```sql
 SET statement_timeout = '30s';
 SET lock_timeout = '5s';
 ```
 
-Или в yml:
+Или через свойства pool:
 ```yaml
 spring.datasource.hikari.data-source-properties:
-  socketTimeout: 30       # мaximum на statement
+  socketTimeout: 30       # максимум на statement
 ```
 
----
+## Savepoints через NESTED propagation
 
-## 4. Savepoints (NESTED propagation)
-
-Когда одна tx хочет «попробовать и откатить кусок»:
-
+NESTED propagation позволяет попытаться операцию с возможным откатом без потери всей transaction:
 ```java
 @Service
 class OrderService {
@@ -173,33 +140,15 @@ class AuditService {
 }
 ```
 
-### 4.1 Как работает
+Механизм работы. При вызове NESTED в существующей transaction Spring создаёт savepoint через SAVEPOINT sp1 SQL команду. Выполняется код метода. Success — savepoint удаляется, изменения остаются в transaction. Exception — ROLLBACK TO SAVEPOINT sp1, внешняя transaction продолжается.
 
-При вызове NESTED в существующей tx:
-1. Spring создаёт savepoint (`SAVEPOINT sp1`).
-2. Выполняется код.
-3. Success → savepoint удаляется, изменения остаются в tx.
-4. Exception → `ROLLBACK TO SAVEPOINT sp1` → внешняя tx продолжается.
+Требования. БД должна поддерживать savepoints — PostgreSQL, Oracle, MySQL InnoDB поддерживают. В Spring — DataSourceTransactionManager.setNestedTransactionAllowed(true) (default true). JpaTransactionManager с Hibernate работает.
 
-### 4.2 Требования
+Различие NESTED и REQUIRES_NEW. NESTED использует один Connection, одну transaction с savepoint внутри. REQUIRES_NEW создаёт новый Connection и полностью независимую transaction. Если внешняя откатывается NESTED тоже откатывается (внутри одной transaction). REQUIRES_NEW независима и коммитится отдельно.
 
-- БД должна поддерживать savepoints (PostgreSQL — да, Oracle — да, MySQL InnoDB — да).
-- В Spring: `DataSourceTransactionManager.setNestedTransactionAllowed(true)` (default true).
-- JpaTransactionManager с Hibernate — работает.
+## TransactionSynchronization хуки
 
-### 4.3 Разница NESTED vs REQUIRES_NEW
-
-- **NESTED** — один Connection, один tx с savepoint.
-- **REQUIRES_NEW** — новый Connection, независимая tx.
-
-Кавет — если внешняя откатывается, NESTED тоже откатывается (внутри одной tx). REQUIRES_NEW — независимая, коммитится отдельно.
-
----
-
-## 5. TransactionSynchronization — хуки
-
-Spring позволяет подписаться на события транзакции.
-
+Spring позволяет подписаться на события transaction lifecycle:
 ```java
 TransactionSynchronizationManager.registerSynchronization(
     new TransactionSynchronization() {
@@ -214,18 +163,11 @@ TransactionSynchronizationManager.registerSynchronization(
     });
 ```
 
-### 5.1 События
+События. beforeCommit — до commit. Можно бросить exception чтобы откатить transaction. beforeCompletion — до close (commit или rollback). afterCommit — после успешного commit. Ошибки логируются но не влияют на transaction (она уже commited). afterCompletion(status) — после close. Status равен STATUS_COMMITTED, STATUS_ROLLED_BACK, STATUS_UNKNOWN.
 
-- **beforeCommit** — до commit. Можно бросить exception → tx откатится.
-- **beforeCompletion** — до close (commit или rollback).
-- **afterCommit** — после успешного commit. **Ошибки логируются, но не влияют на tx**.
-- **afterCompletion(status)** — после close. status = STATUS_COMMITTED / STATUS_ROLLED_BACK / STATUS_UNKNOWN.
+Use cases. afterCommit для публикации event в Kafka или Rabbit только если transaction успешно закоммитилась. Реализует логику outbox — не публикуем event пока не commit. afterCompletion для cleanup ресурсов, metrics.
 
-### 5.2 Use cases
-
-- **afterCommit** — публикация события в Kafka/Rabbit **только если tx успешно закоммитилась**. Логика outbox.
-- **afterCompletion** — очистка ресурсов, метрики.
-
+Пример:
 ```java
 @Transactional
 public void save(Order o) {
@@ -234,16 +176,15 @@ public void save(Order o) {
         new TransactionSynchronizationAdapter() {
             @Override
             public void afterCommit() {
-                publisher.publish(o);   // публикуем только после commit
+                publisher.publish(o);
             }
         });
 }
 ```
 
-### 5.3 @TransactionalEventListener — правильный способ
+## @TransactionalEventListener правильный способ
 
-Более удобно через события Spring:
-
+Более удобный подход через Spring events:
 ```java
 @Service
 class OrderService {
@@ -265,53 +206,40 @@ class OrderEventListener {
 }
 ```
 
-Фазы:
-- `BEFORE_COMMIT` — до commit.
-- `AFTER_COMMIT` — после success.
-- `AFTER_ROLLBACK` — после rollback.
-- `AFTER_COMPLETION` — после (commit или rollback).
+Публикатор просто вызывает publishEvent — сохраняется событие связанное с transaction. Listener с @TransactionalEventListener выполняется в указанной phase.
 
-Обычный `@EventListener` (без Transactional) — срабатывает **синхронно** при publishEvent, до commit.
+Фазы. BEFORE_COMMIT до commit — можно cancel transaction через exception. AFTER_COMMIT после success. AFTER_ROLLBACK после rollback. AFTER_COMPLETION после (commit или rollback).
 
-### 5.4 Кавет: событие потеряется если нет tx
+Обычный @EventListener (без Transactional) срабатывает синхронно при publishEvent, до commit. Проблема если событие приводит к side effects (например отправка email) до commit — при откате side effect уже произошёл. TransactionalEventListener решает этой проблему.
 
-`@TransactionalEventListener` **работает только в активной tx**. Если событие опубликовано вне @Transactional — listener НЕ вызовется.
-
-Можно разрешить fallback:
+Caveat — событие теряется если нет активной transaction. @TransactionalEventListener работает только в активной transaction. Если событие опубликовано вне @Transactional listener не вызовется. Можно разрешить fallback:
 ```java
 @TransactionalEventListener(fallbackExecution = true)
 ```
 
-Тогда без tx выполняется как обычный @EventListener.
+Тогда без transaction выполняется как обычный @EventListener.
 
----
+## Async обработка вне transaction
 
-## 6. Async — обрабатывать вне tx
-
-Опубликовать событие, дальше обработать асинхронно:
-
+Комбинация @Async и @TransactionalEventListener позволяет обрабатывать события в отдельном thread:
 ```java
 @Component
 class OrderEventListener {
-    @Async                       // + @EnableAsync
+    @Async                       // + @EnableAsync в конфигурации
     @TransactionalEventListener(phase = AFTER_COMMIT)
     public void handle(OrderCreatedEvent event) {
-        // выполнится в отдельном потоке, вне tx
+        // выполнится в отдельном thread, вне transaction
     }
 }
 ```
 
-Порядок:
-1. Original method → save + publishEvent → commit.
-2. Spring вызывает listener на другом потоке.
-3. Даже если listener упадёт → не откатит уже commit'нутую tx.
+Порядок. Original method делает save plus publishEvent, потом commit. Spring вызывает listener в другом thread. Даже если listener упадёт не откатит уже commit-нутую transaction.
 
----
+Полезно для heavy post-processing которое не должно блокировать main transaction path. Отправка email, обновление кэшей, генерация reports — все хорошие candidates.
 
-## 7. Программные транзакции — TransactionTemplate
+## Программные транзакции TransactionTemplate
 
-Уже упоминал в предыдущем файле. Детально:
-
+Уже упоминался кратко в предыдущем файле. Detailed usage:
 ```java
 @Service
 class ProcessorService {
@@ -345,31 +273,19 @@ class ProcessorService {
 }
 ```
 
-Плюсы vs `@Transactional`:
-- Динамический контроль.
-- `setRollbackOnly` без бросания exception.
-- Гибкая настройка per-invocation.
-- Легче unit-тестить (можно замокать).
+Плюсы vs @Transactional. Динамический контроль — можно менять propagation, isolation, timeout на runtime. setRollbackOnly без бросания exception. Гибкая настройка per-invocation. Легче unit-тестить потому что transaction manager можно замокать.
 
-Минусы:
-- Многословнее.
-- Нельзя декларативно (аннотации виднее).
+Минусы. Многословнее чем аннотация. Нельзя декларативно — сложнее понять глядя на класс что метод transactional.
 
----
+Практически TransactionTemplate используется для сценариев где @Transactional недостаточен. Bulk processing где каждый item в своей transaction и failure одного не блокирует другие. Dynamic configuration transaction based на runtime conditions.
 
-## 8. Тестирование транзакций
+## Тестирование transactions
 
-### 8.1 @Transactional в тестах = автоматический rollback
-
-Spring Test автоматически:
-1. Начинает tx перед каждым @Test.
-2. Откатывает после.
-
+@Transactional в тестах даёт автоматический rollback. Spring Test автоматически начинает transaction перед каждым @Test и откатывает после:
 ```java
 @SpringBootTest
 @Transactional
 class OrderServiceIntegrationTest {
-
     @Autowired OrderService svc;
     @Autowired OrderRepository repo;
 
@@ -377,38 +293,36 @@ class OrderServiceIntegrationTest {
     void createOrder_persistsToDb() {
         svc.createOrder(new Order(...));
         assertThat(repo.findAll()).hasSize(1);
-        // после теста → rollback → БД чистая
+        // после теста rollback → БД чистая
     }
 }
 ```
 
-Плюсы: не нужен @BeforeEach cleanup.
+Плюсы — не нужен @BeforeEach cleanup, tests isolated automatically.
 
-**Кавет 1 — REQUIRES_NEW в тесте**: если код внутри создаёт новую tx (REQUIRES_NEW) — она НЕ откатится с тестовой tx. Тестовая откатит только свою.
+Caveat 1 REQUIRES_NEW в тесте. Если код внутри создаёт new transaction (REQUIRES_NEW) она НЕ откатится с тестовой transaction. Тестовая откатит только свою. REQUIRES_NEW transaction commits independently, test cleanup ей не поможет.
 
-**Кавет 2 — тест видит state внутри tx**: `assertThat(repo.findAll())` работает потому что тестовая tx та же что и `svc.createOrder`. Если тест делает `@Async`/новый поток — тестовая tx не пробросится → изменения не увидит.
+Caveat 2 тест видит state внутри transaction. assertThat(repo.findAll()) работает потому что тестовая transaction та же что и svc.createOrder — они share PersistenceContext. Если тест делает @Async или создаёт новый thread — тестовая transaction не пробросится, изменения не увидит.
 
-### 8.2 @Commit — не откатывать
-
+@Commit явно указывает не откатывать transaction после теста:
 ```java
 @Test
 @Commit
 void keepDataForDebug() { ... }
 ```
 
-БД сохранит изменения после теста. Для debug.
+БД сохранит изменения после теста. Для debugging когда хочется inspect state после test.
 
-### 8.3 @Sql для setup
-
+@Sql для setup данных перед тестом:
 ```java
 @Test
 @Sql("/setup-orders.sql")
 void test() { ... }
 ```
 
-### 8.4 Тестировать без Spring контекста (unit)
+Полезно для загрузки test fixtures из SQL файлов.
 
-Мокать репозиторий:
+Unit tests без Spring context быстрее. Мокать репозиторий:
 ```java
 class OrderServiceTest {
     OrderRepository repo = mock(OrderRepository.class);
@@ -422,124 +336,63 @@ class OrderServiceTest {
 }
 ```
 
-Быстро (нет Spring), но нет проверки самой tx.
+Быстро (нет Spring boot) но нет проверки самой transaction. Комбинация unit tests для business logic plus integration tests для transaction behavior стандартная стратегия.
 
----
+## Distributed transactions
 
-## 9. Distributed транзакции (краткое напоминание)
+Из файла 32 напоминание — не используй XA в микросервисах. Правильно outbox pattern для atomic БД plus Kafka/Rabbit. Saga для multi-service transactions с compensation.
 
-Из `32-transactions-acid-isolation-propagation.md`: **не используй XA в микросервисах**. Правильно:
+Spring поддержки Saga из коробки нет — есть внешние библиотеки Camunda, Axon Framework для orchestration-based Saga. Choreography-based Saga через event-driven architecture можно реализовать вручную с RabbitMQ или Kafka.
 
-- **Outbox pattern** для atomic БД + Kafka/Rabbit.
-- **Saga** для multi-service tx.
+## JTA обзор
 
-Spring поддержки Saga из коробки нет — есть внешние библиотеки (Camunda, Axon Framework).
+Java Transaction API стандарт для distributed transactions через 2PC. UserTransaction для manual управления. TransactionManager для container-level. XAResource interface для resource providers.
 
----
+В Spring Boot — JtaTransactionManager plus XA provider (Atomikos, Bitronix, Narayana). Configuration сложна. Redko используется в микросервисах потому что 2PC has performance и complexity issues.
 
-## 10. JTA (Java Transaction API) — краткий обзор
+В legacy monolith на JEE application server (WebLogic, WebSphere) XA был стандартом. Modern microservices moved away от XA. Осталось только для legacy migrations и specific enterprise environments.
 
-Стандарт для distributed tx через 2PC.
+## Специфика для JPA
 
-- `UserTransaction` — управление вручную.
-- `TransactionManager` — уровень контейнера.
-- `XAResource` — интерфейс участника.
+Flush time важен для понимания where errors происходят. @Transactional method flow. Изменения managed objects накапливаются в PersistenceContext. При commit em.flush() генерирует SQL. conn.commit() фиксирует. Ошибка на flush (constraint violation, staleObject) throws exception на границе transaction method не в момент setter вызова.
 
-В Spring Boot: `JtaTransactionManager` + XA-provider (Atomikos, Bitronix, Narayana).
+Caveat в debugging. setter вроде работает без ошибки, но на выходе метода ConstraintViolationException. Причина — flush происходит в конце method. Явный em.flush() внутри может помочь ловить ошибку earlier.
 
-**В микросервисах не используется**. В legacy monolith на JEE app-server — было.
+Optimistic lock exception через @Version. При UPDATE Hibernate проверяет version column. Если не совпадает бросает OptimisticLockException. В @Transactional-методе — rollback plus throw. Приложение должно обработать — retry или show conflict пользователю.
 
----
+Multi-tenancy иногда одна transaction работает с несколькими БД (например каждый tenant своя БД). JPA стандарт — schema-based или database-based multi-tenancy через MultiTenantConnectionProvider. Spring поддерживает.
 
-## 11. Специфичные вещи для JPA
+## Диагностика проблем
 
-### 11.1 Flush time
+«Изменения не сохраняются» — стандартный чеклист. Метод public? Класс Spring bean не new? @Transactional присутствует? Не self-invocation? Не бросается checked exception без rollbackFor? Не readOnly = true случайно? Не @Async (session в другом thread)?
 
-`@Transactional` метод:
-1. Изменения managed-объектов накапливаются.
-2. При commit — `em.flush()` → SQL.
-3. `conn.commit()`.
+«UnexpectedRollbackException» — внутренний REQUIRED пометил rollback-only. Внешний не знает и пытается continue — на commit ошибка. Fix через REQUIRES_NEW для «независимых» операций или явно проверять и бросать exception.
 
-Ошибка на flush (constraint violation, staleObject) — throw exception на границе tx-метода, не в момент set-а.
+«Connection pool exhausted» — причины. REQUIRES_NEW внутри REQUIRED держит 2 connections одновременно. Внешние API внутри transaction connection занят долго. Утечка connection (не возвращён в pool). leak-detection-threshold в HikariCP помогает локализовать.
 
-**Кавет debug**: `setter` вроде работает, но на выходе метода — `ConstraintViolationException`. Причина — flush.
+«Deadlock» — две transactions ждут блокировки друг друга. Fix через consistent ordering locks (всегда by id ascending), уменьшение длины transactions, использование optimistic locking вместо pessimistic где возможно.
 
-### 11.2 Optimistic lock exception
+## Полная best-practice конфигурация
 
-`@Version` — при UPDATE Hibernate проверяет version. Не совпадает → `OptimisticLockException`.
-
-В @Transactional-методе → rollback + throw. Приложение должно handle (retry / show conflict user).
-
-### 11.3 Multi-tenancy
-
-Иногда одна tx работает с несколькими БД (например, каждый tenant — своя БД). Стандарт JPA — schema-based или database-based multi-tenancy через `MultiTenantConnectionProvider`. Spring поддерживает.
-
----
-
-## 12. Диагностика проблем
-
-### 12.1 «Изменения не сохраняются»
-
-Проверить:
-- Метод public?
-- Класс — Spring bean (не new)?
-- `@Transactional` есть?
-- Не self-invocation?
-- Не бросается checked exception без `rollbackFor`?
-- Не `readOnly = true` случайно?
-- Не `@Async` (session в другом потоке)?
-
-### 12.2 «UnexpectedRollbackException»
-
-Внутренний REQUIRED пометил rollback-only. Внешний не знает, продолжает — на commit ошибка.
-
-Fix:
-- Использовать REQUIRES_NEW для «независимых» операций.
-- Или явно проверять / бросать exception.
-
-### 12.3 «Connection pool exhausted»
-
-Причины:
-- REQUIRES_NEW внутри REQUIRED — держит 2 connection.
-- Внешние API внутри tx — connection занят долго.
-- Утечка connection (не вернулся в пул).
-
-`leak-detection-threshold` в HikariCP.
-
-### 12.4 «Deadlock»
-
-Две tx ждут блокировки друг друга.
-
-Fix:
-- Всегда брать locks в одном порядке.
-- Уменьшить длину tx.
-- Использовать optimistic lock вместо pessimistic.
-
----
-
-## 13. Полная best-practice тx-настройка
-
+Собранная воедино правильная transaction setup:
 ```java
 @Configuration
 @EnableTransactionManagement
 public class TxConfig {
-    // Spring Boot всё автоконфигурит для JPA;
+    // Spring Boot автоконфигурит всё для JPA
     // это только если нужен custom
 }
 
 @Service
 class OrderService {
-
     @Autowired OrderRepository repo;
     @Autowired ApplicationEventPublisher events;
 
-    // read
     @Transactional(readOnly = true, timeout = 5)
     public Order findById(Long id) {
         return repo.findById(id).orElseThrow();
     }
 
-    // write
     @Transactional(rollbackFor = Exception.class, timeout = 30)
     public Order create(OrderRequest req) {
         Order o = new Order(req);
@@ -551,7 +404,6 @@ class OrderService {
 
 @Component
 class OrderEventListener {
-
     @Async
     @TransactionalEventListener(phase = AFTER_COMMIT)
     public void publish(OrderCreatedEvent event) {
@@ -560,37 +412,26 @@ class OrderEventListener {
 }
 ```
 
----
+Ключевые элементы. @Transactional(readOnly = true, timeout = N) на read methods. @Transactional(rollbackFor = Exception.class, timeout = N) на write methods. Events через publishEvent plus @TransactionalEventListener(AFTER_COMMIT) для async post-processing. @Async на listener чтобы не блокировать main transaction.
 
-## 14. Собесные вопросы
+## Итоги
 
-1. **Что откатывается по умолчанию?** — Только RuntimeException + Error; checked exceptions → commit.
-2. **Как откатывать на checked exception?** — `@Transactional(rollbackFor = Exception.class)`.
-3. **`readOnly = true` — что даёт?** — JDBC read-only, Hibernate MANUAL flush, БД оптимизации.
-4. **Как откатить без exception?** — `TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()` или TransactionTemplate + status.setRollbackOnly.
-5. **Что такое UnexpectedRollbackException?** — Внутренняя tx пометила rollback-only, внешняя пыталась commit → exception.
-6. **NESTED vs REQUIRES_NEW?** — NESTED = savepoint в одной tx; REQUIRES_NEW = отдельная tx (новый connection).
-7. **Как выполнить логику после commit?** — `@TransactionalEventListener(phase = AFTER_COMMIT)` или TransactionSynchronization.afterCommit.
-8. **@EventListener vs @TransactionalEventListener?** — Первый sync до commit; второй с фазой (обычно AFTER_COMMIT).
-9. **TransactionTemplate — когда?** — Программный контроль, динамические настройки, `setRollbackOnly` без exception.
-10. **@Transactional в тестах?** — Spring Test автоматически откатывает после теста.
-11. **@Async @TransactionalEventListener — как работают вместе?** — Listener выполняется в другом потоке, вне исходной tx.
-12. **Что такое JTA?** — Стандарт distributed tx через 2PC; в микросервисах избегай.
-13. **Timeout в @Transactional — что делает?** — Ограничивает время tx; JDBC statement timeout под капотом.
-14. **Проблемы с REQUIRES_NEW?** — Требует два connection одновременно → истощение пула + возможные deadlock.
-15. **Как правильно отправить событие в Kafka после save?** — TransactionalEventListener(AFTER_COMMIT) + outbox pattern.
+По default только RuntimeException и Error приводят к rollback. Checked exceptions приводят к COMMIT несмотря на exception. Используй rollbackFor = Exception.class универсально безопасно или всё через RuntimeException-based иерархию.
 
----
+readOnly = true даёт JDBC read-only mode, Hibernate MANUAL flush, database оптимизации. Обязательно на всех read-only methods. Caveat — случайные setter в readOnly method silently не сохраняются.
 
-## Итог
+Timeout ограничивает transaction execution time. JDBC statement timeout под капотом. Более надёжно через statement_timeout в PostgreSQL напрямую.
 
-- **rollbackFor = Exception.class** — универсально безопасно (иначе checked не откатываются).
-- **readOnly = true** на всех read-методах.
-- **@TransactionalEventListener(AFTER_COMMIT)** для sending events / notifications.
-- **NESTED** для «попытки с откатом» без потери tx.
-- **REQUIRES_NEW** осторожно — 2 connections одновременно.
-- **TransactionTemplate** — гибкий программный контроль.
-- **@Transactional в тестах** — auto rollback.
-- **Async listeners** для не-критичной пост-обработки.
+Savepoints через NESTED propagation для «попыток с откатом» без потери всей transaction. Один Connection в отличие от REQUIRES_NEW который требует два.
 
-Следующий — `35-transactional-jpa-persistence-context.md`.
+TransactionSynchronization и @TransactionalEventListener для callbacks на transaction events. AFTER_COMMIT типичный для publishing events after successful transaction.
+
+@Async на @TransactionalEventListener для async обработки events в другом thread. Не блокирует main transaction path.
+
+TransactionTemplate для программного transaction control когда declarative @Transactional недостаточен. Dynamic configuration per-invocation.
+
+@Transactional в тестах даёт automatic rollback. Caveat REQUIRES_NEW не откатывается с test transaction. @Commit для explicit commit в тестах. @Sql для test fixtures.
+
+XA/JTA избегать в микросервисах — Saga и Outbox pattern предпочтительнее.
+
+Дальше — @Transactional plus JPA специфика с PersistenceContext, flush, LazyInit и OSIV.

@@ -1,154 +1,68 @@
 # 31. Load Balancer: виды, как работает, за что отвечает
 
-Что такое LB, зачем, разница L4/L7, server-side vs client-side, алгоритмы.
+## Что такое Load Balancer
 
----
+Load Balancer (LB) это компонент распределяющий входящий трафик между несколькими серверами или инстансами приложения. Ключевая инфраструктурная составляющая любой highload системы обеспечивающая scalability и high availability.
 
-## 1. Что такое Load Balancer
+Задачи которые решает Load Balancer охватывают несколько связанных проблем. Распределение нагрузки — предотвращение перегрузки одного сервера когда доступны другие. High availability — если один сервер упал трафик автоматически идёт на живые. Масштабирование — можно добавить или удалить инстансы приложения без прерывания сервиса. Health checking — LB следит какие серверы отвечают правильно. SSL termination — расшифровка HTTPS один раз на LB, дальше внутри кластера plain HTTP что упрощает и ускоряет обработку. Rate limiting и security функции вроде WAF (Web Application Firewall) и DDoS защиты часто интегрированы в LB.
 
-**Load Balancer (LB)** — компонент, который распределяет входящий трафик между несколькими серверами (инстансами приложения).
+Хорошая аналогия — банк с несколькими кассирами и один администратор направляющий клиентов к свободному кассиру. Администратор не выполняет банковские операции сам, но эффективно распределяет клиентов и знает состояние каждого кассира.
 
-Задачи:
-1. **Распределение нагрузки** — чтобы один сервер не перегружался.
-2. **High availability** — если один сервер упал, трафик идёт на живые.
-3. **Масштабирование** — можно добавить/удалить инстансы без остановки сервиса.
-4. **Health checking** — LB знает какие серверы живы.
-5. **SSL termination** — расшифровать HTTPS один раз на LB, дальше идти plain HTTP внутри кластера.
-6. **Rate limiting**, **security** — WAF, DDoS-защита.
+## Основные концепты
 
-Аналогия: в банке есть N кассиров и один администратор, который направляет клиентов к свободному кассиру.
+Терминология LB важна для понимания документации и обсуждений архитектуры. Frontend это то что видит клиент — VIP (Virtual IP) плюс порт на которых LB принимает соединения. Backend или upstream — реальные серверы за LB обрабатывающие запросы. Pool или target group — набор backend серверов образующих одну группу. Health check — периодическая проверка живости backend через TCP или HTTP probe. Algorithm — правило распределения запросов между backends. Session affinity или sticky session — привязка клиента к конкретному backend для stateful сценариев.
 
----
-
-## 2. Основные концепты
-
-- **Frontend** — то, что видит клиент (VIP + порт).
-- **Backend / upstream** — реальные серверы за LB.
-- **Pool / target group** — набор backend'ов.
-- **Health check** — периодическая проверка живости backend'а.
-- **Algorithm** — правило распределения.
-- **Session affinity / sticky session** — привязка клиента к одному backend.
-
-Схема:
+Общая схема работы:
 ```
                 Client
                   │
                   ▼
             ┌───────────┐
-            │Load       │  ← Frontend: 200.10.20.30:443
+            │Load       │  ← Frontend: 200.10.20.30:443 (VIP)
             │Balancer   │
             └─────┬─────┘
-                  │
+                  │  select backend by algorithm
      ┌────────────┼────────────┐
      ▼            ▼            ▼
   [App 1]      [App 2]      [App 3]  ← Backend pool
    10.0.1.5    10.0.1.6    10.0.1.7
 ```
 
----
+## Разница L4 и L7
 
-## 3. L4 vs L7
+Классификация load balancers по уровню OSI где они работают.
 
-Классификация по уровню OSI.
+L4 (Transport Layer) работает с TCP и UDP пакетами. Ничего не знает про HTTP или HTTPS содержимое. Смотрит только на IP адреса и порты source/destination. Пересылает пакеты не изменяя. Быстрый потому что нет парсинга application data. Может балансировать любой TCP протокол — PostgreSQL, Redis, gRPC, WebSocket.
 
-### 3.1 L4 (Transport Layer)
+Примеры L4 балансировщиков. AWS NLB (Network Load Balancer) для managed решения в AWS. HAProxy в TCP mode когда используется как L4 proxy. LVS (Linux Virtual Server) — kernel-level Linux решение. F5 BIG-IP LTM в L4 конфигурации для enterprise. Kubernetes Service (ClusterIP) — тоже L4 балансировка работающая через iptables или IPVS правила.
 
-Работает с **TCP/UDP пакетами**. Ничего не знает про HTTP/HTTPS содержимое.
+Плюсы L4. Extremely fast — миллионы пакетов в секунду достижимы. Простой internally. Работает для любого TCP-based протокола, не привязан к HTTP. Минусы. Не может делать routing по URL или headers — не понимает HTTP. SSL termination невозможен — не разбирает TLS. Не понимает retry или smart routing на уровне application logic.
 
-Что делает:
-- Смотрит только IP + port (source/destination).
-- Пересылает пакеты не изменяя.
-- Быстрый (нет парсинга).
-- Может балансировать любой TCP-протокол (не только HTTP).
+L7 (Application Layer) работает с HTTP запросами. Понимает URL, headers, cookies, method. Парсит HTTP запрос полностью. Может routing по Host header (различать knp.kgd.gov.kz vs arm.kgd.gov.kz на одном IP), по URL path (/api/knp vs /api/fno), по method, headers, cookies. SSL termination поддерживается — LB имеет certificate и обрабатывает TLS. Может modify headers, rewrite URLs. Compression, caching, application-level features.
 
-Примеры:
-- **AWS NLB (Network Load Balancer)**.
-- **HAProxy в TCP mode**.
-- **LVS (Linux Virtual Server)**.
-- **F5 BIG-IP LTM в L4 mode**.
-- **K8s Service (ClusterIP)** — тоже L4, работает через iptables.
+Примеры L7 балансировщиков. nginx как наиболее популярный open source. Envoy modern proxy основа service mesh (Istio, Linkerd). Traefik с хорошей K8s интеграцией. HAProxy в HTTP mode. AWS ALB (Application Load Balancer) для managed L7. Kubernetes Ingress Controller (nginx-ingress, traefik-based) для declarative K8s HTTP routing. Spring Cloud Gateway как L7 внутри Java приложения.
 
-Плюсы:
-- Быстро (миллионы пакетов в секунду).
-- Простой.
-- Работает для любого TCP (Postgres, Redis, gRPC, WebSocket).
+Плюсы L7. Богатая маршрутизация — множество опций для routing decisions. SSL termination упрощает backend. Rate limiting, WAF, application-specific features. HTTP-специфичные оптимизации — compression, caching, keepalive management. Минусы. Медленнее L4 из-за парсинга. Обычно только HTTP/HTTPS. Больше memory footprint per connection.
 
-Минусы:
-- Не может routing по URL / header.
-- SSL термирировать не может (нужен L7).
-- Не понимает retry / smart-routing.
-
-### 3.2 L7 (Application Layer)
-
-Работает с **HTTP-запросами**. Понимает URL, headers, cookies.
-
-Что делает:
-- Парсит HTTP-запрос.
-- Может routить по:
-  - Host header (`knp.kgd.gov.kz` vs `arm.kgd.gov.kz`).
-  - URL path (`/api/knp` vs `/api/fno`).
-  - Method, headers, cookies.
-- SSL termination.
-- Modify headers, rewrite URLs.
-- Compression, caching.
-
-Примеры:
-- **nginx**.
-- **Envoy**.
-- **Traefik**.
-- **HAProxy в HTTP mode**.
-- **AWS ALB (Application Load Balancer)**.
-- **K8s Ingress Controller** (nginx-ingress, traefik).
-- **Spring Cloud Gateway** (в приложении).
-
-Плюсы:
-- Богатая маршрутизация.
-- SSL termination.
-- Rate limiting, WAF.
-- HTTP-специфичные фичи (compression, cache).
-
-Минусы:
-- Медленнее L4 (парсинг).
-- Только HTTP/HTTPS обычно.
-- Больше memory footprint.
-
-### 3.3 Практика
-
-Обычно **L4 перед L7**:
+Практика типично комбинирует L4 перед L7:
 ```
 Internet → NLB (L4) → ALB / nginx (L7) → App
 ```
 
-L4 распределяет по нескольким L7 инстансам для их HA.
+L4 распределяет по нескольким L7 инстансам обеспечивая их собственную HA. L7 handles application routing. Каждый слой оптимизирован для своей роли.
 
----
+## Server-side против client-side балансировки
 
-## 4. Server-side vs client-side LB
-
-### 4.1 Server-side LB
-
-Классический подход. **LB отдельная сущность**, клиент шлёт ему.
-
+Server-side LB это классический подход. LB отдельная сущность через которую идёт клиент:
 ```
 Client → LB → [server1, server2, server3]
 ```
 
-Плюсы:
-- Клиент простой, не знает про топологию.
-- Централизованное управление.
-- Легко подключать не-Java клиентов.
+Плюсы включают простоту клиента — не знает про топологию, только адрес LB. Централизованное управление — конфигурация в одном месте. Легко подключать не-Java клиенты потому что нет library dependency. Минусы. LB сам становится точкой отказа — требует HA конфигурации. Extra hop — Client to LB to Server это два сетевых прыжка вместо одного. Меньше возможностей для tuning на клиенте.
 
-Минусы:
-- LB — точка отказа (нужен свой HA).
-- Лишний hop (Client → LB → Server = 2 сетевых прыжка).
-- Меньше tunability на клиенте.
+Примеры включают nginx, HAProxy, AWS ALB, Kubernetes Service — все server-side LB.
 
-Примеры: nginx, HAProxy, AWS ALB, K8s Service.
-
-### 4.2 Client-side LB
-
-Клиент **сам** знает про все backend'ы, сам выбирает один.
-
+Client-side LB имеет логику балансировки в самом клиенте:
 ```
 Client с LB-logic
         │
@@ -161,212 +75,130 @@ Client с LB-logic
     server2
 ```
 
-Плюсы:
-- Нет лишнего hop.
-- Клиент видит топологию, может retry на другой инстанс.
-- Custom алгоритмы (weighted, sticky).
+Клиент сам знает про все backend инстансы через service registry (Consul, Eureka). Сам выбирает один по алгоритму. Соединяется напрямую с выбранным.
 
-Минусы:
-- Логика LB в каждом клиенте.
-- Библиотека нужна для каждого языка.
-- Больше нагрузка на service registry.
+Плюсы. Нет extra hop — connection напрямую к server. Клиент видит топологию — может делать intelligent retry на другой instance при failure. Custom алгоритмы легко реализуются — weighted, sticky by business key. Минусы. Логика LB встроена в каждый клиент — дублирование. Library needed per язык. Больше нагрузка на service registry.
 
-Примеры:
-- **Ribbon** (Spring Cloud Netflix, deprecated).
-- **Spring Cloud LoadBalancer** — современная замена.
-- **gRPC client-side LB**.
-- **Feign** через SC LB.
+Примеры client-side LB. Ribbon от Netflix (deprecated в пользу Spring Cloud LoadBalancer). Spring Cloud LoadBalancer как современная замена Ribbon. gRPC имеет встроенный client-side LB. Feign через Spring Cloud LoadBalancer.
 
-**В ИСНА**: одновременно и **server-side** (nginx-ingress перед gateway), и **client-side** (Feign через Consul внутри).
+В КНП используются одновременно оба подхода. Server-side через nginx-ingress перед gateway для внешнего трафика. Client-side через Feign плюс Consul для internal service-to-service communication.
 
----
+## Алгоритмы балансировки
 
-## 5. Алгоритмы балансировки
-
-### 5.1 Round Robin (RR)
-
-Простейший: по очереди, по кругу.
-
+Round Robin (RR) самый простой алгоритм — распределение по очереди циклически:
 ```
 request 1 → server A
 request 2 → server B
 request 3 → server C
 request 4 → server A
-request 5 → server B
 ...
 ```
 
-Плюсы: справедливо, просто.
-Минусы: не учитывает нагрузку разных серверов.
+Плюсы простоты и справедливости. Минусы в неучёте реальной нагрузки — если один сервер медленнее, он получает равное количество запросов и деградирует.
 
-### 5.2 Weighted Round Robin
-
-Каждому серверу вес.
+Weighted Round Robin даёт каждому серверу вес отражающий его capacity:
 ```
-A (weight=3), B (weight=1)
-→ A A A B A A A B ...
+A (weight=3), B (weight=1) → A A A B A A A B ...
 ```
 
-Использование: разные мощности серверов; canary release (5% на новую версию).
+Использование для серверов разной мощности, canary release где 5 процентов трафика идёт на новую версию.
 
-### 5.3 Least Connections
+Least Connections направляет на сервер с наименьшим количеством активных connections. Плюсы в учёте реальной занятости. Минусы — LB должен считать connections требуя state.
 
-Идёт на сервер с наименьшим количеством активных connections.
+Least Response Time идёт на сервер с наименьшей средней latency. Учитывает и loading и производительность backend. Умный но требует continuous measurement.
 
-Плюсы: учитывает реальную занятость.
-Минусы: LB должен считать connections (state).
+IP Hash использует hash(client_ip) modulo N чтобы направить того же клиента всегда на тот же сервер. Плюсы — sticky session без cookies, реализуется на уровне L4. Минусы — неравномерное распределение когда один прокси создаёт много connections с одного IP.
 
-### 5.4 Least Response Time
+Consistent Hashing применяет hash(request_key) mapping на server. Ключевое свойство — при добавлении или удалении сервера минимальное перераспределение (только 1/N ключей перемещаются). Использование для cache серверов Memcached, Redis Cluster где перераспределение ведёт к cache miss.
 
-Идёт на сервер с наименьшей средней latency.
+Random просто случайный выбор. Работает удивительно хорошо в практике из-за принципа Power of Two Choices — простое выбирание случайного backend даёт приемлемое распределение.
 
-Учитывает latency + connections. Умный.
+Power of Two Choices как продвинутый алгоритм — выбираются два случайных backends, из них выбирается менее загруженный. Аппроксимация Least Connections без хранения state в LB. Хороший баланс simplicity и performance.
 
-### 5.5 IP Hash
+## Sticky sessions
 
-`hash(client_ip) % N` → тот же клиент → всегда на тот же сервер.
+Session affinity или sticky session привязывает клиента к одному backend. Тот же клиент всегда попадает на тот же server.
 
-Плюсы: sticky session без cookies.
-Минусы: неравномерно (один прокси = один hash = один сервер).
+Зачем нужны. Если backend хранит session в local memory (не в Redis или shared storage) — sessions работают только на одном instance. Пользователь после login должен продолжать попадать на тот instance где сессия создана.
 
-### 5.6 Consistent Hashing
+Реализации. IP hash — по IP адресу клиента, самый простой но неравномерный. Cookie-based — LB устанавливает cookie например LB_SERVER=A, читает при next requests для routing. Более гибкий, работает через proxy.
 
-`hash(request_key) → server`. При добавлении/удалении сервера — минимальное перераспределение.
+Правила использования. Stateless приложения (JWT-based auth, session в Redis) — sticky sessions НЕ нужны. Sticky плохо для масштабирования — нельзя equally распределить. Смерть sticky server — все связанные клиенты теряют session. Правильный approach — сделать приложение stateless. Sticky sessions это костыль скрывающий architectural проблему.
 
-Использование: кэш-серверы (Memcached, Redis Cluster).
+## Health checks
 
-### 5.7 Random
+LB периодически проверяет каждый backend несколькими способами.
 
-Просто случайный. Работает удивительно хорошо (Power of Two Choices).
+TCP check это простейший — просто открытие TCP соединения на порт. Успешный handshake равно OK. Быстро но грубо — порт может быть открыт даже если приложение сломано.
 
-### 5.8 Power of Two Choices
+HTTP check это стандартный для web приложений. GET /health возвращает 200-399 равно OK. Обычно проверяется /actuator/health/readiness в Spring Boot приложениях. Более точный чем TCP check потому что проверяет что application layer отвечает.
 
-Выбираешь два случайных, идёшь на менее загруженный. Аппроксимация Least Connections без state.
+Custom check через script или custom logic для specific требований. Может проверять database connectivity, downstream services, любые critical dependencies.
 
----
+Параметры health check. Interval — как часто проверять, обычно 5-30 секунд. Timeout — сколько ждать ответа. Healthy threshold — сколько успешных подряд check чтобы считать backend здоровым (обычно 2-3). Unhealthy threshold — сколько неудачных чтобы вывести из pool (обычно 2-3). Пороги предотвращают flapping — быструю смену status на transient failures.
 
-## 6. Sticky sessions
+При unhealthy backend LB перестаёт направлять на него трафик. Не убивает backend процесс — это ответственность оркестратора (Kubernetes через liveness probe). LB просто skip failing backend.
 
-**Sticky session (session affinity)** — тот же клиент → всегда тот же backend.
+## SSL termination
 
-Зачем: если backend хранит session в памяти (не в Redis).
-
-Реализация:
-- **IP hash** — по IP клиента.
-- **Cookie-based** — LB устанавливает cookie `LB_SERVER=A`, читает при следующих запросах.
-
-**Правила**:
-- **Stateless** приложения (JWT, session в Redis) — sticky **НЕ нужен**.
-- Плохо для скэйла — нельзя equally распределить.
-- Смерть sticky-серверa → все клиенты теряют session.
-
-**Правильно**: делать stateless приложение. Sticky — костыль.
-
----
-
-## 7. Health checks в LB
-
-LB периодически проверяет каждый backend:
-
-### 7.1 TCP check
-
-Просто открыть TCP-соединение на порт. TCP handshake = OK.
-
-Быстро, но грубо (порт открыт, а приложение сломано).
-
-### 7.2 HTTP check
-
-`GET /health` → 200-399 = OK.
-
-Обычно на `/actuator/health/readiness` в Spring Boot. Подробно в файле `10-kubernetes-detailed.md`.
-
-### 7.3 Custom check
-
-Скрипт / кастомная логика.
-
-### 7.4 Параметры
-
-- **Interval** — как часто проверять (5-30 сек).
-- **Timeout** — сколько ждать ответа.
-- **Healthy threshold** — сколько успешных подряд чтобы считать здоровым.
-- **Unhealthy threshold** — сколько неуспешных чтобы вывести.
-
-При unhealthy → LB перестаёт слать трафик (не убивает backend, это уже дело K8s).
-
----
-
-## 8. SSL termination
-
+Классическая архитектура:
 ```
 Client ──HTTPS──► LB ──HTTP──► Backend
 ```
 
-LB расшифровывает HTTPS. Внутри кластера — plain HTTP (быстрее, легче отладка).
+LB расшифровывает HTTPS одним обработчиком. Внутри кластера трафик plain HTTP что быстрее и легче для debugging и tracing. Настройка требует TLS certificate на LB, backend без SSL слушает 8080 или другой HTTP port, коммуникация LB-backend через приватную сеть (не через public internet).
 
-Настройка:
-- LB имеет TLS-сертификат.
-- Backend без SSL, слушает 8080.
-- Пропускает через приватную сеть (не через интернет).
+Плюсы простота management сертификатов — только на LB, не на каждом backend. Better performance backends потому что нет SSL overhead. Легче observability и debugging plain HTTP.
 
-Если требуется end-to-end TLS (compliance) — **SSL passthrough** или **re-encryption**.
+Если требуется end-to-end TLS для compliance или security requirements — используются SSL passthrough (LB не расшифровывает, просто forwards TLS) или re-encryption (LB расшифровывает и заново шифрует к backend).
 
----
+## Как это в КНП
 
-## 9. Как это в ИСНА
-
-Полная картина запроса `https://knp.kgd.gov.kz/api/fno/submit`:
+Полная картина запроса https://knp.kgd.gov.kz/api/fno/submit проходит через несколько уровней:
 
 ```
 Пользователь
     │  HTTPS 443
     ▼
 [External LB / firewall]           ← L4 / L7
-    │
+    │  DDoS protection, WAF
     ▼
 [nginx-ingress]                     ← L7, terminates SSL, routing по host
     │  routes: knp.kgd.gov.kz → svc/isnaknpgateway
     ▼
-[K8s Service: isnaknpgateway]      ← L4 (iptables), ClusterIP
+[K8s Service: isnaknpgateway]      ← L4 (iptables/IPVS), ClusterIP
     │  round-robin по подам gateway
     ▼
 [isna-knp-gateway pod]              ← Java 11, Zuul
     │  routes: /services/X → Consul lookup + client-side LB
-    │  (или через K8s Service внутри)
     ▼
-[Consul discovery]                  ← client-side LB (Ribbon / SC LoadBalancer)
-    │  дал inst: 10.0.1.5:8080
+[Consul discovery]                  ← client-side LB (Spring Cloud LoadBalancer)
+    │  дал instance: 10.0.1.5:8080
     ▼
 [isna-knp-integration pod]
     │
-    ├─ через Feign → Consul lookup → isnaknpuser pod
-    ├─ через Feign → Consul lookup → isnaknpfno pod
+    ├─ через Feign → Consul → isnaknpuser pod
+    ├─ через Feign → Consul → isnaknpfno pod
     └─ БД / RabbitMQ
 ```
 
-Реальный ИСНА-кейс `knp-fo-consul-lb-mr1223-latent-mine`: при миграции Ribbon → Spring Cloud LoadBalancer сменилась case-sensitivity — `isnaKnpUser` не резолвился → 500.
+Каждый уровень имеет свою роль. External LB защищает от external threats и балансирует global traffic. nginx-ingress terminates SSL и routing по host header. K8s Service простой L4 balancer к подам gateway. Gateway маршрутизирует по service names. Client-side LB через Consul distribution между конкретными подами.
 
----
+Реальный кейс knp-fo-consul-lb-mr1223-latent-mine из КНП memory. При миграции с Ribbon на Spring Cloud LoadBalancer изменилась case-sensitivity resolving service names. isnaKnpUser не резолвился как раньше — Ribbon был case-insensitive, Spring Cloud LoadBalancer строгий. Результат 500 ошибки. Урок — миграция даже совместимых по API компонентов может иметь semantic differences.
 
-## 10. K8s Service как LB
+## Kubernetes Service как LB
 
-K8s Service = **L4 LB** для подов внутри кластера.
+K8s Service это L4 LB для подов внутри cluster. Абстракция над dynamic set подов позволяющая stable network endpoint.
 
-Механика:
-1. Endpoints controller следит за подами с матчащим label.
-2. Kube-proxy на каждой ноде создаёт iptables/IPVS правила: «трафик на 10.96.0.5:8080 → раскинуть по IPs подов».
-3. Балансировка round-robin по iptables.
+Механика работы. Endpoints controller следит за подами имеющими matching labels. При добавлении/удалении пода — endpoint list обновляется. Kube-proxy на каждой ноде читает endpoint updates и создаёт iptables или IPVS правила. Правила говорят «трафик на 10.96.0.5:8080 (Service ClusterIP) — раскинуть round-robin между IP адресами подов». Балансировка происходит на kernel level без user-space proxy overhead.
 
-Типы (см. `10-kubernetes-detailed.md`):
-- **ClusterIP** — внутри кластера.
-- **NodePort** — порт на всех нодах.
-- **LoadBalancer** — просит облачный LB.
+Типы K8s Services. ClusterIP это internal-only Service доступный только внутри cluster через ClusterIP address. Стандартный тип для service-to-service. NodePort exposes Service на port каждой ноде — external доступ через любой node IP. LoadBalancer просит cloud provider настроить external LB (например AWS ELB) указывающий на нужные ноды. ExternalName это alias через DNS CNAME для external services.
 
----
+## Kubernetes Ingress как L7 LB
 
-## 11. K8s Ingress как L7 LB
+Ingress это declarative HTTP routing в K8s. Ресурс определяющий rules маршрутизации, реализуется Ingress Controller (обычно nginx-ingress).
 
-**Ingress** = declarative HTTP-роутинг. Реализуется **Ingress Controller**-ом (обычно nginx).
-
+Пример Ingress ресурса:
 ```yaml
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -388,105 +220,66 @@ spec:
                 port: { number: 8080 }
 ```
 
-Ingress Controller (nginx-ingress) читает Ingress-ресурсы → генерирует nginx.conf → reload nginx.
+Ingress Controller (например nginx-ingress) читает Ingress ресурсы через K8s API. Динамически генерирует nginx configuration reflecting rules. Reloads nginx при changes. Обеспечивает declarative HTTP routing без manual nginx configuration management.
 
----
+Преимущества. Kubernetes-native — управление через k8s API и manifests. Declarative — желаемое состояние описывается, controller обеспечивает. Multiple hosts и paths на одном external IP. TLS termination централизованно. WAF, rate limiting через annotations или CRDs.
 
-## 12. Spring Cloud LoadBalancer
+## Spring Cloud LoadBalancer
 
-Client-side LB **внутри приложения**. Замена Ribbon.
+Client-side LB библиотека внутри Java приложения. Замена deprecated Ribbon.
 
-Работает автоматически с Feign / RestTemplate / WebClient если есть `spring-cloud-starter-loadbalancer`.
-
+Работает автоматически с Feign, RestTemplate, WebClient при наличии зависимости spring-cloud-starter-loadbalancer. Пример использования через RestTemplate:
 ```java
 @Autowired RestTemplate rest;
 
-// Используя service name (не URL!)
+// Используется service name а не URL
 UserDto u = rest.getForObject("http://isnaknpuser/api/users/1", UserDto.class);
 ```
 
-Под капотом:
-1. `LoadBalancerInterceptor` перехватывает.
-2. Резолвит `isnaknpuser` через ServiceInstanceListSupplier (Consul, Eureka, K8s).
-3. Выбирает инстанс по алгоритму.
-4. Заменяет URL на реальный IP.
+Под капотом LoadBalancerInterceptor перехватывает запрос. Резолвит isnaknpuser через ServiceInstanceListSupplier получающий список из Consul, Eureka, или K8s. Выбирает конкретный instance по алгоритму. Заменяет service name на реальный IP:port. Fixing URL и продолжает execution.
 
-Кастомный алгоритм:
+Кастомный алгоритм регистрируется как bean:
 ```java
 @Bean
-ReactorLoadBalancer<ServiceInstance> customLB(Environment env,
+ReactorLoadBalancer<ServiceInstance> customLB(
+        Environment env,
         LoadBalancerClientFactory factory) {
     String name = env.getProperty(LoadBalancerClientFactory.PROPERTY_NAME);
     return new RandomLoadBalancer(
-        factory.getLazyProvider(name, ServiceInstanceListSupplier.class), name);
+        factory.getLazyProvider(name, ServiceInstanceListSupplier.class), 
+        name);
 }
 ```
 
-Доступные алгоритмы: `RoundRobinLoadBalancer` (default), `RandomLoadBalancer`.
+Доступные встроенные алгоритмы — RoundRobinLoadBalancer (default) и RandomLoadBalancer. Custom реализации через ReactorLoadBalancer interface.
 
----
+## Типовые продукты Load Balancer
 
-## 13. Типовые продукты LB
+Обзор основных tools используемых в индустрии.
 
-### 13.1 nginx
+nginx это L7 (HTTP) в основном, может L4 через stream module. Open source версия достаточна для большинства use cases, есть commercial nginx Plus с extra features. Легковесный, быстрый. Хороший для static content serving плюс reverse proxy. Самый популярный в industry.
 
-- L7 (HTTP), может L4 (stream module).
-- Open source + commercial (nginx Plus).
-- Легковесный, быстрый.
-- Хороший для static + reverse proxy.
+HAProxy это L4 плюс L7 балансировщик специализирующийся именно на балансировке (в отличие от nginx который также web server). Богатые метрики через statistics interface. ACLs (Access Control Lists) для sophisticated routing. Используется в местах требующих serious load balancing capability.
 
-### 13.2 HAProxy
+Envoy это modern L7 proxy являющийся основой service mesh платформ Istio и Linkerd. Мощная динамическая конфигурация через xDS API — configuration updates без restart. Observability first — extensive metrics и tracing из коробки. Полезен для больших microservices deployments.
 
-- L4 + L7.
-- Специализация — балансировка.
-- Богатые метрики, ACLs.
+Traefik это L7 балансировщик с хорошей интеграцией с K8s и Docker. Автоматически discovers backends через labels в container orchestrators. Проще в конфигурации чем nginx для K8s environments.
 
-### 13.3 Envoy
+AWS ALB, NLB, GLB это managed решения от AWS. ALB (Application Load Balancer) L7. NLB (Network Load Balancer) L4 с extreme performance. GLB (Global Load Balancer) globally distributed anycast для world-wide applications. Не надо обслуживать infrastructure — cloud provider handles.
 
-- L7 modern proxy.
-- Основа service mesh (Istio, Linkerd).
-- Мощная динамическая конфигурация через xDS API.
-- Observability first (метрики + tracing).
+F5 BIG-IP это enterprise решение hardware plus software. Дорогое но feature-rich — WAF, DDoS protection, SSL offload с hardware acceleration. Используется в enterprise environments где стоимость оправдана требованиями compliance или performance.
 
-### 13.4 Traefik
+## Graceful drain
 
-- L7.
-- Хорошая интеграция с K8s / Docker.
-- Автоматически discovers backends.
+При удалении backend (deploy new version, scale down) важно не потерять in-flight requests.
 
-### 13.5 AWS ALB / NLB / GLB
+Плохой подход. Kill process instantly через SIGKILL. Все in-flight requests теряются с 500 errors. Пользователи получают ошибки. Retry на клиенте может помочь но лучше избежать проблемы вовсе.
 
-- Managed (не надо обслуживать).
-- ALB = L7, NLB = L4, GLB = глобальный anycast.
+Хороший подход через graceful drain. Убрать backend из LB pool — LB перестаёт направлять new requests. Дать time для дообработки in-flight requests (30-60 секунд обычно достаточно). Только после этого убить процесс.
 
-### 13.6 F5 BIG-IP
+Kubernetes делает это автоматически при удалении пода. Pod переходит в Terminating state. Endpoints controller убирает pod IP из Service endpoints — LB перестаёт направлять трафик. SIGTERM отправляется процессу — приложение должно gracefully shutdown. terminationGracePeriodSeconds (default 30) определяет сколько ждать до SIGKILL. Если приложение завершилось раньше — pod удаляется сразу.
 
-- Enterprise, дорогой.
-- Hardware + software.
-- WAF, DDoS protection, SSL offload.
-
----
-
-## 14. Graceful drain
-
-Когда убираешь backend (deploy, scale down):
-
-Плохо:
-1. `kill -9 pod` → все in-flight запросы теряются.
-
-Хорошо:
-1. Убрать backend из pool (LB перестаёт слать новых).
-2. Дать time для дообработки in-flight (30-60 сек).
-3. Убить pod.
-
-K8s делает автоматически:
-- Preлib pod → status=Terminating.
-- Endpoints controller убирает pod из Service (LB перестаёт слать).
-- SIGTERM → приложение graceful shutdown.
-- `terminationGracePeriodSeconds` (default 30) — сколько ждать.
-- SIGKILL если не завершилось.
-
-Spring Boot graceful shutdown:
+Spring Boot имеет built-in graceful shutdown:
 ```yaml
 server:
   shutdown: graceful
@@ -495,79 +288,32 @@ spring:
     timeout-per-shutdown-phase: 30s
 ```
 
----
+При shutdown Spring Boot прекращает принимать новые HTTP requests, дообрабатывает in-flight, потом завершает процесс. Синхронизировано с K8s termination sequence — timeout-per-shutdown-phase должен быть меньше terminationGracePeriodSeconds для правильного порядка.
 
-## 15. Собесные вопросы
+## Итоги
 
-1. **Что такое Load Balancer, зачем?** — Распределение трафика между инстансами, HA, скэйлинг.
-2. **Разница L4 и L7 LB?** — L4 = TCP/UDP (быстро, для любого протокола); L7 = HTTP (routing по URL/header, SSL).
-3. **Server-side vs client-side LB?** — SSLB отдельная сущность; CSLB логика в клиенте (Feign+Consul).
-4. **Алгоритмы балансировки?** — Round-robin, weighted RR, least connections, IP hash, consistent hash, random, power of two choices.
-5. **Что такое sticky session?** — Клиент → всегда тот же backend; нужен для stateful; лучше избежать (сделать stateless).
-6. **Как LB узнаёт что backend жив?** — Health check (TCP / HTTP / custom) с interval + threshold.
-7. **Что такое SSL termination?** — LB расшифровывает HTTPS, дальше внутри кластера HTTP.
-8. **Что такое K8s Service, тип LB?** — L4 LB на iptables/IPVS через kube-proxy.
-9. **Что такое Ingress?** — Declarative HTTP-роутер в K8s, реализуется Ingress Controller.
-10. **Spring Cloud LoadBalancer — что это?** — Client-side LB в приложении (замена Ribbon), интегрируется с Feign/RestTemplate.
-11. **Что такое graceful drain?** — Убрать backend из пула, подождать in-flight, потом убить.
-12. **Consistent hashing — зачем?** — Минимизировать перераспределение при добавлении/удалении сервера; для кэшей.
-13. **Разница nginx и HAProxy?** — nginx больше про reverse proxy + static, HAProxy специализация на балансировке.
-14. **Что такое Envoy?** — L7 proxy, основа service mesh, dynamic конфиг через xDS.
-15. **Как выбрать алгоритм?** — Round-robin если equal servers; least-connections если разные времена обработки; IP hash для sticky (без cookies).
+Load Balancer распределяет трафик обеспечивая high availability и scaling. Health checks определяют работающие backends. SSL termination упрощает backend infrastructure.
 
----
+L4 против L7 разные уровни. L4 быстрый и универсальный для любых TCP protocols. L7 понимает HTTP давая rich routing capabilities но медленнее. Обычно комбинируются — L4 перед L7 для их HA.
 
-## Итог
+Server-side против client-side LB. Server-side (nginx, HAProxy) традиционный подход. Client-side (Spring Cloud LoadBalancer, gRPC) убирает extra hop и даёт больше гибкости. В enterprise часто оба используются одновременно.
 
-- **LB распределяет трафик**: HA + scaling + health checks.
-- **L4** = TCP/UDP (K8s Service, NLB); **L7** = HTTP (nginx, Ingress, ALB).
-- **Server-side** (nginx) + **client-side** (SC LoadBalancer / Feign) часто оба вместе.
-- **Round Robin** — default; **Least Connections** — умнее; **IP Hash** — для sticky без cookies.
-- **Health checks** — must; HTTP лучше TCP.
-- **SSL termination** на LB — стандарт.
-- **Graceful drain** через K8s + Spring Boot shutdown.
-- В ИСНА цепочка: **nginx-ingress → K8s Service → gateway → Consul (client-side LB) → микросервисы**.
+Алгоритмы. Round Robin default простой. Least Connections умнее но требует state. IP Hash для sticky без cookies. Consistent Hashing для cache scenarios. Power of Two Choices как efficient approximation.
 
----
+Sticky sessions необходимы для stateful backends но лучше делать stateless приложения. Sticky это костыль скрывающий architectural проблему.
 
-## Финальный итог всех блоков
+Health checks обязательны. HTTP лучше TCP потому что проверяет application layer. Пороги предотвращают flapping.
 
-Все файлы в `C:\Users\berik\Desktop\work projects\isna-theory\`:
+SSL termination на LB — стандарт для simplicity. E2E TLS для compliance requirements через passthrough или re-encryption.
 
-**Foundation** (01-11):
-- 01 обзорный
-- 02-04 — Java базы (JVM, Gradle, JAR)
-- 05-08 — Spring (IoC, Boot, servers, startup)
-- 09-11 — инфра (Docker, K8s, Consul)
+В КНП цепочка nginx-ingress → K8s Service → gateway → Consul (client-side LB) → микросервисы. Каждый слой имеет свою role.
 
-**JPA/Hibernate** (12-15):
-- 12 JPA основы
-- 13 Hibernate внутри
-- 14 Spring Data JPA
-- 15 Производительность
+K8s Service это L4 через iptables/IPVS. Ingress это declarative L7 через Ingress Controller (nginx-ingress наиболее популярный).
 
-**Java 11→21** (16-19):
-- 16 Синтаксис
-- 17 JVM/GC
-- 18 API/миграция
-- 19 Virtual Threads
+Spring Cloud LoadBalancer заменил Ribbon. Автоматически интегрируется с RestTemplate, WebClient, Feign. Custom алгоритмы возможны.
 
-**RabbitMQ** (20-23):
-- 20 AMQP основы
-- 21 Гарантии доставки
-- 22 Spring AMQP
-- 23 Прод-паттерны
+Типовые products. nginx самый популярный. HAProxy специализированный. Envoy modern для service mesh. Traefik K8s-friendly. Cloud managed (AWS ALB/NLB) для cloud environments. F5 BIG-IP enterprise.
 
-**Security** (24-27):
-- 24 Spring Security
-- 25 OAuth2/OIDC
-- 26 Keycloak
-- 27 SS + Keycloak
+Graceful drain обязателен для zero-downtime deployments. K8s + Spring Boot shutdown работают together.
 
-**PostgreSQL / Highload / LB** (28-31):
-- 28 PG внутри
-- 29 PG + HikariCP
-- 30 Дорогостоящие операции
-- 31 Load Balancer
-
-Всего **31 файл теории**, около 300+ страниц. Для собеседования middle Java — покрывает весь стек ИСНА.
+Дальше — фундаментальная тема transactions ACID isolation propagation как основа @Transactional понимания.

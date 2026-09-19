@@ -1,17 +1,8 @@
-# 35. @Transactional + JPA: PersistenceContext, flush, LazyInit
+# 35. @Transactional плюс JPA: PersistenceContext, flush, LazyInit
 
-Как `@Transactional` работает с JPA конкретно. Что происходит с EntityManager внутри tx.
+## Ключевое связывание transaction равно PersistenceContext
 
----
-
-## 1. Ключевое связывание: tx = PersistenceContext
-
-При старте `@Transactional`-метода Spring:
-
-1. Открывает JPA-транзакцию через `JpaTransactionManager`.
-2. Создаёт (или берёт из пула) **EntityManager**.
-3. Привязывает его к текущему потоку через `TransactionSynchronizationManager`.
-4. Все `@PersistenceContext EntityManager em;` в коде получают этот же EM (proxy'ed).
+При старте @Transactional метода в JPA приложении Spring выполняет несколько связанных операций. Открывает JPA-транзакцию через JpaTransactionManager. Создаёт или берёт из pool EntityManager. Привязывает его к текущему потоку через TransactionSynchronizationManager. Все инъекции @PersistenceContext EntityManager в коде получают тот же EM через прокси механизм.
 
 ```
 @Transactional method
@@ -38,128 +29,72 @@ JpaTransactionManager.doCommit
     └─ unbind from thread
 ```
 
-### 1.1 SharedEntityManagerCreator
+SharedEntityManagerCreator это ключевой инфраструктурный класс. Когда Spring инжектит через @PersistenceContext, разработчик получает не настоящий EntityManager а прокси (SharedEntityManagerCreator). При каждом вызове прокси смотрит thread-local — есть ли связанный EM? Да — возвращает связанный (тот же для всей transaction). Нет — создаёт временный EM на один вызов (не рекомендуется потому что вне transaction).
 
-Когда Spring инжектит:
-```java
-@PersistenceContext
-private EntityManager em;
-```
+Из этого следует важное — вне @Transactional операции с EM могут не работать или работать некорректно. Отдельные операции могут выполниться как auto-committed, но нет consistency между multiple operations.
 
-Ты получаешь **не настоящий EntityManager**, а **прокси** (`SharedEntityManagerCreator`). При каждом вызове он:
-- Смотрит thread-local — есть ли связанный EM?
-- Да → возвращает связанный (тот же для всей tx).
-- Нет → создаёт временный на один вызов (не рекомендуется, т.к. вне tx).
+## Три сценария вызова
 
-Отсюда: **вне @Transactional операции с EM могут не работать** (или работать только на одну операцию).
-
----
-
-## 2. Три сценария вызова
-
-### 2.1 Внутри @Transactional
-
+Внутри @Transactional. Стандартный правильный use case:
 ```java
 @Transactional
 public void save(Order o) {
     em.persist(o);              // managed
     o.setStatus(NEW);           // dirty
-    // выход → flush → INSERT + UPDATE (single tx)
+    // выход → flush → INSERT + UPDATE (одна transaction)
 }
 ```
 
-Работает как ожидается.
+Работает как ожидается — все operations в одной transaction, атомарность гарантирована.
 
-### 2.2 Вне @Transactional (в web-контроллере с open-in-view)
-
-Spring Boot по умолчанию включает **Open-Session-In-View (OSIV)** — session открыта на весь HTTP-запрос.
-
-```java
-// application.yml
-spring.jpa.open-in-view: true    # default!
+Вне @Transactional в web контроллере с open-in-view. Spring Boot по default включает Open-Session-In-View (OSIV) — session открыта на весь HTTP запрос:
+```yaml
+spring.jpa.open-in-view: true    # default
 ```
 
-Что делает: `OpenEntityManagerInViewInterceptor` открывает EM в начале HTTP-запроса, закрывает в конце. Внутри — есть session, LazyInit работает.
+Что делает — OpenEntityManagerInViewInterceptor открывает EM в начале HTTP request, закрывает в конце. Внутри есть session, LazyInit работает даже вне @Transactional service methods.
 
-**Проблемы**:
-- Скрывает N+1 (SELECT'ы летят из контроллера).
-- Держит DB connection на весь запрос (если сервис делает внешние вызовы — connection зря простаивает).
-- Скрывает архитектурные ошибки (Entity утекает в контроллер).
+Проблемы OSIV. Скрывает N+1 problem — SELECT-ы летят из controller или view слоя незаметно. Держит DB connection на весь HTTP request — если service делает внешние вызовы, connection зря простаивает во время external call. Скрывает архитектурные ошибки — Entity утекает в controller что нарушает layering.
 
-**Правильно**: `spring.jpa.open-in-view: false` + аккуратный дизайн (сервис возвращает DTO).
+Правильная практика — spring.jpa.open-in-view: false plus аккуратный дизайн где service возвращает DTO а не Entity. Entity живёт только в service слое.
 
-### 2.3 Вне @Transactional и без OSIV
+Вне @Transactional и без OSIV. em.find(...) вернёт detached object (запрос выполнится но связь с session потеряется сразу). em.persist(...) бросит TransactionRequiredException. Правильное поведение — операции с БД должны быть в transaction.
 
-`em.find(...)` вернёт detached-объект. `em.persist(...)` бросит `TransactionRequiredException`.
+## Flush когда именно
 
-Это правильно — операции с БД должны быть в tx.
+Внутри @Transactional-метода Hibernate накапливает изменения (dirty checking plus persist/remove) в PersistenceContext. Реальные SQL-запросы летят в БД на flush.
 
----
+Автоматический flush в FlushMode.AUTO (default) происходит в нескольких moments. Перед commit обязательно — гарантия что все pending changes записаны до финализации transaction. Перед выполнением query — чтобы query увидел изменения текущей transaction. Иногда перед find() если сущность изменена (сложные rules чтобы поддерживать consistency).
 
-## 3. Flush — когда именно
-
-Внутри @Transactional-метода Hibernate накапливает изменения (dirty checking + persist/remove). Реальные SQL летят в БД на **flush**.
-
-### 3.1 Автоматический flush
-
-Hibernate flushMode = AUTO (по умолчанию):
-1. **Перед commit** — обязательно.
-2. **Перед выполнением query** — чтобы query увидел изменения текущей tx.
-3. **Иногда** перед `find()` (если сущность изменена).
-
-Пример:
+Пример поведения:
 ```java
 @Transactional
 public void updateAndCount() {
     Order o = em.find(Order.class, 1L);
     o.setStatus(NEW);              // dirty, не в БД
 
-    long count = em.createQuery("SELECT count(o) FROM Order o WHERE o.status = :s", Long.class)
+    long count = em.createQuery(
+        "SELECT count(o) FROM Order o WHERE o.status = :s", Long.class)
         .setParameter("s", NEW)
         .getSingleResult();
-    // ← перед этим query — flush → UPDATE + SELECT
+    // ← перед этим query flush → UPDATE + SELECT
+    // count увидит текущий изменённый Order
 
-    // на выходе — flush (уже сделан), commit
+    // на выходе flush (уже сделан), commit
 }
 ```
 
-### 3.2 Manual flush
+Manual flush через явный em.flush() полезен в нескольких сценариях. Проверить что INSERT прошёл валидацию БД до конца метода — если constraint violation, exception раньше а не на commit. Получить @GeneratedValue(IDENTITY) id немедленно для использования в других операциях.
 
-Явно:
-```java
-em.flush();       // отправить SQL сейчас (для проверки, для получения ID)
-```
+FlushMode variants. AUTO — automatic flush (default). COMMIT — flush только на commit, queries могут вернуть устаревшие данные within transaction. MANUAL — flush только явный em.flush(), настраивается для read-only оптимизации.
 
-Полезно:
-- Проверить что INSERT прошёл валидацию БД до конца метода.
-- Получить `@GeneratedValue(IDENTITY)` id немедленно.
+readOnly и flush имеют важное взаимодействие. @Transactional(readOnly = true) в Hibernate устанавливает Session.setDefaultReadOnly(true) plus Session.setFlushMode(FlushMode.MANUAL). Отсюда нет dirty checking, нет UPDATE даже если изменил поле, изменение молча теряется.
 
-### 3.3 FlushMode
+Caveat критический — если в read-only методе случайно entity.setX(...) — ничего не происходит с БД. Не паника когда «изменение не сохранилось» — проверить readOnly setting.
 
-- `AUTO` — auto flush (default).
-- `COMMIT` — только на commit. Query может вернуть устаревшие данные.
-- `MANUAL` — только явный `em.flush()`. Настраивается для read-only оптимизации.
+## LazyInitializationException глубже
 
-### 3.4 readOnly и flush
-
-`@Transactional(readOnly = true)` в Hibernate:
-```
-Session.setDefaultReadOnly(true)
-Session.setFlushMode(FlushMode.MANUAL)
-```
-
-Отсюда:
-- Нет dirty checking → нет UPDATE даже если ты изменил поле.
-- Изменение молча теряется.
-
-**Кавет**: если в read-only методе случайно `entity.setX(...)` — ничего не будет. Не паникуй когда «изменение не сохранилось» — проверь readOnly.
-
----
-
-## 4. LazyInitializationException — глубже
-
-Уже обсуждали в `15-jpa-performance.md`. Здесь связь с tx.
-
+Обсуждали в файле 15 в контексте JPA performance. Здесь связь с transaction management:
 ```java
 @Transactional(readOnly = true)
 public Order load(Long id) {
@@ -171,122 +106,84 @@ Order o = svc.load(1L);
 o.getItems().forEach(...);         // ← LazyInit!
 ```
 
-### 4.1 Причина
+Причина — orderItems это LAZY collection представленная Hibernate proxy (PersistentBag). При обращении пытается выполнить SELECT для loading данных.
 
-`orderItems` — LAZY коллекция. Прокси (`PersistentBag`). При обращении → пытается SELECT.
+Но session закрыта (transaction закончилась при выходе из svc.load). Нет source для SELECT — LazyInitializationException.
 
-Но session закрыта (tx закончилась) → нет откуда SELECT → **LazyInitializationException**.
+Решения различаются по quality.
 
-### 4.2 Решения
-
-**A) DTO в сервисе** (правильно):
+DTO в service — правильный подход:
 ```java
 @Transactional(readOnly = true)
 public OrderDto load(Long id) {
     Order o = repo.findById(id).orElseThrow();
     return new OrderDto(
         o.getId(),
-        o.getItems().stream().map(...).toList()   // загружаем внутри tx
+        o.getItems().stream().map(...).toList()   // загружаем внутри transaction
     );
 }
 ```
 
-**B) JOIN FETCH** / **EntityGraph** — форсированно загрузить перед закрытием session.
+DTO конструируется внутри transaction где session активна. LAZY доступ работает. Наружу возвращается plain DTO без Hibernate proxies.
 
-**C) OSIV** (плохо) — session до конца HTTP-запроса.
+JOIN FETCH или @EntityGraph — форсированно загрузить relationships перед закрытием session. Тоже работает но Entity утекает наружу.
 
-**D) FetchType.EAGER** (ужасно) — всегда загружать.
+OSIV — session до конца HTTP request. Работает но скрывает problems.
 
-### 4.3 Hibernate 6 стало строже
+FetchType.EAGER — всегда загружать. Худший подход — избыточные queries, performance degradation.
 
-С Hibernate 6 (Spring Boot 3) LazyInit ловится чаще. Раньше некоторые случаи молчали.
+Hibernate 6 стало строже с LazyInit. С Hibernate 6 (Spring Boot 3) LazyInit ловится чаще. Раньше некоторые случаи молчали, теперь explicit exceptions.
 
-Реальный кейс ИСНА `knp-fo-sync-notification-bugs`:
-- `@Transactional` был мёртв из-за self-invocation.
-- Значит session никогда не открывалась.
-- Hib6 стал жёстче → LazyInit проявился (Hib5 молчал).
+Реальный кейс из КНП memory knp-fo-sync-notification-bugs. @Transactional был мёртв из-за self-invocation. Значит session никогда не открывалась. Hibernate 6 стал жёстче — LazyInit проявился где Hibernate 5 молчал. Урок — не полагаться на «работает в Hibernate 5». Правильные transactions plus DTO обязательны.
 
-Урок: **не полагаться на «работает в Hib5»**. Правильные tx + DTO.
+getById vs findById в Spring Data. findById(id) возвращает Optional<T> и делает SELECT сразу. getReferenceById(id) возвращает T как прокси без SELECT — LazyInit если использовать вне transaction. Практика — findById по default. getReferenceById только когда «мне нужна ссылка не читая», обычно для FK установления.
 
-### 4.4 `getById` vs `findById`
+## Cascade и transaction
 
-Уже разбирали. Напоминание:
-- `findById(id)` → `Optional<T>` → SELECT сразу.
-- `getReferenceById(id)` → `T` → **прокси без SELECT** → LazyInit если использовать вне tx.
-
-Практика: `getReferenceById` только для «мне нужна ссылка не читая» (например, для FK).
-
----
-
-## 5. Cascade и tx
-
+Cascade расширяет операции persist/remove на связанные объекты все в одной transaction:
 ```java
 @Entity
 class Order {
     @OneToMany(mappedBy="order", cascade = ALL, orphanRemoval = true)
     List<OrderItem> items;
 }
-```
 
-Cascade расширяет операции persist/remove на связанные объекты — **всё в одной tx**.
-
-```java
 @Transactional
 public void createOrder(Order o) {
     o.setItems(List.of(item1, item2, item3));
     repo.save(o);
-    // на flush → INSERT Order + 3 × INSERT OrderItem — одна tx
+    // на flush → INSERT Order + 3 × INSERT OrderItem — одна transaction
 }
 ```
 
-Если что-то не пройдёт валидацию БД → rollback всей tx (никаких «половинных» состояний).
+Если что-то не пройдёт валидацию БД — rollback всей transaction. Никаких «половинных» состояний. Атомарность гарантирована.
 
----
+## Bulk operations
 
-## 6. Bulk operations
-
+Bulk UPDATE и DELETE операции имеют важную особенность:
 ```java
 @Modifying
 @Query("UPDATE Order o SET o.status = :new WHERE o.status = :old")
 int bulkUpdate(...);
 ```
 
-Bulk UPDATE **не проходит через PersistenceContext**. Managed-объекты в текущей сессии остаются со старым значением.
+Bulk UPDATE не проходит через PersistenceContext. Managed-объекты в текущей session остаются со старым значением. Cache становится stale по отношению к БД.
 
-Правило после bulk:
+Правило после bulk operation:
 ```java
-em.flush();   // отправить всё в БД до bulk
-em.clear();   // очистить кэш
+em.flush();   // отправить pending changes до bulk
+em.clear();   // очистить cache
 repo.bulkUpdate(OLD, NEW);
 // managed-объекты теперь detached
 ```
 
-Или изолировать в отдельном сервисе / tx.
+Или изолировать bulk operation в отдельном service или transaction чтобы не смешивать с regular ORM operations.
 
----
+## Transaction propagation в JPA практика
 
-## 7. Transaction propagation в JPA
+REQUIRED default для обычных сервисов. Всё в своих transactions.
 
-Практика для типовых кейсов.
-
-### 7.1 REQUIRED (default)
-
-Обычный сервис:
-```java
-@Service
-class OrderService {
-    @Transactional
-    public void save(Order o) { ... }
-
-    @Transactional
-    public void update(Order o) { ... }
-}
-```
-
-Всё в своих tx.
-
-### 7.2 REQUIRES_NEW для independent audit
-
+REQUIRES_NEW для independent audit. Даже если main transaction откатывается, audit record сохраняется независимо:
 ```java
 @Service
 class OrderService {
@@ -295,7 +192,7 @@ class OrderService {
     @Transactional
     public void createOrder(Order o) {
         repo.save(o);
-        audit.log("Order created", o);   // отдельная tx
+        audit.log("Order created", o);   // отдельная transaction
     }
 }
 
@@ -308,12 +205,9 @@ class AuditService {
 }
 ```
 
-Даже если Order сохранился, а audit упал — audit-запись сохранится независимо.
+Caveat — два connections в pool одновременно (suspended outer plus new inner). При нагрузке pool истощается.
 
-**Кавет**: 2 connections в пуле одновременно. При нагрузке пул истощается.
-
-### 7.3 NESTED для «попыток»
-
+NESTED для «попыток». Внутренняя операция может упасть без impact на внешнюю:
 ```java
 @Transactional
 public void createOrder(Order o) {
@@ -330,73 +224,60 @@ public void createOrder(Order o) {
 public void apply(Order o) { ... }
 ```
 
-### 7.4 SUPPORTS для «может быть в tx, может не быть»
-
+SUPPORTS для методов работающих и в transaction и без:
 ```java
 @Transactional(propagation = SUPPORTS)
 public List<Order> list() {
-    // если снаружи tx — участвуем;
-    // если нет — работаем без tx (одиночные SELECT)
     return repo.findAll();
 }
 ```
 
-Редко полезно. Обычно `readOnly = true` + REQUIRED достаточно.
+Редко полезно. Обычно readOnly = true plus REQUIRED достаточно.
 
----
+## Session per request vs @Transactional
 
-## 8. Session per request (что не путать)
+Важное различие — OSIV это session per HTTP request. @Transactional это session per transaction.
 
-**OSIV** = session per HTTP-request.
-**@Transactional** = session per tx.
+С OSIV включённым session открыта весь request. @Transactional открывает transaction внутри. По окончании transaction session НЕ закрывается — продолжается до конца request.
 
-С OSIV **включённым**: session открыта весь запрос, tx открывается внутри при @Transactional-методах. По окончании tx — session НЕ закрывается (продолжается до конца HTTP-запроса).
+С OSIV выключенным session открыта ТОЛЬКО в @Transactional. Вне transaction session не существует.
 
-С OSIV **выключённым**: session открыта ТОЛЬКО в @Transactional. Вне — нет.
+Правильная практика — OSIV OFF plus все взаимодействия с БД внутри @Transactional сервисов plus возвращать DTO из сервисов. Contract чёткий, no accidental N+1, no LazyInit surprises.
 
-**Правильно**: OSIV **OFF** + все взаимодействия с БД внутри @Transactional-сервисов + возвращать DTO.
+## Долгие транзакции плохо
 
----
-
-## 9. Долгие транзакции — почему плохо
-
+Классический анти-pattern:
 ```java
 @Transactional
 public void process(Order o) {
     repo.save(o);
-    externalApi.call(o);        // ждём 30 сек
+    externalApi.call(o);        // ждём 30 секунд
     audit.log(o);
 }
 ```
 
-30 сек tx open:
-- Connection в пуле занят → пул истощается.
-- Row locks удерживаются → deadlock растёт.
-- Long-running tx блокирует VACUUM → bloat.
-- В PgBouncer transaction-mode → connection не возвращается в pool.
+30 секунд open transaction. Connection в pool занят весь этот период — pool истощается быстро. Row locks удерживаются 30 секунд — deadlocks растут. Long-running transaction блокирует VACUUM в PostgreSQL — bloat накапливается. В PgBouncer transaction-mode connection не возвращается в pool до конца.
 
-**Правило**: **внешние вызовы вне @Transactional**.
-
+Правило абсолютное — внешние вызовы вне @Transactional:
 ```java
 public void process(Order o) {
-    Order saved = doSave(o);              // короткая tx
-    externalApi.call(saved);              // снаружи tx
-    doAudit(saved);                       // отдельная tx
+    Order saved = doSave(o);              // короткая transaction
+    externalApi.call(saved);              // снаружи transaction
+    doAudit(saved);                       // отдельная transaction
 }
 
 @Transactional
 Order doSave(Order o) { return repo.save(o); }
+
 @Transactional
 void doAudit(Order o) { ... }
 ```
 
-Или **outbox pattern**: сохранить в БД + запись в outbox, отдельный job сделает external call асинхронно.
+Или outbox pattern — сохранить в БД plus запись в outbox, отдельный job делает external call асинхронно. Атомарность через транзакцию БД, реальный external call decoupled по времени.
 
----
+## Read-only pattern
 
-## 10. Read-only в SUPPORTS + repo
-
-Common pattern:
+Common practical pattern для типового сервиса:
 ```java
 @Service
 class OrderService {
@@ -416,19 +297,15 @@ class OrderService {
 }
 ```
 
-Правильно: read = readOnly + DTO; write = обычная tx + Entity.
+Read методы — readOnly = true plus DTO для return type. Write методы — regular @Transactional plus Entity возвращается только если нужно. Chapter DTO обеспечивает clean separation между Entity (internal representation) и DTO (external contract).
 
----
+## Session per test
 
-## 11. Session per test
-
-`@SpringBootTest @Transactional`:
-
+@SpringBootTest plus @Transactional автоматический rollback после теста:
 ```java
 @SpringBootTest
-@Transactional      // auto rollback после теста
+@Transactional
 class OrderServiceTest {
-
     @Autowired OrderService svc;
     @Autowired OrderRepository repo;
 
@@ -436,94 +313,69 @@ class OrderServiceTest {
     void createOrder_savesEntity() {
         svc.create(new OrderRequest(...));
         assertThat(repo.findAll()).hasSize(1);
-        // на конец теста → rollback → БД чистая
+        // на конец теста rollback → БД чистая
     }
 }
 ```
 
-Тест и сервис в **одной** tx → repo видит изменение сервиса.
+Тест и сервис в одной transaction. Repo видит изменение сервиса потому что share PersistenceContext.
 
-Кавет: если сервис делает REQUIRES_NEW → это отдельная tx, откатится сама, но тестовая tx её не увидит после rollback.
+Caveat REQUIRES_NEW. Если сервис делает REQUIRES_NEW — это отдельная transaction, откатится сама на выходе своего метода. Но тестовая transaction её не увидит после её rollback — данные не accessible через тест repository queries если inner transaction сделал commit и внешняя откатывается.
 
----
+## Реальные кейсы КНП
 
-## 12. Кейсы из ИСНА
+Memory knp-fo-sync-notification-bugs — 6 багов sync-сервиса связанных с transactions plus JPA. @Transactional мёртв из-за self-invocation — session не открывается. Hibernate 6 LazyInit ловится там где раньше молчал. printStackTrace вместо log.error — ELK-слепая зона не видно transaction ошибок. Тихий скип на ошибке (MAX offset) — потеря данных без detection.
 
-### 12.1 `knp-fo-sync-notification-bugs`
+Урок общий — правильные transactions plus structured logging plus отсутствие self-invocation. Не отдельные проблемы а комплекс дисциплин.
 
-6 багов sync-сервиса, часть связана с tx + JPA:
-- `@Transactional` мёртв (self-invocation) → session не открывается.
-- Hib6 LazyInit ловится там где раньше молчал.
-- `printStackTrace` вместо log.error → ELK-слепая зона (не видно tx-ошибок).
-- Тихий скип на ошибке (MAX offset) → потеря данных.
+Memory taxreport21-java21-runtime-regressions — getById plus toDto вне transaction — LazyInit. Fix findById (SELECT сразу) plus правильные @Transactional методы. Encapsulation внутри service.
 
-Урок: правильные tx + structured logging + отсутствие self-invocation.
+Memory knp-e2e-runner-hikari-isolation-poisoning — не JPA специфично но связано с transactions. isolation равное -1 (opt-in) отравлял pool на pp-pgbouncer. gate-knp краснел 18 минут. Явно указывать isolation в конфигурации.
 
-### 12.2 `taxreport21-java21-runtime-regressions`
+## Best practices итог
 
-- `getById` + `toDto` вне tx → LazyInit.
-- Fix: `findById` (SELECT сразу) + правильные @Transactional-методы.
+Правила которые работают в production:
 
-### 12.3 `knp-e2e-runner-hikari-isolation-poisoning`
+@Transactional на сервис не на repository и не на controller. Encapsulation transaction logic в service layer.
 
-Не JPA, но связано: `isolation=-1` (opt-in) отравлял пул на pp-pgbouncer → gate краснел ~18 мин. Явно указывать isolation.
+readOnly = true на все чтения. Optimizations plus documentation.
 
----
+rollbackFor = Exception.class универсально безопасно. Или все свои exceptions через RuntimeException иерархию.
 
-## 13. Best practices итог
+Сервис возвращает DTO не Entity. Entity не должна утекать за границы transaction.
 
-1. **@Transactional на сервис**, не на репозиторий, не на контроллер.
-2. **`readOnly = true`** на все чтения.
-3. **`rollbackFor = Exception.class`** (или иметь только Runtime exceptions).
-4. **Сервис возвращает DTO**, не Entity.
-5. **Внешние API — вне tx** (outbox / отдельные методы).
-6. **OSIV = false** (`spring.jpa.open-in-view: false`).
-7. **`@TransactionalEventListener(AFTER_COMMIT)`** для sending events.
-8. **`findById` не `getReferenceById`** (если только не для FK-связи).
-9. **Bulk UPDATE / DELETE** → `em.clear()` после.
-10. **Timeout** на каждую tx (`@Transactional(timeout = 30)`).
-11. **Проверить** что нет self-invocation.
-12. **Логировать** `org.springframework.transaction: DEBUG` при отладке.
+Внешние API вне transaction. Outbox pattern или отдельные methods.
 
----
+OSIV = false. spring.jpa.open-in-view: false. Явные transaction boundaries.
 
-## 14. Собесные вопросы
+@TransactionalEventListener(AFTER_COMMIT) для sending events после commit.
 
-1. **Как @Transactional работает с EntityManager?** — Открывает EM, привязывает к потоку через TransactionSynchronizationManager; все `@PersistenceContext` получают тот же.
-2. **Что такое OSIV?** — Open-Session-In-View: session открыта весь HTTP-запрос; default в Spring Boot; лучше выключить.
-3. **Почему OSIV плохо?** — Скрывает N+1, держит DB connection долго, скрывает архитектурные проблемы.
-4. **Когда происходит flush?** — Перед commit, перед query (auto), явно `em.flush()`.
-5. **readOnly = true — что делает?** — JDBC read-only + Hibernate MANUAL flush + БД оптимизации.
-6. **Что произойдёт если изменить поле в readOnly tx?** — Молча ничего (нет flush).
-7. **Почему LazyInit важно связано с @Transactional?** — Session открывается только в tx; после выхода — закрыта; lazy fields пытаются load → exception.
-8. **REQUIRES_NEW в JPA — риски?** — Требует 2 connection одновременно → пул истощается + возможные deadlock.
-9. **Как сохранить audit-запись независимо от главной tx?** — REQUIRES_NEW в отдельном бине.
-10. **Почему `@TransactionalEventListener(AFTER_COMMIT)`?** — Публиковать в Kafka/Rabbit только после успешного commit; иначе можно опубликовать, а tx откатится.
-11. **Почему нельзя внешний API внутри @Transactional?** — Держит connection и row locks долго; истощение пула, deadlock, длинная tx.
-12. **Как правильно возвращать данные из @Transactional?** — DTO. Entity не должна утекать за границы tx.
-13. **Разница `findById` и `getReferenceById` в контексте tx?** — findById SELECT сразу; getReferenceById прокси без SELECT — LazyInit если использовать вне tx.
-14. **Bulk UPDATE и managed объекты?** — Не проходит через PersistenceContext; managed остаются со старым значением; `em.clear()` после.
-15. **Тесты с @Transactional?** — Auto rollback после теста; тест и сервис в одной tx (кроме REQUIRES_NEW внутри).
+findById не getReferenceById по default (если только не для FK связи).
 
----
+Bulk UPDATE plus em.clear() после. Или изолировать в отдельном service.
 
-## Итог
+Timeout на каждую transaction. @Transactional(timeout = 30) explicit.
 
-- **@Transactional** = **session** = **PersistenceContext** = **connection**, всё привязано к потоку.
-- **OSIV = false** и работать с DTO.
-- **`readOnly = true`** для чтения.
-- **Внешние вызовы вне tx**.
-- **AFTER_COMMIT** для events.
-- **Self-invocation** = самая частая причина «tx не работает».
-- **Hibernate 6** строже к LazyInit — правильные tx обязательны.
+Проверить что нет self-invocation. Регулярный code review.
 
----
+Логировать org.springframework.transaction DEBUG при отладке.
 
-## Итог блока @Transactional
+## Итоги
 
-- 32 — Транзакции: ACID, isolation, propagation, XA, Saga.
-- 33 — @Transactional изнутри: прокси, PlatformTransactionManager, self-invocation.
-- 34 — Продвинутое: rollback, readOnly, listeners, savepoints, TransactionTemplate, testing.
-- 35 — @Transactional + JPA: PersistenceContext, flush, LazyInit, OSIV, best practices.
+@Transactional равно session равно PersistenceContext равно connection — всё привязано к потоку через TransactionSynchronizationManager thread-local.
 
-Следующий — `36-spring-cloud.md`.
+OSIV = false и работать с DTO. Явные transaction boundaries лучше implicit session per request.
+
+readOnly = true для чтения — оптимизации plus documentation.
+
+Внешние вызовы вне transaction — outbox pattern predпочтительно для async external work.
+
+@TransactionalEventListener(AFTER_COMMIT) для events после commit. Обеспечивает outbox-подобную reliability без external tools.
+
+Self-invocation самая частая причина «transaction не работает». Fix extract to another bean.
+
+Hibernate 6 строже к LazyInit чем Hibernate 5. Правильные transactions обязательны, «работало раньше» не аргумент.
+
+Итог блока @Transactional. Файлы 32-35 покрыли ACID basics и isolation levels, @Transactional internals через proxies, advanced features с rollback rules и listeners, JPA специфику с PersistenceContext и OSIV. Complete picture для reliable transaction handling в enterprise Spring приложениях.
+
+Дальше — Spring Cloud с discovery, gateway, resilience patterns и другими компонентами microservices infrastructure.

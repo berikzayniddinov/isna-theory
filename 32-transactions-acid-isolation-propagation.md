@@ -1,214 +1,94 @@
 # 32. Транзакции: ACID, isolation levels, propagation
 
-Всё что нужно знать про транзакции до того, как разбирать `@Transactional`.
+## Что такое транзакция
 
----
+Транзакция это логическая единица работы с базой данных. Набор операций которые должны выполниться как одно целое — либо все успешно, либо ни одна не применяется. Фундаментальная абстракция обеспечивающая consistency данных при concurrent modifications.
 
-## 1. Что такое транзакция
+Классический пример банковского перевода иллюстрирует необходимость транзакций. Списываем 100 у Алисы, зачисляем 100 Бобу — это две операции которые должны happen атомарно. Если между ними падает БД, деньги «потеряются» — списаны у одного, не зачислены другому. Транзакция гарантирует что либо обе UPDATE применились (COMMIT) либо ни одна не применилась (ROLLBACK).
 
-**Транзакция** — логическая единица работы с БД. Набор операций, которые должны выполниться **как одна**: либо все, либо ни одна.
-
-Классический пример — банковский перевод:
+Классический SQL для перевода:
 ```sql
 BEGIN;
-UPDATE accounts SET balance = balance - 100 WHERE id = 1;   -- списали у Alice
-UPDATE accounts SET balance = balance + 100 WHERE id = 2;   -- зачислили Bob
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 COMMIT;
 ```
 
-Если между двумя UPDATE упадёт БД — деньги «потерялись». Транзакция гарантирует: либо оба UPDATE применены (COMMIT), либо ни один (ROLLBACK).
+BEGIN открывает транзакцию. Между BEGIN и COMMIT/ROLLBACK находится transaction scope. COMMIT фиксирует все изменения атомарно. ROLLBACK откатывает — как будто ничего не было.
 
----
+## ACID свойства
 
-## 2. ACID
+Правильная транзакция обладает четырьмя свойствами известными как ACID. Каждое имеет специфический смысл и специфический механизм реализации.
 
-Четыре свойства правильной транзакции.
+Atomicity (атомарность) — «всё или ничего». Транзакция либо вся зафиксирована либо вся откачена, никаких partial states. Реализация в PostgreSQL через Write-Ahead Log (WAL). Прежде чем изменение попадёт в actual data files оно пишется в WAL. При crash в середине транзакции — recovery может undo изменения используя WAL. Гарантия что незакоммиченные изменения не остаются в БД.
 
-### 2.1 Atomicity (атомарность)
+Consistency (согласованность) означает что БД до транзакции была валидна и БД после транзакции остаётся валидной. Все constraints (FOREIGN KEY, UNIQUE, CHECK, NOT NULL) соблюдены. Важное уточнение — consistency в ACID это database constraints consistency, не бизнес-логическая консистентность. Приложение должно обеспечивать бизнес-инварианты самостоятельно. БД проверяет только structural constraints.
 
-«Всё или ничего». Транзакция либо вся зафиксирована, либо вся откачена.
+Isolation (изоляция) — параллельные транзакции не мешают друг другу. Строгая изоляция как будто транзакции выполнены последовательно даже если фактически они выполняются concurrently. Уровни изоляции представляют собой компромисс между строгостью гарантий и performance. Разбор различных уровней ниже.
 
-Реализация: **WAL** (Write-Ahead Log). Прежде чем изменение попадёт в таблицу — пишется в лог. При crash в середине tx — undo из лога.
+Durability (долговечность) — после COMMIT изменения гарантированно на диске и переживут падение сервера. Реализация через fsync WAL — commit возвращает OK клиенту только после успешного flush WAL записи на диск. Настройка fsync=on обязательна для реальной durability. fsync=off быстрее но может потерять последние committed transactions при crash.
 
-### 2.2 Consistency (согласованность)
+## Проблемы конкурентного доступа
 
-БД до транзакции валидна → БД после транзакции валидна. Все constraints (FK, UNIQUE, CHECK) соблюдены.
+Прежде чем обсуждать уровни изоляции полезно понять что может пойти не так при concurrent transactions.
 
-**Не** гарантирует бизнес-логическую консистентность (это уже приложение).
+Dirty read происходит когда одна транзакция читает изменения другой ещё не committed транзакции. T1 обновляет строку, T2 читает — видит незакоммиченное значение, T1 делает ROLLBACK. T2 «поверила» в данные которых на самом деле не было. Может привести к incorrect business decisions на основе несуществующих данных.
 
-### 2.3 Isolation (изоляция)
+Non-repeatable read это когда одна транзакция читает одну и ту же строку дважды и получает разные значения. T1 читает строку — видит balance=100. T2 обновляет и коммитит balance=200. T1 читает опять — видит balance=200. Внутри одной транзакции данные «изменились» что нарушает consistency перспективы транзакции.
 
-Параллельные транзакции не мешают друг другу. Строгая изоляция — как будто транзакции выполнены последовательно.
+Phantom read похожа на non-repeatable но касается набора строк по условию а не конкретной строки. T1 выполняет SELECT COUNT(*) WHERE balance > 100 — получает 5. T2 вставляет новую строку с balance=200 и коммитит. T1 повторяет запрос — теперь 6 строк. Новая «phantom» строка появилась в результате того же query. Отличие от non-repeatable — не изменение существующей строки, а появление или исчезновение строк по условию.
 
-**Уровни изоляции** — компромисс между строгостью и performance (см. §4).
+Lost update происходит когда две транзакции читают, обе изменяют, обе коммитят — одно изменение потеряно. T1 читает balance=100. T2 читает balance=100 (в другой сессии). T1 обновляет balance=150 и коммитит. T2 обновляет balance=80 (на основе своего чтения 100 минус 20) и коммитит. Итог 80 вместо ожидаемого 130. Изменение T1 полностью «затерто». Решается через optimistic locking (@Version) или pessimistic (SELECT FOR UPDATE).
 
-### 2.4 Durability (долговечность)
+Write skew это специфичная проблема serializable уровня. Две транзакции читают один и тот же набор данных, каждая изменяет свою часть, вместе нарушают invariant. Классический пример — правило «минимум один врач на дежурстве». T1 читает список on-call врачей видя A и B on-call, снимает A потому что B on-call. T2 параллельно делает то же самое — видит A и B on-call, снимает B потому что A on-call. Обе коммитятся — 0 on-call врачей, invariant нарушен.
 
-После COMMIT изменения гарантированно на диске, переживут падение.
+## Уровни изоляции SQL стандарт
 
-Реализация: **fsync** WAL. Commit возвращает OK только когда `fsync()` завершился.
-
----
-
-## 3. Проблемы конкурентного доступа
-
-Прежде чем говорить про уровни — что вообще может пойти не так.
-
-### 3.1 Dirty read
-
-T1 изменил строку, но не закоммитил.
-T2 читает — видит незакоммиченное изменение.
-T1 откатывает.
-T2 «поверила» в то, чего не было.
-
-```
-T1: UPDATE accounts SET balance = 200 WHERE id = 1;
-T2: SELECT balance FROM accounts WHERE id = 1;   -- видит 200
-T1: ROLLBACK;                                     -- balance был 100
-```
-
-### 3.2 Non-repeatable read
-
-T1 читает строку.
-T2 обновляет и коммитит.
-T1 читает ту же строку — другое значение.
-
-```
-T1: SELECT balance FROM accounts WHERE id = 1;   -- 100
-T2: UPDATE accounts SET balance = 200 WHERE id = 1; COMMIT;
-T1: SELECT balance FROM accounts WHERE id = 1;   -- 200 (изменилось в той же tx!)
-```
-
-### 3.3 Phantom read
-
-T1 читает набор строк по условию.
-T2 вставляет новую строку, попадающую под условие.
-T1 повторяет — появилась «новая» строка.
-
-```
-T1: SELECT COUNT(*) FROM accounts WHERE balance > 100;   -- 5
-T2: INSERT INTO accounts VALUES (10, 200); COMMIT;
-T1: SELECT COUNT(*) FROM accounts WHERE balance > 100;   -- 6
-```
-
-Отличие от non-repeatable — тут не изменение, а появление/исчезновение строк по условию.
-
-### 3.4 Lost update
-
-Две транзакции читают, обе меняют, обе коммитят. Первое изменение потеряно.
-
-```
-T1: SELECT balance FROM accounts WHERE id = 1;   -- 100
-T2: SELECT balance FROM accounts WHERE id = 1;   -- 100
-T1: UPDATE ... SET balance = 100 + 50; COMMIT;   -- 150
-T2: UPDATE ... SET balance = 100 - 20; COMMIT;   -- 80  ← +50 потеряно!
-```
-
-Решение — optimistic (`@Version`) или pessimistic (`SELECT FOR UPDATE`) locking.
-
-### 3.5 Write skew
-
-Специфичная проблема serializable. Две транзакции читают один и тот же набор, каждая обновляет свою часть, вместе нарушают инвариант.
-
-Классический пример — дежурство врачей: правило «минимум один врач на дежурстве». T1 снимает врача A (видит что B на дежурстве). T2 снимает врача B (видит что A на дежурстве). Обе коммитятся — 0 врачей.
-
----
-
-## 4. Уровни изоляции (SQL стандарт)
-
-Компромисс между строгостью и производительностью.
+SQL стандарт определяет четыре уровня изоляции представляющие trade-offs между строгостью и performance.
 
 | Уровень | Dirty read | Non-repeatable | Phantom | Lost update |
 |---|---|---|---|---|
-| **READ UNCOMMITTED** | ✅ | ✅ | ✅ | ✅ |
-| **READ COMMITTED** | ❌ | ✅ | ✅ | ✅ |
-| **REPEATABLE READ** | ❌ | ❌ | ✅ (стандарт)<br>❌ (PG!) | ❌ (PG) |
-| **SERIALIZABLE** | ❌ | ❌ | ❌ | ❌ |
+| READ UNCOMMITTED | возможен | возможен | возможен | возможен |
+| READ COMMITTED | нет | возможен | возможен | возможен |
+| REPEATABLE READ | нет | нет | возможен (стандарт) / нет (PG) | нет (PG) |
+| SERIALIZABLE | нет | нет | нет | нет |
 
-✅ = проблема возможна. ❌ = не возможна.
+READ UNCOMMITTED разрешает всё включая dirty reads. Максимально быстро потому что не требует consistency guarantees. Максимально небезопасно. PostgreSQL не поддерживает этот уровень — при попытке установить его молча повышает до READ COMMITTED. Использование ограничено analytical queries где неточность допустима.
 
-### 4.1 READ UNCOMMITTED
+READ COMMITTED это default в PostgreSQL. Видит только committed данные. Каждый SELECT видит свежий snapshot committed данных на момент SELECT. Non-repeatable и phantom reads всё ещё возможны потому что несколько SELECT в одной transaction могут видеть разные данные если другие transactions committed между ними. Самый практичный компромисс для большинства сценариев.
 
-Видит всё, включая незакоммиченное. Максимально быстро, максимально небезопасно.
+REPEATABLE READ фиксирует snapshot на первом SELECT в транзакции. Все повторные чтения внутри транзакции возвращают согласованные данные. SQL стандарт разрешает phantom reads в этом уровне. PostgreSQL реализует более строго — фактически даёт snapshot isolation где phantom reads тоже недоступны. Полезен для reports и batch операций требующих consistent multiple reads.
 
-**PostgreSQL не поддерживает** — молча повышает до READ COMMITTED.
+SERIALIZABLE даёт полную изоляцию — как будто transactions выполнены последовательно. PostgreSQL использует SSI (Serializable Snapshot Isolation) — при обнаружении conflict одна из transactions получает ошибку 40001 could not serialize access. Приложение должно retry операцию. Медленнее (много retries под нагрузкой) но самая правильная семантика для сценариев чувствительных к write skew.
 
-Использовать только для аналитики где неточность допустима.
+Практический выбор. READ COMMITTED устраивает 95 процентов случаев. REPEATABLE READ для консистентных multiple чтений — отчёты, batch. SERIALIZABLE только когда логика чувствительна к write skew и приложение готово handle retry.
 
-### 4.2 READ COMMITTED (default для PG)
+В КНП стандарт READ COMMITTED явно установленный. Memory кейс knp-e2e-runner-hikari-isolation-poisoning показал что opt-in isolation равное -1 может отравить pool PgBouncer subsequent transactions в pool получают wrong isolation. Явное указание уровня обязательно.
 
-Видит только закоммиченное. Каждый SELECT видит свежий snapshot.
+## Реализация уровней изоляции
 
-Non-repeatable и phantom всё ещё возможны (два SELECT в одной tx могут увидеть разные данные).
+Существует два основных подхода к реализации isolation levels.
 
-**По умолчанию в PostgreSQL** — самый практичный компромисс.
+Lock-based подход используемый в MySQL InnoDB классически. Explicit locks на строки или ranges. SELECT ставит shared lock, UPDATE берёт exclusive. Concurrent readers ok но writer блокируется если читатели держат shared lock. Приводит к contention — много waits и потенциально deadlocks.
 
-### 4.3 REPEATABLE READ
+MVCC подход используемый в PostgreSQL и Oracle. Многоверсионный concurrency control. Читатели видят свою snapshot version данных, не блокируют писателей. Каждый tuple имеет xmin/xmax системные columns определяющие видимость для конкретных transactions.
 
-Snapshot фиксируется на первом SELECT. Внутри tx все повторные чтения одинаковы.
+Snapshot берётся в разные моменты в зависимости от уровня. В READ COMMITTED snapshot обновляется на каждый statement — каждый SELECT видит свежие committed данные. В REPEATABLE READ и SERIALIZABLE один snapshot на всю transaction — все statements видят consistent data.
 
-Стандартный SQL позволяет phantom read. **PostgreSQL реализует более строго** — фактически даёт snapshot isolation, phantom тоже недоступны.
+MVCC даёт лучшую concurrency чем lock-based. Читатели никогда не блокируют писателей. Писатели блокируют других писателей той же row. Читатели не блокируют друг друга. Trade-off — накопление dead tuples требующее periodic VACUUM.
 
-Используется когда нужны консистентные множественные чтения в одной tx (например, отчёты).
+## Propagation комбинирование транзакций
 
-### 4.4 SERIALIZABLE
+Что происходит когда транзакционный метод A вызывает транзакционный метод B? Ответ зависит от propagation атрибута B. По умолчанию REQUIRED но существует семь опций для разных сценариев.
 
-Полная изоляция. Как будто транзакции выполнены последовательно.
-
-**Cost**: PG использует SSI (Serializable Snapshot Isolation) — при обнаружении конфликта одна из tx получает `40001 could not serialize access` → приложение должно retry.
-
-Медленнее (много retry на нагрузке), но самая правильная семантика.
-
-Использовать когда критичен write skew.
-
-### 4.5 Что выбрать
-
-- **READ COMMITTED** — default, устраивает 95% случаев.
-- **REPEATABLE READ** — консистентные множественные чтения (отчёты, batch).
-- **SERIALIZABLE** — только когда логика чувствительна к write skew И готов handle retry.
-
-В ИСНА (memory `knp-e2e-runner-hikari-isolation-poisoning`) — стандарт **READ COMMITTED** явно, иначе `isolation=-1` (opt-in) может отравить пул PgBouncer.
-
----
-
-## 5. Как реализуются уровни
-
-### 5.1 Lock-based (MySQL InnoDB)
-
-Явные блокировки строк / диапазонов. SELECT ставит shared lock, UPDATE — exclusive. Плохо: contention.
-
-### 5.2 MVCC (PostgreSQL, Oracle)
-
-Многоверсионный. Читатели видят свою версию, не блокируют писателей. Каждый tuple имеет xmin/xmax (см. `28-postgresql-internals.md`).
-
-Snapshot берётся:
-- В READ COMMITTED — на каждый statement.
-- В REPEATABLE READ / SERIALIZABLE — один на всю tx.
-
----
-
-## 6. Propagation — как транзакции комбинируются
-
-Что происходит когда транзакционный метод A вызывает транзакционный метод B?
-
-Ответ зависит от **propagation** метода B (значение по умолчанию — REQUIRED).
-
-### 6.1 REQUIRED (default)
-
-Если есть внешняя транзакция — участвовать. Нет — создать новую.
-
+REQUIRED это default. Если есть внешняя транзакция — метод участвует в ней. Нет внешней — создаётся новая. Один commit на всю цепочку, один rollback. Внутренний rollback метки транзакцию как rollback-only — при попытке commit внешней получается UnexpectedRollbackException.
 ```
 A (@Transactional)
   ├─ B (@Transactional REQUIRED)     ← участвует в A's tx
-  ...
+  ├─ C (@Transactional REQUIRED)     ← участвует в A's tx
 ```
 
-Один commit, один rollback. Внутренний rollback → внешняя тоже упадёт (mark as rollback-only).
-
-### 6.2 REQUIRES_NEW
-
-**Всегда новая tx**. Внешняя приостанавливается (suspended) на время выполнения.
-
+REQUIRES_NEW всегда создаёт новую транзакцию. Внешняя приостанавливается (suspended) на время выполнения внутренней. Полезно для independent audit logs — даже если main transaction откатывается, audit entry остаётся:
 ```
 A (@Transactional)                    tx1: BEGIN
   ├─ B (@Transactional REQUIRES_NEW)  tx1: SUSPEND
@@ -218,254 +98,129 @@ A (@Transactional)                    tx1: BEGIN
   ...                                 tx1: COMMIT
 ```
 
-Использование: независимый audit-лог (упало приложение → аудит-запись остаётся).
+Важный caveat — требует два connection в pool одновременно (suspended tx1 держит свой connection, new tx2 берёт другой). Может привести к pool exhaustion при массовом использовании.
 
-**Кавет**: требует два connection в пуле одновременно! Может привести к deadlock пула.
-
-### 6.3 NESTED
-
-Savepoint внутри внешней транзакции. Rollback внутренней возвращает к savepoint, внешняя продолжается.
-
+NESTED использует savepoint внутри внешней транзакции. Rollback внутренней возвращает к savepoint, внешняя продолжается. Реализуется через SAVEPOINT SQL команду:
 ```
 A (@Transactional)              tx: BEGIN
   ├─ B (@Transactional NESTED)  tx: SAVEPOINT sp1
       throw                      tx: ROLLBACK TO sp1
-  continue                       tx: (working)
+  continue                       tx: (продолжаем)
                                  tx: COMMIT
 ```
 
-Требует поддержки savepoint (PG — да).
+Требует поддержку savepoints БД (PostgreSQL поддерживает). Отличие от REQUIRES_NEW — работает в одной transaction (один connection), при rollback внешней nested тоже откатывается. Полезен для «попытки с возможностью отката» без потери всей transaction.
 
-Использование: попытка операции с возможным откатом без потери всей tx.
+MANDATORY требует существующей внешней транзакции. Если нет — бросает IllegalTransactionStateException. Использование когда метод «строго часть чьей-то транзакции» — программное указание что метод не должен вызываться самостоятельно.
 
-### 6.4 MANDATORY
+SUPPORTS работает как в транзакции так и без. Если есть — участвует. Нет — работает без транзакции. Использование для read методов которые могут вызываться и в transactional и в non-transactional контекстах.
 
-Требует внешнюю транзакцию. Нет → `IllegalTransactionStateException`.
+NOT_SUPPORTED всегда работает без транзакции. Если есть внешняя — suspends её на время. Использование для долгих операций которые не должны быть в transaction — audit logging, analytics, external calls.
 
-Использование: метод «строго часть чьей-то tx».
+NEVER работает только без транзакции. Если есть — бросает exception. Использование для специфических jobs которые не должны выполняться в transaction context.
 
-### 6.5 SUPPORTS
-
-Если есть — участвует; нет — работает без tx.
-
-Использование: read-методы, которые могут вызываться и с tx, и без.
-
-### 6.6 NOT_SUPPORTED
-
-Если есть — suspend; работает без tx.
-
-Использование: долгие операции которые не должны блокировать tx (audit, аналитика).
-
-### 6.7 NEVER
-
-Если есть — исключение. Работает только без tx.
-
-Использование: специфичные джобы, не должны быть в tx.
-
-### 6.8 Таблица
+Сводная таблица behavior:
 
 | Propagation | Внутренняя tx | Внешняя tx |
 |---|---|---|
-| REQUIRED | участвует | — |
+| REQUIRED | участвует | использует существующую |
 | REQUIRES_NEW | новая | suspend |
-| NESTED | savepoint | — |
-| MANDATORY | участвует | ошибка если нет |
-| SUPPORTS | участвует | работает без |
+| NESTED | savepoint | использует существующую |
+| MANDATORY | участвует | error если нет |
+| SUPPORTS | участвует или без | ok либо без |
 | NOT_SUPPORTED | работает без | suspend |
-| NEVER | работает без | ошибка если есть |
+| NEVER | работает без | error если есть |
 
----
+## Distributed transactions и 2PC
 
-## 7. XA / distributed transactions (2PC)
+Что делать когда две БД или БД плюс message broker должны фиксироваться атомарно? Классическое решение — Two-Phase Commit (2PC).
 
-Что делать когда две БД или БД + брокер должны фиксироваться атомарно?
+2PC работает через координатор и участников. Фаза prepare — координатор запрашивает всех «готовы commit?». Каждый участник записывает изменения в prepared state (persist but not committed), отвечает yes или no. Фаза commit — если все ответили yes координатор говорит всем commit, если хоть один no — говорит всем abort.
 
-### 7.1 Two-Phase Commit (2PC)
+XA (X/Open XA) это стандарт для 2PC. XA-resource это database, message queue или другой resource поддерживающий XA protocol. Java Transaction API (JTA) это interface для управления XA transactions. UserTransaction, TransactionManager для application, XAResource для resource providers.
 
-Координатор + участники.
+Реализации XA в JEE серверах — Atomikos, Bitronix, Narayana. В Spring Boot требует manual configuration. Не common practice.
 
-Фаза 1 — **prepare**:
-- Координатор → всем: «готовы?».
-- Каждый участник записывает изменения в prepared state (не коммитит).
-- Отвечает «yes / no».
+Почему 2PC редко используют в микросервисах. Медленно — два round-trip минимум для commit. Блокирующий — если координатор упал между фазами, ресурсы застряли в prepared state до восстановления координатора. Сложно — требует правильной конфигурации всех участников, recovery процедур. Плохо масштабируется — координатор bottleneck.
 
-Фаза 2 — **commit / abort**:
-- Если все «yes» → координатор → всем: «commit».
-- Если хоть один «no» → всем «abort».
+Saga pattern как альтернатива для microservices. Compensation-based подход. Каждый шаг это local transaction в одном сервисе. При failure на любом шаге — вызываются compensating actions отменяющие предыдущие steps.
 
-### 7.2 XA (X/Open XA)
+Пример order flow. CreateOrder в order-service local tx. ReserveInventory в inventory-service local tx. ChargePayment в payment-service local tx. При failure на шаге 3 — RefundPayment (compensation), ReleaseInventory (compensation), CancelOrder (compensation).
 
-Стандарт 2PC. **XA-resource** — БД / MQ / etc, поддерживающий XA-протокол.
+Реализации Saga. Orchestration — центральный оркестратор направляет steps. Choreography — сервисы координируются через events без central controller.
 
-Java: **JTA (Java Transaction API)** — интерфейс для управления XA. `UserTransaction`, `TransactionManager`.
+Outbox pattern это practical подход для atomic commit БД plus message broker без XA. В одной transaction — сохранить бизнес-данные plus запись в outbox таблицу. Отдельный job читает outbox — публикует в Rabbit/Kafka — удаляет запись. Гарантия — если commit прошёл то outbox запись есть, публикация состоится eventually. Наиболее практичный подход для микросервисов.
 
-Реализации в JEE-сервере: Atomikos, Bitronix, Narayana. В Spring Boot — вручную настраивать.
+## Optimistic против Pessimistic locking
 
-### 7.3 Почему не используют
+Два подхода к handling concurrent updates.
 
-- **Медленно** — 2 round-trip.
-- **Блокирующе** — если координатор упал между фазами, ресурсы залипли в prepared.
-- **Сложно** — требует правильной настройки, восстановления после падений.
-- **Не масштабируется** — плохо в микросервисах.
-
-### 7.4 Альтернатива — Saga
-
-Compensation-based. Каждая tx локальная (в одной БД), при ошибке — вызываются compensating actions.
-
-Пример order flow:
-```
-1. CreateOrder (order-service, local tx)
-2. ReserveInventory (inventory-service, local tx)
-3. ChargePayment (payment-service, local tx)
-
-При ошибке на шаге 3:
-- RefundPayment (compensation)
-- ReleaseInventory (compensation)
-- CancelOrder (compensation)
-```
-
-Реализации: Orchestration (центральный оркестратор) vs Choreography (события).
-
-### 7.5 Outbox pattern
-
-Атомарный commit БД + публикация в брокер без XA:
-
-1. В одной tx: сохранить бизнес-данные + запись в `outbox` таблицу.
-2. Отдельный job читает `outbox` → публикует в Rabbit/Kafka → удаляет запись.
-
-Гарантия: если commit прошёл — outbox запись есть → рано или поздно опубликуется.
-
-**Наиболее практичный подход** для микросервисов вместо XA.
-
----
-
-## 8. Optimistic vs Pessimistic locking
-
-### 8.1 Pessimistic (`SELECT FOR UPDATE`)
-
-Явно захватить блокировку строки. Другие ждут.
+Pessimistic locking через SELECT FOR UPDATE явно захватывает lock на строку. Другие транзакции ждут пока lock не освободится. Простая семантика — гарантия что никто не изменит между read и write. Deadlocks возможны при complex lock acquisition patterns. Плохо масштабируется потому что concurrent writes serialized.
 
 ```sql
 BEGIN;
-SELECT * FROM accounts WHERE id = 1 FOR UPDATE;   -- lock row
--- ... работа ...
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
+-- работа с данными
 UPDATE accounts SET balance = ... WHERE id = 1;
-COMMIT;   -- lock released
+COMMIT;
 ```
 
-Плюсы:
-- Гарантия — никто не изменит.
-- Простая логика.
-
-Минусы:
-- Блокирует других.
-- Deadlock возможен.
-- Плохо масштабируется.
-
-### 8.2 Optimistic (`@Version`)
-
-Проверка версии при UPDATE.
+Optimistic locking через @Version добавляет version column к entity. При UPDATE проверяется version — если не совпадает значит кто-то опередил, retry требуется. В JPA автоматически через @Version аннотацию.
 
 ```sql
 UPDATE accounts SET balance = ..., version = version + 1
     WHERE id = 1 AND version = 5;
--- если 0 rows updated → кто-то опередил → retry
+-- если 0 rows updated — конфликт, retry
 ```
 
-В JPA — автоматически через `@Version` поле.
+Плюсы optimistic. Не блокирует читателей — concurrent reads без issues. Хорошо масштабируется — только conflicting writes требуют retry. Быстро когда конфликты редки.
 
-Плюсы:
-- Не блокирует читателей.
-- Хорошо масштабируется.
-- Быстро.
+Минусы. Приложение должно обрабатывать retry — сложность в коде. Работает только для сценариев с редкими конфликтами — если конфликты частые overhead retry превышает savings.
 
-Минусы:
-- Приложение должно handle retry.
-- Работает только для «редко конфликтующих» сценариев.
+Практический выбор. Optimistic для обычных CRUD с редкими конфликтами. Pessimistic для критичных операций вроде counters, deposits, financial transactions где ordering критичен и корректность важнее throughput.
 
-### 8.3 Что выбрать
+## Транзакции в микросервисах
 
-- **Optimistic** — обычные CRUD, редкие конфликты.
-- **Pessimistic** — счётчики, deposits, финансовые операции.
+Локальные транзакции внутри одного сервиса и одной БД — обычные @Transactional, ничего сложного. Всё описанное выше применимо напрямую.
 
----
+Между сервисами XA практически не используется. Saga или Outbox pattern стандартный подход. Local transactions in each service плюс coordination через events.
 
-## 9. Транзакции в микросервисах
+Между БД и message broker (Kafka или Rabbit) обычно Outbox. Kafka имеет свои transactions но координация с БД всё равно через outbox для reliability.
 
-### 9.1 Локальные
+Идемпотентность как обязательное свойство. Retry делает атомарность условной — операция может выполниться несколько раз. Consumer должен быть идемпотентен через unique keys или conditional updates. Без идемпотентности любая retry ситуация приводит к duplication.
 
-Внутри одного сервиса + одна БД — обычная tx. Ничего сложного.
+## Реальные примеры
 
-### 9.2 Между сервисами — Saga / Outbox
-
-XA практически не используется. Всё через events / compensations.
-
-### 9.3 Между БД + брокер (Kafka/Rabbit)
-
-**Outbox** — уже обсуждали.
-
-Kafka имеет свои transactions (см. `42-kafka-prod`) — но с БД координацию всё равно через outbox.
-
-### 9.4 Идемпотентность
-
-Retry делает атомарность условной. Consumer должен быть идемпотентен (см. `21-rabbitmq-delivery-guarantees.md`).
-
----
-
-## 10. Реальные примеры
-
-### 10.1 Правильный банк-перевод (одна БД)
-
+Правильный банк-перевод в одной БД:
 ```sql
 BEGIN;
 SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;
--- проверка баланса
+-- проверка баланса на достаточность
 UPDATE accounts SET balance = balance - 100 WHERE id = 1;
 UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 COMMIT;
 ```
 
-Pessimistic lock. `READ COMMITTED` достаточно.
+Pessimistic lock через FOR UPDATE предотвращает concurrent modifications. READ COMMITTED достаточен потому что операции короткие и на конкретных строках.
 
-### 10.2 Правильный банк-перевод через events (микросервисы)
+Правильный банк-перевод через events для микросервисов. POST /transfer вызывает account-service который делает local tx списание с account 1 плюс INSERT в outbox запись TransferInitiated. Job публикует TransferInitiated в Kafka. account-service (или другой) consumer в local tx делает зачисление на account 2 плюс INSERT TransferCompleted. Job публикует TransferCompleted.
 
-1. `POST /transfer` → account-service local tx: списание с account 1 + INSERT в outbox `TransferInitiated`.
-2. Job публикует `TransferInitiated` в Kafka.
-3. account-service (или другой) consumer → local tx: зачисление на account 2 + INSERT `TransferCompleted`.
-4. Job публикует `TransferCompleted`.
+При неудаче зачисления — publish TransferFailed event. account-service обрабатывает event через compensation — возвращает деньги на account 1.
 
-Компенсация: при неудаче зачисления → publish `TransferFailed` → account-service возвращает деньги.
+## Итоги
 
----
+ACID это четыре гарантии transactions — Atomicity через WAL, Consistency через constraints, Isolation через locks или MVCC, Durability через fsync.
 
-## 11. Собесные вопросы
+Четыре уровня изоляции представляют trade-offs. READ UNCOMMITTED быстрый но небезопасный. READ COMMITTED default практичный. REPEATABLE READ для consistent multiple reads. SERIALIZABLE для write skew scenarios с retry logic.
 
-1. **Что такое ACID?** — Atomicity/Consistency/Isolation/Durability.
-2. **Уровни изоляции SQL?** — READ UNCOMMITTED, READ COMMITTED, REPEATABLE READ, SERIALIZABLE.
-3. **Что такое dirty read?** — Чтение незакоммиченных изменений.
-4. **Non-repeatable vs phantom read?** — Non-repeatable — изменённая строка; phantom — появилась/пропала по условию.
-5. **Default уровень PG?** — READ COMMITTED.
-6. **Почему PG REPEATABLE READ строже стандарта?** — MVCC snapshot, phantom тоже недоступны.
-7. **Что такое lost update, как избежать?** — Optimistic (@Version) или pessimistic (SELECT FOR UPDATE).
-8. **Propagation типы?** — REQUIRED, REQUIRES_NEW, NESTED, MANDATORY, SUPPORTS, NOT_SUPPORTED, NEVER.
-9. **REQUIRED vs REQUIRES_NEW?** — REQUIRED = участвует или создаёт; REQUIRES_NEW = всегда новая (suspend внешней).
-10. **NESTED — как?** — Savepoint внутри внешней tx; rollback возвращает к savepoint.
-11. **Что такое 2PC / XA?** — Distributed tx: prepare + commit; медленно, редко используется.
-12. **Что такое Saga?** — Compensation-based distributed tx; локальные tx + compensating actions.
-13. **Что такое outbox pattern?** — Атомарный commit БД + запись в outbox → job публикует.
-14. **Optimistic vs pessimistic locking — когда что?** — Optimistic для редких конфликтов (CRUD); pessimistic для критичных (счётчики).
-15. **Что такое MVCC?** — Многоверсионный concurrency control; читатели не блокируют писателей.
+PostgreSQL MVCC даёт читателям snapshot без блокировок писателей. Реализация через xmin/xmax системные columns и snapshot management per transaction или per statement.
 
----
+Семь propagation типов покрывают различные сценарии combining transactions. REQUIRED default. REQUIRES_NEW для independent operations. NESTED для savepoint-based error recovery. Остальные для специфических cases.
 
-## Итог
+Distributed transactions через XA и 2PC избегать в микросервисах. Saga plus Outbox pattern предпочтительнее — local transactions plus event-driven coordination.
 
-- **ACID** — 4 гарантии транзакций.
-- **4 уровня изоляции**, компромисс скорость/строгость. PG default = READ COMMITTED.
-- **MVCC** в PG — читатели не блокируют писателей.
-- **7 propagation** типов — REQUIRED default, REQUIRES_NEW / NESTED для особых случаев.
-- **XA / 2PC** — избегать в микросервисах. Используй Saga + Outbox.
-- **Optimistic locking** (`@Version`) — стандарт для UPDATE.
-- **Идемпотентность** = обязательное свойство consumer'ов.
+Optimistic locking через @Version стандарт для UPDATE в concurrent scenarios с редкими конфликтами. Pessimistic locking через SELECT FOR UPDATE для критичных операций с частыми conflicts.
 
-Следующий — `33-transactional-internals.md`.
+Идемпотентность обязательное свойство в message-based системах. Retry возможен всегда, идемпотентность предотвращает duplication effects.
+
+Дальше — @Transactional изнутри, как Spring реально implements через AOP proxies и PlatformTransactionManager.
