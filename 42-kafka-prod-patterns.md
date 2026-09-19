@@ -1,46 +1,42 @@
-# 42. Kafka в проде: transactions, exactly-once, monitoring
+# 42. Kafka в production: transactions, exactly-once, monitoring, распространённые issues
 
-Distributed transactions в Kafka, exactly-once, мониторинг, типовые проблемы.
+## Зачем углубляться в production paradigms
 
----
+В предыдущих файлах разобрали Kafka как distributed log с brokers, topics, partitions, offsets. Разобрали Spring Kafka abstractions с KafkaTemplate, @KafkaListener, error handling. Этой глубины достаточно чтобы поднять working Kafka pipeline. Но production reality приносит classes проблем которые не проявляются в testing environments. Что делать если producer нужно писать в несколько partitions atomically? Как реально достичь exactly-once semantics когда tools promise это в specific circumstances only? Что происходит когда consumer suddenly starts lagging и alerts fire — как diagnose и fix? Как настроить monitoring чтобы problem detected before customer notices?
 
-## 1. Kafka transactions
+Разница между разработчиком «использующим Kafka» и «понимающим production Kafka» очень заметна именно здесь. Первый deploys Kafka, sees green metrics, considers done. Второй знает что consumer lag это key operational metric — growing lag indicates capacity problem или downstream issue requiring action. Знает что UnderReplicatedPartitions > 0 warning об imminent risk of data loss. Знает что exactly-once semantics в Kafka работают только within Kafka boundaries — writing к external database требует Outbox pattern не Kafka transactions. Знает что rebalancing storms usually cause slow consumer processing exceeding max.poll.interval.ms — fix через adjusting timeout или reducing batch size.
 
-### 1.1 Проблема
+В этом файле разберём production concerns деятельностью. Kafka transactions detailed — что реально делают, requirements, semantics с consumers. Exactly-once semantics — три подхода (idempotent producer, transactional producer, EOS в streams) plus fundamental limitations на external systems. Comprehensive monitoring — что мониторить на broker/topic/consumer/producer levels. Consumer lag deeper investigation. Common issues и их fixes — rebalancing storms, hot partitions, poison pills, duplicate messages, missing messages. Kafka Streams и Connect как higher-level patterns. Schema Registry для schema evolution. Best practices deployment.
 
-Producer шлёт много сообщений в разные partitions. Между ними может упасть → **atomicity нарушена** (часть отправлена, часть нет).
+## Kafka transactions detailed
 
-Consumer читает → обрабатывает → write в другой topic → commit offset. Между шагами может упасть → **дубли или потери**.
+Проблема которую решают Kafka transactions. Producer sends multiple messages в разные partitions. Между sends может произойти crash. Atomicity нарушена — часть sent, часть нет. Downstream systems see partial state.
 
-### 1.2 Идея транзакций
+Пример scenario. Order service publishes OrderCreated к «orders» topic plus PaymentRequested к «payments» topic per order. Consumer processing orders must correlate с payments. Если сrash после «orders» send но перед «payments» — payment service никогда не knows about order. Data inconsistency.
 
-Всё что происходит внутри `beginTransaction ... commitTransaction` — **атомарно**:
-- Все sends в разные partitions.
-- Commit offsets для нескольких partitions.
+Kafka transactions предоставляют atomic multi-partition writes. Всё что происходит внутри beginTransaction/commitTransaction — либо celiком visible к read_committed consumers, либо не visible вовсе. Either both partitions get their messages, either neither does.
 
-Транзакция либо целиком видна consumer'ам (с `isolation.level=read_committed`), либо не видна.
+Setup requires transactional producer configuration. transactional.id это identifier — уникальный per producer instance, stable across restarts. При startup producer.initTransactions() coordinates с broker — resumes any pending transactions from previous incarnation, aborts им если needed.
 
-### 1.3 Настройка producer
-
+Configuration in Spring Kafka:
 ```yaml
 spring.kafka.producer:
   transaction-id-prefix: tx-orders-
 ```
 
-Или руками:
+Spring generates unique IDs based on prefix. Stability across restarts requires deterministic ID generation — usually based on host/pod identity.
+
+Или manual configuration:
 ```properties
 enable.idempotence=true
 acks=all
 transactional.id=tx-orders-{host}-{pid}
 ```
 
-**`transactional.id`** должен быть уникальный per producer instance и **стабильный между рестартами** (для recovery).
-
-### 1.4 Использование
-
+Usage паттерн. Каждая transaction — beginTransaction, sends, commit or abort:
 ```java
 KafkaProducer<String, Object> producer = ...;
-producer.initTransactions();   // один раз при старте
+producer.initTransactions();   // один раз при startup
 
 try {
     producer.beginTransaction();
@@ -52,49 +48,34 @@ try {
 }
 ```
 
-В Spring:
+В Spring через @Transactional:
 ```java
-@Autowired KafkaTemplate<String, Object> template;
-
 @Transactional("kafkaTransactionManager")
 public void publishAtomic() {
     template.send("orders", event1);
     template.send("payments", event2);
-    // если бросит → abortTransaction
+    // если бросит exception → abort
 }
 ```
 
-### 1.5 Consumer read_committed
-
+Consumer side для видимости committed transactions:
 ```properties
 isolation.level=read_committed
 ```
 
-Consumer видит только commit'нутые транзакции. Aborted — пропускаются. Uncommitted — пока не видит.
+Read_committed consumer видит только committed transactions. Aborted — completely invisible. Uncommitted — пока не visible до commit signal.
 
-**Замедляет latency** — consumer ждёт commit чтобы отдать.
+Trade-off. Adds latency — consumer ждёт transaction completion before delivering messages. Aborted transactions increase overhead. Coordination between transactional producer и consumer requires additional protocol messages.
 
-`isolation.level=read_uncommitted` (default) — видит всё, включая aborted (нет транзакций → быстрее).
+Read_uncommitted (default) видит всё включая aborted transactions. Faster because no waiting. But receives messages that will be aborted — downstream processing must handle этого. Rarely appropriate когда transactions used.
 
----
+## Exactly-once semantics полностью
 
-## 2. Exactly-Once Semantics (EOS)
+EOS (Exactly-Once Semantics) наиболее confusing part Kafka semantics. Requires understanding what exactly is guaranteed and what isn't.
 
-### 2.1 Что нужно
+Что нужно для EOS. Idempotent producer через enable.idempotence=true — no duplicates в single partition при retries. Transactional producer — atomic writes в multiple partitions. Consumer с isolation.level=read_committed — reading only committed transactions. Consume plus process plus produce plus commit offset в one transaction.
 
-- **Idempotent producer** (`enable.idempotence=true`).
-- **Transactional producer** — atomic writes в несколько partitions.
-- **Consumer с `read_committed`**.
-- **Consume + process + produce + commit offset** в одной транзакции.
-
-### 2.2 Stream processing (Kafka Streams)
-
-Классический pattern для EOS:
-```
-Read from topic A → process → Write to topic B → Commit offset A
-```
-
-Всё в одной Kafka-транзакции:
+Classical stream processing pattern для EOS. Read from input topic — process — write to output topic — commit input offset. All в one transaction:
 ```java
 producer.beginTransaction();
 try {
@@ -111,61 +92,60 @@ try {
 }
 ```
 
-Kafka Streams делает это автоматически с `processing.guarantee=exactly_once_v2`.
+Что происходит atomically. Все send calls к output topic. Consumer offset commit для input topic. Either все committed together, либо все aborted. Exactly-once semantics — каждый input record produces exactly one output record even under failures.
 
-### 2.3 Кавет — не всё exactly-once
+Kafka Streams делает это автоматически с processing.guarantee=exactly_once_v2. Framework обеспечивает EOS transparently для stream applications. Recommended approach для complex stream processing needing EOS.
 
-EOS работает **только внутри Kafka**. Если consumer:
-- Пишет в внешнюю БД,
-- Или вызывает внешний API,
+Fundamental limitation — EOS работает только внутри Kafka. Если consumer:
+- Пишет в внешнюю БД (PostgreSQL, MongoDB, etc)
+- Или вызывает внешний API
+- Или отправляет email/SMS
 
-— это не покрывается Kafka-транзакцией → **идемпотентность обязательна**.
+— это НЕ покрывается Kafka-транзакцией. Kafka transaction commits после DB write — если между DB write и Kafka commit crash — DB has data, Kafka message uncommitted, on retry re-executed DB write создаёт duplicate.
 
-Для БД + Kafka правильно — **outbox pattern**:
-1. В одной DB-tx: сохранить + запись в outbox.
-2. Отдельный producer читает outbox → публикует в Kafka.
+Для БД plus Kafka правильно — Outbox pattern. В одной DB transaction: сохранить business data plus запись в outbox таблицу. Отдельный producer читает outbox, публикует в Kafka, marks record as published. Atomicity через DB transaction. Publish eventually happens after successful commit.
 
----
+Outbox provides at-least-once delivery к Kafka. Combined с идемпотентностью consumer — effective exactly-once для business perspective. Simpler than trying stretch Kafka transactions к external systems.
 
-## 3. Мониторинг
+## Comprehensive monitoring
 
-### 3.1 Что мониторить
+Broker level metrics критичны для operational awareness cluster health.
 
-**Broker level**:
-- **UnderReplicatedPartitions** — сколько partitions не полностью реплицированы. > 0 → тревога.
-- **OfflinePartitionsCount** — partition без leader. > 0 → критично.
-- **ActiveControllerCount** — должен быть 1 в кластере.
-- **NetworkProcessorAvgIdlePercent** — если <30% → перегружен.
-- **RequestHandlerAvgIdlePercent** — то же для request handler.
-- **BytesInPerSec / BytesOutPerSec** — трафик.
+UnderReplicatedPartitions — сколько partitions currently not fully replicated. Some replicas lagging behind leader beyond threshold. > 0 warning об imminent data loss risk. Investigation required — replica broker health, network between brokers, disk capacity на affected brokers.
 
-**Topic level**:
-- **MessagesInPerSec**.
-- **BytesInPerSec / BytesOutPerSec**.
-- **PartitionCount**.
-- **LogSize** — размер на диске.
+OfflinePartitionsCount — partition без leader. > 0 критично — эти partitions completely unavailable for read/write. Usually indicates severe broker failures или configuration issue. Data unavailable to consumers, producers cannot write.
 
-**Consumer level**:
-- **Lag** — сколько отстал consumer от producer (см. §3.3).
-- **CommitLatency**.
+ActiveControllerCount — должен быть exactly 1 в cluster. Multiple controllers indicates split-brain situation. Zero controllers indicates cluster без coordinator — administrative operations fail.
 
-**Producer level**:
-- **RecordSendRate**.
-- **RecordErrorRate**.
-- **RequestLatency**.
+NetworkProcessorAvgIdlePercent — если <30% network processors перегружены — brokers cannot handle traffic. Scale-up needed. RequestHandlerAvgIdlePercent similar но для request handling threads.
 
-### 3.2 Инструменты
+BytesInPerSec/BytesOutPerSec — network traffic per broker. Uneven distribution indicates hot brokers requiring rebalancing.
 
-- **JMX** — Kafka экспортирует метрики через JMX.
-- **JMX Exporter** для Prometheus.
-- **Confluent Control Center** (commercial).
-- **Kafka Manager / CMAK** (UI).
-- **Cruise Control** — automated rebalancing.
+Topic level metrics per-topic insights. MessagesInPerSec — production rate. BytesInPerSec/BytesOutPerSec — data volume. PartitionCount — configuration verification. LogSize — disk usage на broker. Alerting on LogSize approaching capacity предотвращает disk full incidents.
 
-### 3.3 Consumer lag
+Consumer level metrics критично для health processing pipeline.
 
-**Lag** = `latest_offset (producer) - current_offset (consumer)`.
+Lag — сколько отстал consumer от producer. Most important operational metric. Growing lag indicates consumer cannot keep up с production rate. Detailed section below.
 
+CommitLatency — время commit operations. Growing latency indicates coordinator issues или network problems.
+
+Producer level metrics. RecordSendRate — sending rate. RecordErrorRate — errors per second. Growing errors indicate configuration issues или broker problems. RequestLatency — время responses от brokers.
+
+## Tools для monitoring
+
+JMX это Kafka's native monitoring interface. All metrics exposed через JMX MBeans. Standard Java Management Extensions.
+
+JMX Exporter конвертирует JMX metrics в Prometheus format. Deployed as sidecar или agent. Configures which JMX metrics to expose plus how to rename/label.
+
+Confluent Control Center — commercial GUI от Confluent (создатели Kafka). Rich monitoring, alerting, cluster management. License required.
+
+Kafka Manager (CMAK) — open source management UI. Community-maintained. Basic topic/broker/consumer group operations. Free alternative.
+
+Cruise Control — automated rebalancing. Detects broker imbalance, generates reassignment plans, executes gradually. Reduces operational burden manual rebalancing.
+
+## Consumer lag investigation
+
+Lag = latest_offset (producer) - current_offset (consumer). Как sees command-line:
 ```bash
 kafka-consumer-groups.sh --bootstrap-server broker:9092 \
     --describe --group my-group
@@ -175,114 +155,119 @@ my-group        orders  0          10500           10520           20
 my-group        orders  1          10480           10500           20
 ```
 
-Растущий lag = consumer не догоняет.
+CURRENT-OFFSET consumer's current position. LOG-END-OFFSET latest position в topic. LAG difference.
 
-Диагностика:
-- Медленный процессинг → thread dump.
-- Мало consumers → добавить (до max = partitions count).
-- Downstream (БД, API) тормозит.
-- Rebalance loop.
+Growing lag = consumer не догоняет. Investigation.
 
-### 3.4 Prometheus + Grafana
+Медленный процессинг. Thread dump consumer showing where time spent. Обычно external calls внутри processing loop — database queries, HTTP calls. Optimize downstream или add async processing.
 
-Grafana dashboards (community):
-- **Kafka Overview** — broker metrics.
-- **Kafka Consumer** — per-group lag.
-- **Kafka Producer** — send rates.
+Мало consumers. Increase concurrency до количества partitions. Beyond partition count no benefit — extra consumers idle.
 
-Alerts:
-- Lag > 10000 на любой partition.
-- UnderReplicatedPartitions > 0.
-- OfflinePartitionsCount > 0.
-- Broker down.
+Мало partitions. Cannot добавить больше consumers чем partitions. Requires topic reconfiguration — create new topic с more partitions plus migrate data. Cannot change partition count on existing topic without data reshuffling.
 
----
+Downstream tormoзит. Database saturated. External API rate-limited. Cache misses. Investigation goes down to root cause.
 
-## 4. Типовые проблемы
+Rebalance loop. Consumers unstable — coordinator constantly rebalancing. Fix через увеличения max.poll.interval.ms или switching к CooperativeStickyAssignor.
 
-### 4.1 Rebalancing storm
+## Prometheus plus Grafana
 
-Постоянные rebalance → группа не потребляет.
+Standard monitoring stack. JMX Exporter scrapes metrics from brokers. Prometheus scrapes JMX Exporter endpoint. Grafana visualizes.
 
-Причины:
-- Consumer долго обрабатывает batch → `max.poll.interval.ms` истёк → dead → rebalance → снова.
-- Нестабильные consumers (падают).
-- Cluster нестабилен.
+Grafana community dashboards доступны для Kafka. Kafka Overview показывает broker metrics. Kafka Consumer per-group lag с partition-level detail. Kafka Producer send rates и errors.
 
-Fix:
-- Уменьшить `max.poll.records` или увеличить `max.poll.interval.ms`.
-- **CooperativeStickyAssignor** — incremental rebalance без freeze всей группы.
-- Стабилизировать consumers.
+Alerts критичные для operational awareness. Lag больше 10000 на любую partition — investigate. UnderReplicatedPartitions > 0 — investigate replication. OfflinePartitionsCount > 0 — critical, immediate action. Broker down — page on-call. Disk usage approaching capacity — expand storage.
 
-### 4.2 Hot partition
+## Rebalancing storm
 
-Одна partition принимает большинство трафика → перегружена, другие пусты.
+Постоянные rebalance — группа не потребляет. Diagnostic pattern.
 
-Причины:
-- Плохой ключ (например, `country_code` где 90% "KZ").
-- Skewed data.
+Причины обычно взаимосвязанные. Consumer processes batch too long — exceeds max.poll.interval.ms default 5 minutes. Coordinator marks consumer dead. Rebalance triggered. Consumer reassigned partitions. Continues slow processing. Repeat.
 
-Fix:
-- Sharding ключа (например, `country_code + hash(user_id) % 10`).
-- Custom partitioner.
+Fix strategies. Уменьшить max.poll.records с default 500 к 100 или 50. Smaller batches complete faster. Увеличить max.poll.interval.ms если processing genuinely slow. But not indefinitely — too high delays failure detection.
 
-### 4.3 Slow consumer
+CooperativeStickyAssignor incremental rebalance не полный freeze всей группы. Consumers gradually reassigned один за одним. Significantly reduces impact rebalance events.
 
-Consumer сильно медленнее producer → lag растёт.
+Stabilize consumers. Investigate crashes causing false failures. Fix underlying processing issues. Ensure consumer application stable.
 
-Fix:
-- Больше consumers (до количества partitions).
-- Batch-обработка.
-- Async processing внутри consumer.
-- Оптимизация downstream (БД, API).
+## Hot partition
 
-### 4.4 Poison pill
+Одна partition принимает большинство трафика — перегружена, другие пустуют. Common issue при uneven key distribution.
 
-Некорректное сообщение → deserializer fails → consumer stuck.
+Причины. Плохой ключ — например country_code где 90% "KZ". Skewed data distribution — some users значительно more active than others.
 
-Fix: `ErrorHandlingDeserializer` (см. `41-spring-kafka.md`).
+Impact. One partition consumer overloaded. Other consumers idle. Effective throughput limited by hot partition capacity даже если infrastructure could handle much more.
 
-### 4.5 Duplicate messages
+Fix strategies. Sharding ключа — вместо country_code use country_code plus hash(user_id) % 10. Splits KZ traffic across 10 partitions.
 
-Consumer crash между process и commit → сообщение обрабатывается снова.
+Custom partitioner для complex routing logic. Sometimes business need routing patterns не conveniently expressible через key hashing.
 
-Fix: **идемпотентность consumer'а** (processed table, UPSERT, conditional UPDATE).
+Sometimes redesign fundamental. Не use natural id как key if distribution uneven. Composite keys balancing distribution vs ordering requirements.
 
-### 4.6 Missing messages
+## Slow consumer
 
-- `acks=0` или `acks=1` + leader упал до replication → потеря.
-- Consumer commit'нул offset до обработки → crash → пропуск.
+Consumer сильно медленнее producer. Lag растёт. Manifested через increasing lag metric.
 
-Fix: `acks=all` + `min.insync.replicas=2` + commit после обработки.
+Fix strategies проходят escalation ladder.
 
-### 4.7 Disk full
+Больше consumers. Up to partition count. Simple первый шаг.
 
-Kafka заполнил диск → broker падает.
+Batch-обработка. Process multiple records в one operation. Bulk database inserts, bulk API calls. Reduces per-message overhead.
 
-Fix:
-- Retention меньше.
-- Больше дисков.
-- Мониторинг с alert на free space.
+Async processing внутри consumer. Consumer thread only polls plus dispatches. Actual work в thread pool. Кавет — теряется partition ordering.
 
-### 4.8 Networked issue
+Оптимизация downstream. Slow database? Add indexes, tuning queries. Slow API? Investigate downstream provider capacity.
 
-Broker down → controller election → пауза → пока новый leader.
+## Poison pill
 
-Мониторить `LeaderElectionRateAndTimeMs`.
+Некорректное сообщение — deserializer fails на каждый poll. Consumer stuck — cannot progress past bad message. Same offset polled forever.
 
----
+Fix через ErrorHandlingDeserializer как обсуждали в файле 41. Wraps actual deserializer. Deserialization exceptions attached к record. Record delivered к listener with null payload plus exception header. DefaultErrorHandler routes to DLT.
 
-## 5. Kafka Streams (обзор)
+Bad message safely goes to DLT для manual review. Consumer continues с next message. No stuck.
 
-Библиотека для stream processing.
+## Duplicate messages
 
-Возможности:
-- Filter, map, flatMap.
-- Joins (streams-to-streams, streams-to-table).
-- Aggregations (count, sum, custom).
-- Windowing (tumbling, hopping, session).
-- Stateful processing (RocksDB как local state).
-- Exactly-once semantics.
+Consumer crash между process и commit — сообщение обрабатывается снова. Fundamental characteristic at-least-once semantics.
+
+Fix mandatory — идемпотентность consumer'а. Processed table checking messageId. UPSERT operations. Conditional UPDATE clauses. Each processed message idempotent — repeated execution not changing state beyond first execution.
+
+Не workaround через complex retry logic. Fundamental design pattern — accepting duplicates possible, ensuring processing safe under duplicates.
+
+## Missing messages
+
+Two main causes.
+
+acks=0 или acks=1 plus leader crashes до replication на followers. Message accepted by leader, follower replication pending, leader crashes. New leader elected from followers doesn't have message. Message lost.
+
+Fix — acks=all plus min.insync.replicas=2. Producer waits для replication к at least 2 ISR before считает send successful.
+
+Consumer commit'нул offset до обработки — crash — пропуск. Auto-commit или incorrect ordering в manual commit code.
+
+Fix — always commit после processing, not before. Manual commit configuration.
+
+Combined solution — acks=all + min.insync.replicas=2 + commit after processing plus idempotent consumer. Complete reliability guarantee.
+
+## Disk full
+
+Kafka заполнил диск — broker падает. Common issue при high volume plus slow retention cleanup.
+
+Причины. Retention периоды больше чем available disk allows. Producer accelerated без reviewing capacity. Failed retention cleanup из-за bug или incorrect configuration.
+
+Fix. Retention меньше — быстрее удаление старых messages. Больше дисков — expand storage. Monitoring с alert на free space threshold — action taken перед hitting full.
+
+Preventive — capacity planning based on ожидаемого throughput plus retention. Regular monitoring disk usage trends.
+
+## Networked issue
+
+Broker down — controller election — пауза — пока новый leader elected для partitions на dead broker. Consumers/producers experience temporary unavailability.
+
+Monitoring LeaderElectionRateAndTimeMs shows how quickly recoveries happen. Long times indicate network issues или broker misconfiguration.
+
+## Kafka Streams обзор
+
+Библиотека для stream processing поверх Kafka. Declarative API для transformations.
+
+Возможности. Filter, map, flatMap — basic transformations. Joins — streams-to-streams, streams-to-table. Aggregations — count, sum, custom. Windowing — tumbling (fixed non-overlapping), hopping (overlapping), session (dynamic based on activity). Stateful processing — RocksDB как local state store. Exactly-once semantics built-in.
 
 Пример:
 ```java
@@ -298,70 +283,43 @@ ordersPerCustomer.toStream().to("customer-orders-count");
 new KafkaStreams(builder.build(), config).start();
 ```
 
-Использование: real-time aggregations, ETL, event sourcing.
+Использование. Real-time aggregations — computing metrics from event stream. ETL — transforming events between different formats. Event sourcing — computing state from event history.
 
-Альтернативы: Apache Flink (мощнее, сложнее), Spark Streaming, ksqlDB (SQL over Kafka).
+Альтернативы. Apache Flink мощнее, сложнее. Spark Streaming для batch-like processing. ksqlDB — SQL over Kafka для non-programmers.
 
----
+## Kafka Connect обзор
 
-## 6. Kafka Connect
+Framework для интеграции Kafka с external systems. No custom code required для common integrations.
 
-Framework для интеграции Kafka с external systems.
+Source connectors — читают из DB/файлов/API — пишут в Kafka. Пример Debezium — CDC (Change Data Capture) из PostgreSQL/MySQL к Kafka. Real-time propagation database changes.
 
-**Source connectors** — читают из DB/файлов/API → пишут в Kafka.
+Sink connectors — читают из Kafka — пишут в DB/Elastic/S3. Various pre-built connectors. Elasticsearch sink для indexing events. JDBC sink для writing back к databases. S3 sink для archival.
 
-Пример: **Debezium** — CDC (Change Data Capture) из PostgreSQL/MySQL → Kafka.
+Config через REST API. Deploy как отдельный process или distributed cluster. Fault-tolerant — connector restarts on failures.
 
-**Sink connectors** — читают из Kafka → пишут в DB/Elastic/S3/...
+Использование. Интеграция без своего кода — common patterns supported ready-made connectors. Reduce custom development for standard integration patterns.
 
-Config через REST. Deploy как отдельный process или distributed cluster.
+## Schema Registry
 
-Использование: интеграция без своего кода.
+Централизованное хранилище schemas (Avro/Protobuf/JSON Schema). Confluent product though open source version available.
 
----
+Producer публикует schema в registry — каждое сообщение содержит schema ID. Consumer читает schema ID — получает schema — десериализует.
 
-## 7. Schema Registry (Confluent)
+Плюсы. Schema evolution — backward/forward compatibility rules enforced. Adding fields safe. Removing fields может ломать consumers depending on compatibility mode. Валидация schemas prevent malformed data entering topics. Компактные сообщения — schema один раз в registry, не в каждом message.
 
-Централизованное хранилище schemas (Avro/Protobuf/JSON Schema).
+Compatibility modes определяют allowed changes. BACKWARD — new consumer can read old data. FORWARD — old consumer can read new data. FULL — both directions. NONE — no compatibility guarantees.
 
-Producer публикует schema в registry → каждое сообщение содержит **schema ID**. Consumer читает schema ID → получает schema → десериализует.
+Обязателен для Avro в prod. Managing schemas manually нереально в scale.
 
-Плюсы:
-- Schema evolution (backward/forward compatibility).
-- Валидация schemas.
-- Компактные сообщения (schema один раз, не в каждом).
+## Deployment best practices
 
-Обязателен для Avro в проде.
+Cluster sizing. Минимум 3 broker (replication factor 3). Минимум 3 Zookeeper или KRaft controllers. Больше при нужде для throughput scaling или fault tolerance.
 
----
+Retention. Обычные topics 7-30 дней. Компакция для KV forever plus periodic compaction. Мониторить disk usage.
 
-## 8. Deployment best practices
+Topics. Названия по конвенции — `<domain>.<entity>.<action>` например `knp.order.created`. Consistent naming позволяет easier discovery и filtering. Создание с partitions=X replication-factor=3 min.insync.replicas=2 для production reliability.
 
-### 8.1 Cluster sizing
-
-Минимум:
-- 3 broker (replication factor 3).
-- 3 Zookeeper / KRaft controllers.
-
-Для нагрузки:
-- +brokers для throughput.
-- +partitions для параллелизма.
-
-### 8.2 Retention
-
-- Обычные topics: 7-30 дней.
-- Компакция для KV: forever + compaction.
-- Мониторить disk usage.
-
-### 8.3 Topics
-
-Названия по конвенции: `<domain>.<entity>.<action>` (например `knp.order.created`).
-
-Создание с `partitions=X replication-factor=3 min.insync.replicas=2`.
-
-### 8.4 Producer settings
-
-Продовые:
+Producer settings production:
 ```
 acks=all
 enable.idempotence=true
@@ -370,9 +328,7 @@ linger.ms=10
 batch.size=32768
 ```
 
-### 8.5 Consumer settings
-
-Продовые:
+Consumer settings production:
 ```
 enable.auto.commit=false
 isolation.level=read_committed          # если producer transactional
@@ -381,69 +337,54 @@ session.timeout.ms=30000
 heartbeat.interval.ms=10000
 ```
 
-### 8.6 JVM
-
-Kafka на JVM: heap 6 GB (не больше — Kafka использует OS page cache).
+JVM tuning. Kafka use OS page cache extensively. Не давать всё memory к heap — leave for page cache. Heap 6 GB usually enough. Остальная RAM — OS cache.
 
 ```
 -Xms6g -Xmx6g -XX:+UseG1GC -XX:MaxGCPauseMillis=20
 ```
 
-Остальная RAM — OS кэш.
+G1GC preferred over CMS/Parallel для Kafka. Consistent short pauses better than throughput-optimized collectors.
 
----
+## Когда Kafka vs Rabbit vs alternatives
 
-## 9. Когда Kafka vs Rabbit vs (SQS / NATS / ...)
+Kafka — high throughput, event streaming, replay, exactly-once, log compaction. Wide adoption для event-driven architectures.
 
-- **Kafka** — high throughput, event streaming, replay, exactly-once, log compaction.
-- **Rabbit** — task queues, complex routing, priority.
-- **SQS** — managed, простые очереди, exactly-once (FIFO).
-- **NATS** — легковесный, low-latency messaging.
-- **Redis Streams** — простой event log поверх Redis.
-- **Pulsar** — Kafka++ (tiered storage, multi-tenancy), сложнее.
+RabbitMQ — task queues, complex routing, priority. Better для command-style messaging.
 
-Для типового ИСНА scenario — Rabbit (уже используется).
+SQS — managed AWS, простые очереди, exactly-once (FIFO). Cloud-native choice.
 
----
+NATS — легковесный, low-latency messaging. Alternative для simple scenarios не needing Kafka's features.
 
-## 10. Собесные вопросы
+Redis Streams — простой event log поверх Redis. Convenient если Redis already deployed.
 
-1. **Что даёт Kafka transactions?** — Atomic writes в несколько partitions + atomic offset commit.
-2. **Как настроить exactly-once producer?** — `enable.idempotence=true` + `transactional.id` + `initTransactions` + `beginTransaction/commit`.
-3. **Что делает read_committed на consumer?** — Видит только commit'нутые транзакции; latency ↑, no duplicates от abort.
-4. **Разница idempotent и transactional producer?** — Idempotent: no duplicates в одной partition; transactional: atomic writes в несколько partitions.
-5. **Что такое consumer lag?** — Разница latest offset producer'а и current offset consumer'а; растущий = отстаёт.
-6. **Как избежать rebalancing storm?** — CooperativeStickyAssignor, увеличить max.poll.interval.ms, стабильные consumers.
-7. **Что такое hot partition?** — Одна partition принимает большую часть трафика; sharding ключа лечит.
-8. **Как обеспечить no data loss в Kafka?** — acks=all + min.insync.replicas=2 + idempotent + replication.factor=3.
-9. **Что такое Kafka Streams?** — Library для stream processing над Kafka; stateful, joins, aggregations, EOS.
-10. **Что такое Kafka Connect?** — Framework для integration Kafka с external systems (Debezium CDC, S3 sink, ...).
-11. **Что такое Schema Registry?** — Централизованное хранилище schemas (Avro), schema evolution.
-12. **Ключевые метрики broker?** — UnderReplicatedPartitions, OfflinePartitions, ActiveControllerCount.
-13. **Как обеспечить exactly-once с БД + Kafka?** — Outbox pattern (не Kafka transactions между БД и Kafka).
-14. **Alerting на что?** — Consumer lag > threshold, UnderReplicated > 0, broker down, disk full.
-15. **Kafka vs Rabbit — когда что?** — Kafka: high throughput, streaming, replay; Rabbit: task queues, complex routing.
+Pulsar — Kafka++ (tiered storage, multi-tenancy), сложнее. Newer alternative gaining adoption.
 
----
+Для типового КНП scenario — Rabbit уже используется. Introduction Kafka не мотивирован если Rabbit satisfies needs.
 
-## Итог
+## Итоги
 
-- **Transactions в Kafka** = atomic writes в partitions + atomic offset commit; **только внутри Kafka**.
-- **Exactly-once** = idempotent + transactional producer + read_committed consumer.
-- **Для БД + Kafka** — outbox pattern (не Kafka tx).
-- **Consumer lag** — главная метрика мониторинга.
-- **CooperativeStickyAssignor** против rebalancing storm.
-- **Sharding ключа** против hot partition.
-- **acks=all + idempotence + replication 3 + min.insync 2** = no data loss.
-- **JMX → Prometheus → Grafana** для мониторинга.
+Kafka transactions provide atomic multi-partition writes plus atomic offset commits — только внутри Kafka boundaries.
 
----
+Exactly-once semantics — idempotent producer plus transactional producer plus read_committed consumer plus consume/process/produce/commit в one transaction. Only полно works внутри Kafka.
 
-## Итог блока Kafka
+Для DB plus Kafka atomicity — Outbox pattern. Не Kafka transactions across systems.
 
-- 39 — основы (broker, topic, partition, offset, replication).
-- 40 — producer / consumer / offsets / consumer groups / rebalancing.
-- 41 — Spring Kafka (KafkaTemplate, @KafkaListener, error handling, DLT).
-- 42 — прод-паттерны (transactions, EOS, monitoring, common issues).
+Consumer lag это main operational metric. Growing lag indicates capacity problem — investigation через thread dumps, consumer/partition scaling, downstream optimization.
 
-Следующий — новые темы. `43-java-basics-primitives-memory.md`.
+CooperativeStickyAssignor против rebalancing storm. Incremental rebalance не freeze всей группы.
+
+Sharding ключа против hot partition. Composite keys distributing load.
+
+acks=all plus min.insync.replicas=2 plus idempotent producer plus replication factor 3 — no data loss guarantee.
+
+JMX через Prometheus через Grafana — стандартный monitoring stack для Kafka.
+
+Alerting на UnderReplicatedPartitions, OfflinePartitions, growing consumer lag, disk usage, broker down.
+
+Kafka Streams для сложных stream processing scenarios с EOS. Kafka Connect для integration с external systems без custom code. Schema Registry для schema evolution в Avro/Protobuf.
+
+Deployment best practices — sizing, retention, topic naming conventions, production-tuned producer/consumer settings, JVM tuning leaving OS page cache room.
+
+Итог блока Kafka. Файлы 39-42 покрыли основы, producer/consumer/offsets, Spring Kafka abstractions, production patterns. Комплексное understanding для reliable Kafka usage в enterprise.
+
+Дальше — Java основы: примитивы, объекты, память с deep dive в memory layout, GC roots, off-heap patterns.

@@ -1,21 +1,18 @@
-# 41. Spring Kafka: @KafkaListener, KafkaTemplate
+# 41. Spring Kafka: KafkaTemplate, @KafkaListener, error handling
 
-Как работать с Kafka в Spring Boot. Прод-грейд конфиг.
+## Зачем нужна abstraction над raw Kafka client
 
----
+Использование raw Kafka clients (KafkaProducer plus KafkaConsumer от Apache Kafka) в Spring приложении технически возможно но неэффективно. Каждый developer будет создавать custom bean для KafkaProducer, custom infrastructure для consumer loop с proper polling plus commit strategy, custom error handling с retry logic, custom shutdown hooks для graceful termination. Всё это повторяется в каждом проекте. Плюс раздел ответственности между инфраструктурным кодом и business logic плохой — consumer loop смешивает threading concerns с business rules.
 
-## 1. Зависимости
+Spring Kafka решает это через high-level abstractions поверх raw clients. KafkaTemplate wraps producer предоставляя idiomatic Spring API. @KafkaListener предоставляет declarative consumer через annotation. ConcurrentMessageListenerContainer управляет threading, polling, commits, rebalancing behind the scenes. DefaultErrorHandler с DeadLetterPublishingRecoverer обеспечивает retry plus DLT patterns. Из этих абстракций формируется production-grade pipeline с minimum custom code.
 
-```gradle
-implementation 'org.springframework.kafka:spring-kafka'
-```
+Разница между разработчиком «использующим Kafka» и «понимающим Spring Kafka» проявляется в детях. Первый пишет @KafkaListener и надеется. Второй знает что concurrency в @KafkaListener фактически создаёт multiple consumers в одном приложении — каждый в отдельном thread — что effectively partitioning must быть sufficient чтобы избежать idle threads. Знает что default ack-mode «batch» коммитит после всего poll batch — meaning single failed message приводит к whole batch reprocessing at least once. Знает что ErrorHandlingDeserializer это wrapper который catches deserialization exceptions и attaches к record instead of blowing up polling entirely. Знает что @TransactionalEventListener AFTER_COMMIT plus KafkaTemplate published из listener гарантирует publish только после DB commit.
 
-Автоматически подключается через Spring Boot starter если Kafka на classpath.
+В этом файле разберём Spring Kafka с этой deep perspective. Configuration properties и что каждая делает. KafkaTemplate publish semantics — async CompletableFuture callback, sync waiting, producer transactions. @KafkaListener механика — container factory internals, threading model, ack modes deeply. Error handling — DefaultErrorHandler flow, DeadLetterPublishingRecoverer configuration, @RetryableTopic alternative. Serialization pipeline и ErrorHandlingDeserializer защита от poison pills. Producer transactions для atomicity. Complete production example с идемпотентностью на consumer.
 
----
+## Configuration properties detailed
 
-## 2. Конфигурация
-
+Spring Kafka configuration через application.yml. Structure отражает разделение producer, consumer, listener concerns:
 ```yaml
 spring:
   kafka:
@@ -44,18 +41,25 @@ spring:
         max.poll.interval.ms: 300000
 
     listener:
-      ack-mode: manual_immediate       # manual/manual_immediate/batch/record/time/count
-      concurrency: 3                    # threads per @KafkaListener
+      ack-mode: manual_immediate
+      concurrency: 3
       poll-timeout: 500
-      type: single                      # single / batch
+      type: single
 ```
 
----
+bootstrap-servers это entry point cluster. Client discovers full cluster через metadata request к любому из указанных. Обычно 2-3 addresses указывается для resilience.
 
-## 3. KafkaTemplate — публикация
+client-id это identifier producer/consumer instance. Полезно для monitoring — shows в broker JMX metrics которое приложение делает что. Should be unique per instance для different services.
 
-### 3.1 Простая публикация
+Producer section wraps Kafka producer settings. Spring translates эти properties к properties producer's underlying config. Не все Kafka producer settings имеют dedicated properties — extra через `properties:` map.
 
+Consumer section идентично wraps consumer settings. group-id обязателен — group coordinator uses для partition assignment.
+
+Listener section это Spring Kafka specific — controls behavior ConcurrentMessageListenerContainer wrapping consumer. ack-mode определяет offset commit timing (детально ниже). concurrency количество consumer threads в приложении. poll-timeout maximum wait в poll call.
+
+## KafkaTemplate publish semantics
+
+Основной API для publishing:
 ```java
 @Autowired KafkaTemplate<String, OrderEvent> template;
 
@@ -64,10 +68,9 @@ public void publish(OrderEvent event) {
 }
 ```
 
-Ключ — второй аргумент. Определит partition.
+Ключ (второй аргумент) определяет partition через hash routing. Same customerId идёт в same partition обеспечивая ordering per customer. Best practice — использовать key that reflects business ordering requirement.
 
-### 3.2 С callback
-
+send returns CompletableFuture в Spring Kafka 3+. По умолчанию async — не блокирует calling thread. Result available asynchronously через callback:
 ```java
 public void publish(OrderEvent event) {
     template.send("orders", event.getCustomerId(), event)
@@ -83,39 +86,38 @@ public void publish(OrderEvent event) {
 }
 ```
 
-Async (в Spring Kafka 3+ — `CompletableFuture`). Не блокирует.
+whenComplete callback вызывается в Kafka producer's I/O thread когда broker responds. Не блокировать callback — этот thread doing all producer I/O work.
 
-### 3.3 Sync (не рекомендуется)
-
+Sync waiting иногда нужен но обычно anti-pattern:
 ```java
-SendResult<String, OrderEvent> result = template.send(...).get();   // блокирует
+SendResult<String, OrderEvent> result = template.send(...).get();
 ```
 
-Только если реально нужно подтверждение перед следующим действием.
+Блокирует calling thread до получения confirmation. Использовать только когда really needed — например если следующая operation зависит от successful publish. Обычно async plus callback lifecycle правильный подход.
 
-### 3.4 Producer transactions
-
-Для exactly-once:
+Producer transactions для exactly-once atomic writes. Configuration:
 ```yaml
 spring.kafka.producer:
   transaction-id-prefix: tx-isna-knp-
 ```
 
+Использование через Spring @Transactional:
 ```java
 @Transactional("kafkaTransactionManager")
 public void publishAtomic(OrderEvent e1, PaymentEvent e2) {
     template.send("orders", e1);
     template.send("payments", e2);
-    // если бросит — оба aborted
+    // если бросит exception — оба aborted
 }
 ```
 
----
+Transactional producer заранее opens transaction через initTransactions при startup. Sends within @Transactional method wrapped в transaction context — beginTransaction перед first send, commit/abort в конце.
 
-## 4. @KafkaListener — приём
+Multiple partition writes atomic — either все или ни одного visible к read_committed consumers. Trade-off performance ценой atomicity guarantees. Обычно overkill для simple scenarios — Outbox pattern часто simpler и flexible.
 
-### 4.1 Простой
+## @KafkaListener механика
 
+Основная abstraction для consumers:
 ```java
 @Component
 class OrderListener {
@@ -124,19 +126,21 @@ class OrderListener {
     public void handle(OrderEvent event) {
         log.info("Received: {}", event);
         process(event);
-        // success → auto ack
     }
 }
 ```
 
-Spring:
-- Создаёт `ConcurrentMessageListenerContainer`.
-- Подписывается на topic.
-- Poll'ит, десериализует, вызывает.
-- Auto ack при success; retry / DLT при exception (по настройкам).
+Что происходит under the hood при @KafkaListener annotation processing.
 
-### 4.2 С полными аргументами
+При Spring context startup KafkaListenerAnnotationBeanPostProcessor scans beans looking для @KafkaListener annotations. Для каждой annotated method — создаётся MethodKafkaListenerEndpoint containing method metadata.
 
+Endpoint регистрируется в KafkaListenerEndpointRegistry которая maintains все registered endpoints. Container factory (ConcurrentKafkaListenerContainerFactory) called для создания MessageListenerContainer per endpoint. ConcurrentMessageListenerContainer это main implementation.
+
+ConcurrentMessageListenerContainer at startup — если concurrency=3, создаёт 3 KafkaMessageListenerContainer instances. Каждый содержит один Kafka consumer running в своём thread. Effectively three consumers в one application, all в one group.
+
+Каждый KafkaMessageListenerContainer runs consumer loop internally. Polls Kafka broker. Deserializes records через configured deserializers. Invokes handler method с deserialized value. Handles exceptions through configured error handler. Commits offsets через configured ack-mode.
+
+С полными аргументами method может получить всё context:
 ```java
 @KafkaListener(topics = "orders")
 public void handle(@Payload OrderEvent event,
@@ -146,39 +150,50 @@ public void handle(@Payload OrderEvent event,
                    @Header(KafkaHeaders.RECEIVED_TIMESTAMP) long timestamp,
                    ConsumerRecord<String, OrderEvent> record,
                    Acknowledgment ack) {
-
-    log.info("Received key={} part={} offset={}", key, partition, offset);
-    try {
-        process(event);
-        ack.acknowledge();
-    } catch (Exception e) {
-        // handling
-    }
+    // full context available
 }
 ```
 
-### 4.3 Manual ack
+@Payload marks основное содержимое. @Header extracts specific headers. ConsumerRecord даёт full raw record. Acknowledgment enables manual commit control.
 
-Требует `ack-mode: manual` или `manual_immediate`:
+## Ack modes глубже
+
+ack-mode это Spring Kafka concept над raw Kafka offset commits. Multiple strategies available.
+
+RECORD — commit после каждого record. Максимальная safety, минимальная performance (много Kafka commits). Rarely used в production.
+
+BATCH — commit после всего poll batch (default). Standard behavior — process all records from poll, then commit. Single failed message в batch может приводить к whole batch reprocessing.
+
+TIME — commit periodically по timer. Time-based batching offset commits.
+
+COUNT — commit после N records regardless когда poll happened. Count-based batching.
+
+COUNT_TIME — combination COUNT plus TIME (whichever triggers first).
+
+MANUAL — commit only when Acknowledgment.acknowledge() called manually. But actual commit happens at end of poll batch если not yet committed.
+
+MANUAL_IMMEDIATE — commit immediately when Acknowledgment.acknowledge() called synchronously. Different от MANUAL — не waits для end of batch.
+
+Configuration:
 ```yaml
 spring.kafka.listener:
   ack-mode: manual_immediate
 ```
 
+Usage manual ack:
 ```java
 @KafkaListener(...)
 public void handle(OrderEvent event, Acknowledgment ack) {
     process(event);
-    ack.acknowledge();   // явный commit
+    ack.acknowledge();
 }
 ```
 
-Разница `manual` vs `manual_immediate`:
-- `manual` — commit в конце batch.
-- `manual_immediate` — commit сразу после acknowledge.
+Choice depends на requirements. MANUAL_IMMEDIATE дает максимальный control но повышает overhead commits. BATCH обычно best balance для standard scenarios. RECORD для extreme reliability requirements.
 
-### 4.4 Batch listener
+## Batch listener
 
+Для massive scale processing multiple records в one method call:
 ```yaml
 spring.kafka.listener.type: batch
 ```
@@ -190,10 +205,13 @@ public void handleBatch(List<OrderEvent> batch) {
 }
 ```
 
-Быстрее для массовых.
+Method receives entire poll batch как List. Processing может leverage bulk operations — bulk database inserts, bulk external API calls — reducing overhead per-message.
 
-### 4.5 Concurrency
+Trade-off — error handling более сложный. Single failed record в batch — как обрабатывать? Retry whole batch (retry successful ones тоже — duplicates). Skip whole batch (lose successful ones). Partial handling — split successful и failed, more complex logic. DefaultErrorHandler имеет support для batch но requires careful configuration.
 
+## Concurrency и partitions relationship
+
+concurrency в @KafkaListener создаёт multiple consumer instances в одном приложении:
 ```yaml
 spring.kafka.listener.concurrency: 5
 ```
@@ -203,14 +221,17 @@ spring.kafka.listener.concurrency: 5
 @KafkaListener(topics = "orders", concurrency = "5")
 ```
 
-5 threads / consumer instances в одном приложении.
+5 threads с 5 KafkaMessageListenerContainer instances. Each container имеет свой Kafka consumer. Все в one group (group-id from listener config).
 
-Правило: `concurrency <= partitions в topic`. Больше — часть потоков простаивает.
+Key rule — concurrency should be <= partitions в topic. Больше — extra consumers будут idle потому что каждая partition assigned to exactly one consumer в group. Waste ресурсов.
 
-### 4.6 Отдельный containerFactory
+Practical values. concurrency=1 для development или low-volume topics. concurrency=3-5 для medium throughput. Higher only если partitions counts support.
 
-Для гибкой настройки нескольких listener'ов:
+Consideration — если несколько @KafkaListener в приложении используют same group-id, concurrency counts combined. Two listeners each with concurrency=3 in same group = 6 total consumers. Ensure sufficient partitions.
 
+## Отдельный containerFactory для гибкости
+
+Default single containerFactory сhared для всех @KafkaListener. Для different scenarios требуется different configuration:
 ```java
 @Bean
 ConcurrentKafkaListenerContainerFactory<String, OrderEvent> orderKafkaFactory(
@@ -227,12 +248,11 @@ ConcurrentKafkaListenerContainerFactory<String, OrderEvent> orderKafkaFactory(
 public void handle(OrderEvent event) { ... }
 ```
 
----
+Named containerFactory injected по name в @KafkaListener. Позволяет different topics/scenarios have different behaviors — different error handling, ack modes, concurrency, deserializers.
 
-## 5. Error handling
+## Error handling: DefaultErrorHandler flow
 
-### 5.1 DefaultErrorHandler (Spring Kafka 2.8+)
-
+DefaultErrorHandler (Spring Kafka 2.8+) это main error handling mechanism:
 ```java
 @Bean
 DefaultErrorHandler errorHandler(KafkaTemplate<String, ?> template) {
@@ -243,45 +263,52 @@ DefaultErrorHandler errorHandler(KafkaTemplate<String, ?> template) {
 }
 ```
 
-Что делает:
-1. При exception в listener — retry 3 раза с задержкой 1 сек.
-2. Если все retry упали → отправить в DLT (Dead Letter Topic).
-3. Continue с следующего сообщения.
+Что делает при exception в listener. Records retried согласно BackOff strategy. FixedBackOff(1000, 3) — 3 retry attempts с 1 second delay между ними. При исчерпании retries — recoverer called с failed record. DeadLetterPublishingRecoverer publishes к DLT topic. После recovery — continue с following records.
 
-### 5.2 Dead Letter Topic (DLT)
+BackOff implementations вариируются. FixedBackOff одинаковая delay. ExponentialBackOff увеличивающаяся delay (1s, 2s, 4s, ...). Custom implementations для specific scenarios.
 
-Отдельный topic для «плохих» сообщений. Обычно название `<original>.DLT`.
+Дополнительная configuration — classify exceptions. Some exceptions retriable (network glitches). Others fatal (validation errors — retry не поможет). handler.addNotRetryableExceptions marks specific types as skip-retry, go directly к recoverer. handler.addRetryableExceptions ограничивает what to retry.
 
-Формат: original message + headers с оригинальным topic/partition/offset/exception.
+Recovery через DeadLetterPublishingRecoverer publishes к DLT topic. Format — original message plus headers indicating original topic/partition/offset/exception. DLT это regular Kafka topic subject к all standard Kafka behaviors.
 
-Consumer'ы DLT — обычно ручной разбор + повторная отправка после fix.
+## Dead Letter Topic pattern
 
-### 5.3 RetryTopicConfigurer (более гибкое)
+DLT это отдельный topic для «плохих» сообщений которые consumer не может обработать. Обычно название `<original>.DLT`.
 
+Message format в DLT — original message content plus enrichment headers. `kafka_original-topic`, `kafka_original-partition`, `kafka_original-offset` — где message originally был. `kafka_exception-fqcn` — full class name exception. `kafka_exception-message` — exception message. `kafka_exception-stacktrace` — full stack trace.
+
+DLT consumption обычно manual. Human reviews failed messages, decides — bug fix in consumer, then reprocess. Or malformed message that should be discarded. Или systematic issue requiring escalation.
+
+Some implementations DLT auto-reprocess после certain time — retry hoping transient issue resolved. Advanced patterns — retry topics with delays (0s, 30s, 5min, 30min) forming retry chain перед DLT.
+
+## @RetryableTopic — альтернатива
+
+Spring Kafka также предоставляет @RetryableTopic для declarative retry configuration:
 ```java
 @RetryableTopic(attempts = "3", backoff = @Backoff(delay = 1000, multiplier = 2))
 @KafkaListener(topics = "orders")
 public void handle(OrderEvent event) { ... }
 ```
 
-Автоматически создаёт retry-topics с задержками (`orders-retry-0`, `orders-retry-1`, `orders-dlt`).
+Автоматически создаёт retry-topics с задержками. При failure — message goes to retry topic с timestamp indicating when re-process. Separate consumer of retry topic picks up когда time comes. Через exhaustion attempts — DLT.
 
-Не блокирует основной consumer.
+Advantage vs DefaultErrorHandler — не блокирует main consumer. Retries happen через separate consumers of retry topics. Main topic continues processing new messages. Long backoffs не hold up throughput.
 
----
+Disadvantage — more complex topic structure. Multiple retry topics per business topic. Requires understanding retry topic ecosystem.
 
-## 6. Serializer / Deserializer
+Choice между DefaultErrorHandler и @RetryableTopic зависит от use case. DefaultErrorHandler proще для quick retry. @RetryableTopic лучше для scenarios с long backoffs или high volume.
 
-### 6.1 String
+## Serialization pipeline и защита от poison pill
 
-Default простой:
+Serializers и deserializers key components. Configuration через Spring properties или explicit beans.
+
+String simple:
 ```yaml
 value-serializer: org.apache.kafka.common.serialization.StringSerializer
 value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 ```
 
-### 6.2 JSON (Spring Kafka)
-
+JSON через Spring Kafka support:
 ```yaml
 value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
 value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
@@ -291,43 +318,61 @@ properties:
   spring.json.value.default.type: kz.gov.kgd.isna.knp.OrderEvent
 ```
 
-Сериализует объект в JSON. Deserializer читает `__TypeId__` header для определения типа.
+JsonSerializer serializes object via Jackson. Adds __TypeId__ header identifying class. JsonDeserializer reads header, deserializes to identified type.
 
-**`spring.json.trusted.packages`** — safety: не десериализовать в любой класс (RCE защита).
+Critical security setting — spring.json.trusted.packages. Prevents deserialization в arbitrary classes что могло бы enable RCE attacks через crafted messages. Restrictive by default — must explicitly whitelist trusted packages.
 
-### 6.3 Avro (Confluent)
-
-Schema-based, компактный, evolution-friendly.
-
+Avro через Confluent Schema Registry — compact binary format с schema evolution support:
 ```yaml
 value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
 value-deserializer: io.confluent.kafka.serializers.KafkaAvroDeserializer
 schema.registry.url: http://schema-registry:8081
 ```
 
-Требует Schema Registry (Confluent).
+Requires Schema Registry deployment. Schemas registered centrally. Producers include schema ID in messages. Consumers fetch schemas by ID. Enables schema evolution — backwards и forwards compatibility rules enforced.
 
-### 6.4 Protobuf
-
-Аналогично Avro, через Protobuf Serializer.
-
-### 6.5 ErrorHandlingDeserializer
-
-Poison pill (некорректный JSON) → deserializer throws → poll break.
-
-Fix: обёртка:
+ErrorHandlingDeserializer защита от poison pill. Message with invalid format — regular deserializer throws exception at poll level — poll cannot return records — infinite retry без progress:
 ```yaml
 value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
 properties:
   spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
 ```
 
-При ошибке — сообщение помечается, попадает в error handler → DLT.
+ErrorHandlingDeserializer wraps actual deserializer. При exception во время deserialization — не throws. Instead attaches exception к record. Record delivered к listener with null payload plus exception header. Listener можно проверить и route к DLT explicitly, или default DefaultErrorHandler catches null payload и routes to DLT.
 
----
+## Producer transactions
 
-## 7. Полная прод-конфигурация
+Для exactly-once atomic multi-partition writes. Producer transactions coordinate multiple sends в one atomic operation.
 
+Requirements. transactional.id уникальный per producer instance plus stable across restarts. Consumer с isolation.level=read_committed для reading only committed. enable.idempotence=true plus acks=all.
+
+Spring configuration:
+```yaml
+spring.kafka.producer:
+  transaction-id-prefix: tx-isna-knp-
+```
+
+Spring generates unique transactional.id per producer using prefix plus counter. Stable across restarts если same prefix used.
+
+Usage через @Transactional с KafkaTransactionManager:
+```java
+@Transactional("kafkaTransactionManager")
+public void publishAtomic(OrderEvent e1, PaymentEvent e2) {
+    template.send("orders", e1);
+    template.send("payments", e2);
+    // exception → abort
+}
+```
+
+Both sends part of one transaction. Either both visible к read_committed consumers или neither. Atomic guarantees across partitions.
+
+Consumer side с isolation.level=read_committed shows only committed messages. Aborted transactions skipped. Adds latency потому что must wait для transaction completion signal.
+
+Practical limitation — transactions only across Kafka. Не extends к external databases или other systems. Для DB plus Kafka atomicity — Outbox pattern preferred.
+
+## Полная production конфигурация
+
+Собранная воедино:
 ```java
 @Configuration
 @EnableKafka
@@ -382,42 +427,95 @@ public class KafkaConfig {
         return factory;
     }
 }
+```
 
+Configuration components. Producer factory с idempotence, acks=all, zstd compression. Consumer factory с ErrorHandlingDeserializer wrapping JsonDeserializer, manual commits, trusted packages. Listener container factory с concurrency 3, manual_immediate ack, retry error handler plus DLT recoverer.
+
+## Idempotent consumer pattern
+
+Even с exactly-once producer duplicates возможны при crashes between processing и commit. Consumer idempotency mandatory:
+```java
 @Component
 class OrderListener {
 
+    @Autowired ProcessedRepo processed;
+
     @KafkaListener(topics = "orders")
+    @Transactional
     public void handle(OrderEvent event, Acknowledgment ack,
                        @Header(KafkaHeaders.RECEIVED_KEY) String key) {
-        try {
-            processIdempotent(event, key);
+        if (processed.existsById(event.getOrderId())) {
+            log.debug("Skip duplicate {}", event.getOrderId());
             ack.acknowledge();
-        } catch (Exception e) {
-            log.error("Failed to process order {}", key, e);
-            throw e;  // → error handler → retry → DLT
+            return;
         }
-    }
-}
 
-@Service
-class OrderPublisher {
-    private final KafkaTemplate<String, OrderEvent> template;
-
-    public void publish(OrderEvent event) {
-        template.send("orders", event.getCustomerId(), event)
-            .whenComplete((result, ex) -> {
-                if (ex != null) log.error("Publish failed", ex);
-            });
+        try {
+            doProcess(event);
+            processed.save(new Processed(event.getOrderId()));
+            ack.acknowledge();
+        } catch (RetryableException e) {
+            log.warn("Retry", e);
+            throw e;
+        } catch (FatalException e) {
+            log.error("Fatal — will go to DLT", e);
+            throw e;
+        }
     }
 }
 ```
 
----
+Pattern implementation. Check processed table для message ID. If already processed — skip и acknowledge (duplicate). Process message. Record processed ID. Acknowledge. All в single database transaction — либо все либо ни одного (avoids partial state).
 
-## 8. Testing
+Retryable exceptions rethrown — DefaultErrorHandler retries. Fatal exceptions rethrown — DefaultErrorHandler classified as not-retryable, goes to DLT immediately.
 
-### 8.1 EmbeddedKafka
+## Publishing после DB commit
 
+Common scenario — save entity в DB, then publish event. Naive approach:
+```java
+@Transactional
+public void createOrder(OrderRequest req) {
+    Order o = new Order(req);
+    repo.save(o);
+    template.send("orders", OrderEvent.from(o));
+}
+```
+
+Problem — publish happens внутри transaction. Если transaction rollbacks — event уже published. Downstream consumers act on nonexistent order.
+
+Right approach — publish только после commit через @TransactionalEventListener:
+```java
+@Service
+class OrderService {
+    @Autowired ApplicationEventPublisher events;
+
+    @Transactional
+    public void createOrder(OrderRequest req) {
+        Order o = new Order(req);
+        repo.save(o);
+        events.publishEvent(new OrderCreatedEvent(o));
+    }
+}
+
+@Component
+class OrderEventPublisher {
+    @Autowired KafkaTemplate<String, OrderEvent> template;
+
+    @TransactionalEventListener(phase = AFTER_COMMIT)
+    public void publish(OrderCreatedEvent e) {
+        template.send("orders", e.getOrder().getCustomerId(),
+            OrderEvent.from(e.getOrder()));
+    }
+}
+```
+
+@TransactionalEventListener AFTER_COMMIT phase гарантирует что listener invoked только после successful DB commit. Rollback — event not published. Consistency ensured.
+
+Trade-off — если Kafka publish fails after DB commit, DB state inconsistent с Kafka. Order created but event lost. Outbox pattern eliminates this window через persistent outbox table processed by separate publisher — гарантирует eventual publish.
+
+## Testing
+
+EmbeddedKafka для integration testing без external Kafka:
 ```java
 @SpringBootTest
 @EmbeddedKafka(partitions = 3, topics = {"orders"})
@@ -434,10 +532,9 @@ class KafkaIntegrationTest {
 }
 ```
 
-Быстро, без Docker. Но не всё покрывает (real broker specifics).
+EmbeddedKafka starts Kafka in-process в JVM before tests. Fast, no Docker required. Real Kafka behavior для most testing needs.
 
-### 8.2 Testcontainers
-
+Testcontainers для even more realistic testing:
 ```java
 @Testcontainers
 @SpringBootTest
@@ -452,107 +549,38 @@ class KafkaIntegrationTest {
 }
 ```
 
-Реалистичнее, медленнее.
+Real Kafka in Docker container. More authentic testing но slower — container startup adds seconds к test run time. Right choice для critical integration tests.
 
----
+## Итоги
 
-## 9. Пример полного flow
+Spring Kafka предоставляет high-level abstractions над raw Kafka clients. KafkaTemplate для publishing plus @KafkaListener для consuming plus supporting infrastructure.
 
-Publisher:
-```java
-@Service
-@Slf4j
-class OrderService {
+Configuration через application.yml с producer/consumer/listener sections. Extra properties через nested map для settings without dedicated properties.
 
-    @Autowired KafkaTemplate<String, OrderEvent> template;
+KafkaTemplate.send returns CompletableFuture default async. whenComplete callback в producer's I/O thread. Sync waiting doable но anti-pattern usually.
 
-    @Transactional
-    public void createOrder(OrderRequest req) {
-        Order o = new Order(req);
-        repo.save(o);
-        // публикация после commit — @TransactionalEventListener
-        events.publishEvent(new OrderCreatedEvent(o));
-    }
-}
+@KafkaListener creates ConcurrentMessageListenerContainer wrapping consumer. Concurrency creates multiple consumer instances в one app — up to partitions count.
 
-@Component
-class OrderEventPublisher {
+Ack modes control offset commit timing. MANUAL_IMMEDIATE для explicit control. BATCH default. Choice affects reliability vs performance trade-off.
 
-    @Autowired KafkaTemplate<String, OrderEvent> template;
+Batch listener processes multiple records в one method invocation. Bulk operations leverage. Error handling more complex.
 
-    @TransactionalEventListener(phase = AFTER_COMMIT)
-    public void publish(OrderCreatedEvent e) {
-        template.send("orders", e.getOrder().getCustomerId(),
-            OrderEvent.from(e.getOrder()));
-    }
-}
-```
+Container factories для different scenarios. Named factories injected через @KafkaListener(containerFactory=...).
 
-Consumer:
-```java
-@Component
-@Slf4j
-class OrderProcessor {
+DefaultErrorHandler с DeadLetterPublishingRecoverer для retry plus DLT pattern. BackOff strategy determines retry timing. addNotRetryableExceptions для fast fail на fatal errors.
 
-    @Autowired ProcessedRepo processed;
+@RetryableTopic alternative через separate retry topics. Не блокирует main consumer. Simpler для complex retry chains.
 
-    @KafkaListener(topics = "orders")
-    @Transactional
-    public void handle(OrderEvent event, Acknowledgment ack,
-                       @Header(KafkaHeaders.RECEIVED_KEY) String key,
-                       @Header(KafkaHeaders.OFFSET) long offset) {
-        // idempotency check
-        if (processed.existsById(event.getOrderId())) {
-            log.debug("Skip duplicate {}", event.getOrderId());
-            ack.acknowledge();
-            return;
-        }
+ErrorHandlingDeserializer защита от poison pill. Wraps actual deserializer. Deserialization exceptions attached к record instead of blowing polling.
 
-        try {
-            doProcess(event);
-            processed.save(new Processed(event.getOrderId()));
-            ack.acknowledge();
-        } catch (RetryableException e) {
-            log.warn("Retry", e);
-            throw e;  // error handler → retry
-        } catch (FatalException e) {
-            log.error("Fatal — will go to DLT", e);
-            throw e;
-        }
-    }
-}
-```
+JSON serialization через Spring Kafka JsonSerializer/JsonDeserializer. spring.json.trusted.packages critical security setting.
 
----
+Producer transactions для atomic multi-partition writes. transaction-id-prefix in config. @Transactional("kafkaTransactionManager") для usage.
 
-## 10. Собесные вопросы
+@TransactionalEventListener AFTER_COMMIT для publishing после DB commit. Гарантирует consistency между DB state и Kafka messages.
 
-1. **Как публиковать в Spring Kafka?** — `KafkaTemplate.send(topic, key, value)`; async с CompletableFuture callback.
-2. **Как подписаться?** — `@KafkaListener(topics = "...")` на методе.
-3. **Что такое ack-mode?** — Как Kafka commit'ит offsets: auto, manual, batch, record, time, count.
-4. **Как обработать batch?** — `spring.kafka.listener.type: batch` + `List<T>` параметр.
-5. **Concurrency в @KafkaListener?** — Threads per listener; <= partitions.
-6. **Что такое DLT?** — Dead Letter Topic для необработанных сообщений; DefaultErrorHandler + DeadLetterPublishingRecoverer.
-7. **Как настроить retry?** — DefaultErrorHandler с BackOff или @RetryableTopic.
-8. **Разница @RetryableTopic и DefaultErrorHandler?** — @RetryableTopic делает retry в отдельных topics (не блокирует consumer); DefaultErrorHandler retry в том же consumer.
-9. **Как избежать poison pill?** — ErrorHandlingDeserializer оборачивает JsonDeserializer.
-10. **Как публиковать после commit tx?** — @TransactionalEventListener(AFTER_COMMIT).
-11. **Producer transactions в Spring Kafka?** — `transaction-id-prefix` + @Transactional("kafkaTransactionManager").
-12. **Что делает Acknowledgment.acknowledge?** — Commit offset (при manual ack mode).
-13. **manual vs manual_immediate?** — Manual в конце batch; immediate сразу.
-14. **Как тестировать Kafka?** — EmbeddedKafka (быстро) или Testcontainers (реалистично).
+Idempotent consumer через processed table или conditional updates. Mandatory для reliable operation.
 
----
+Testing через EmbeddedKafka (fast) или Testcontainers (realistic).
 
-## Итог
-
-- **KafkaTemplate** для publish, **@KafkaListener** для consume.
-- **acks=all + idempotence** обязательно.
-- **Manual ack** для контроля.
-- **DefaultErrorHandler + DLT** для error handling.
-- **ErrorHandlingDeserializer** от poison pill.
-- **@TransactionalEventListener(AFTER_COMMIT)** для publish после DB commit.
-- **Concurrency** <= partitions.
-- **Идемпотентный consumer** обязательно.
-
-Следующий — `42-kafka-prod.md`.
+Дальше — Kafka в production с transactions, exactly-once semantics, monitoring и распространёнными issues.
