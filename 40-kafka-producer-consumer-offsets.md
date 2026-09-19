@@ -1,8 +1,18 @@
-# 40. Kafka: producer, consumer, offsets, consumer groups
+# 40. Kafka producers, consumers, offsets, consumer groups: практическая работа
 
-## Producer детально
+## Зачем идти глубже в consumer/producer mechanics
 
-Основной цикл работы с producer:
+В предыдущем файле разобрали Kafka как distributed log — brokers, topics, partitions, offsets, replicas, ISR. Разобрали basic producer plus consumer patterns. Этой глубины достаточно для понимания архитектуры на high level. Но реальные production issues проявляются на уровне detailed mechanics — как реально работает polling, что происходит во время rebalance, как offsets коммитятся и что происходит когда crash between processing и commit, почему consumer вдруг перестал получать messages несмотря на producer's продолжение sending.
+
+Разработчик который знает Kafka only на архитектурном уровне часто попадает в classical traps. Consumer processes slowly — max.poll.interval.ms exceeded — coordinator marks consumer dead — rebalance triggered — все group frozen на несколько seconds — after rebalance consumer again slow — loop. Poison pill в topic — deserialization fails на каждый poll — infinite retry без progress. Hot partition из-за uneven key distribution — one consumer overloaded while others idle. Все эти problems solvable но требуют understanding detailed mechanics.
+
+Разница между «работающим с Kafka» и «понимающим Kafka» именно здесь. Первый пишет consumer loop и надеется. Второй знает что poll returns immediately if data available, ждёт до timeout если no data, plus posts heartbeat to coordinator в separate thread. Знает что commit synchronizes offset к __consumer_offsets topic — this itself Kafka producer operation with its own reliability considerations. Знает что rebalance freezes все group — CooperativeStickyAssignor reduces impact через incremental rebalance. Знает что max.poll.interval.ms is separate from session.timeout.ms — first controls processing time between polls, second controls heartbeat interval.
+
+В этом файле разберём эти detailed mechanics. Producer detailed — internal buffer, batching, callback threading, delivery guarantees combinations. Consumer detailed — poll model internally, offset management options, delivery semantics practical. Consumer group mechanics — assignment, rebalancing algorithms, coordinator role. Poison pill handling. Hot partition mitigation. Multi-threading strategies. Real-world типичные ошибки and их fixes.
+
+## Producer детально: internal architecture
+
+Основной цикл работы:
 ```java
 Producer<String, Order> producer = new KafkaProducer<>(props);
 
@@ -14,12 +24,21 @@ ProducerRecord<String, Order> record = new ProducerRecord<>(
 
 Future<RecordMetadata> future = producer.send(record);
 RecordMetadata meta = future.get();   // sync — блокирует
-// meta.partition(), meta.offset(), meta.timestamp()
-
-producer.close();
 ```
 
-Sync запись через future.get блокирует поток до получения confirmation от broker. Safe но медленно. Асинхронная запись через callback:
+Что происходит under the hood при producer.send. Not immediate network call к broker. Instead multiple internal steps.
+
+First, serialization. key и value serializer applied — converting objects to byte arrays. Default serializers для standard types (String, Integer, ByteArray). Для Java objects обычно custom serializer или Avro/JSON approach.
+
+Second, partitioner call. С key — hash(keyBytes) modulo numPartitions. Без key — round-robin или sticky. Result — target partition number.
+
+Third, adding to producer's internal buffer. Producer maintains internal buffer of pending records organized by (topic, partition). Records accumulate до batch size limit или linger.ms timeout.
+
+Fourth, when batch ready — sender thread (separate от caller thread) sends batch to broker. Producer это multi-threaded internally — caller threads add records to buffer, sender thread handles network I/O.
+
+Fifth, broker responds acknowledging receipt (depending на acks setting). Success или failure recorded в record's Future. If callback registered — invoked at this point (в sender thread!).
+
+Sync запись через future.get блокирует caller thread до получения confirmation. Safe но медленно. Async запись через callback:
 ```java
 producer.send(record, (meta, exception) -> {
     if (exception != null) {
@@ -30,7 +49,7 @@ producer.send(record, (meta, exception) -> {
 });
 ```
 
-Не блокирует producer thread. Callback вызывается в I/O-thread producer'а поэтому не должен блокировать на долго — быстрый callback обязателен.
+Не блокирует caller thread — returns immediately after adding to buffer. Callback вызывается в I/O thread producer'а later когда broker responds. Не блокировать long callback потому что this thread doing all I/O для producer — long callback blocks other sends.
 
 ## Producer настройки
 
@@ -55,33 +74,29 @@ compression.type=zstd
 buffer.memory=33554432       # 32 MB
 ```
 
-bootstrap.servers это список brokers для initial connection. Producer discovers full cluster через metadata request к любому из них. Обычно 2-3 addresses указывается для resilience.
+bootstrap.servers это список brokers для initial connection. Producer discovers full cluster через metadata request к любому из them. Обычно 2-3 addresses указывается для resilience — если один broker недоступен, другой из list будет работать.
 
-acks=all plus enable.idempotence=true plus retries max — стандартный production setup для reliability.
+acks=all plus enable.idempotence=true plus retries максимальный — стандартный production setup для reliability. Any transient failure retried without duplicates thanks to idempotence.
 
-max.in.flight.requests.per.connection=5 разрешает 5 unacked requests в одно время plus preserving ordering (с idempotence).
+max.in.flight.requests.per.connection=5 позволяет 5 unacked requests в one connection одновременно. Trade-off latency vs throughput. Higher values give better throughput но с idempotence нужно быть careful — Kafka guarantees ordering plus deduplication только up to 5 in-flight requests. Higher values may reorder messages.
 
-linger.ms=10 plus batch.size=32768 balance latency и throughput.
+linger.ms=10 plus batch.size=32768 balance latency и throughput. Producer waits up to 10ms собирая batch до 32KB. Мостики между maximum latency limit и maximum size limit.
 
-compression.type=zstd для network efficiency.
+compression.type=zstd для network efficiency. zstd provides хороший ratio при reasonable CPU cost. Compression happens per batch — compressed batches sent to broker, broker stores compressed на disk, consumers decompress on read. Network plus disk savings often 3-5x без noticeable performance impact.
+
+buffer.memory=33554432 (32 MB) total memory available для buffering pending records. Больше accommodates больше bursts. Слишком большое value consumes JVM heap unnecessarily.
 
 ## Partitioning стратегии
 
-По ключу default. Producer вычисляет hash(key) modulo partitions:
+По ключу default когда key provided:
 ```java
 new ProducerRecord<>("orders", "customer-42", order);
 // hash("customer-42") % partitions → та же partition для этого customer
 ```
 
-Гарантирует ordering per key. Все events one customer идут в one partition в правильном order.
+Guarantees ordering per key. Все events one customer идут в one partition в правильном order.
 
-Round-robin без ключа:
-```java
-new ProducerRecord<>("orders", null, order);
-// каждое сообщение → следующая partition
-```
-
-Uniform distribution но no ordering guarantees per anything specific.
+Round-robin без ключа. Каждое сообщение → следующая partition. Uniform distribution но no ordering guarantees per anything specific.
 
 Sticky (Kafka 2.4+, default для без-ключа). Batch отправляется на одну partition для batching efficiency plus rotates on batch completion. Combines throughput benefits batching plus reasonable distribution.
 
@@ -97,21 +112,23 @@ public class MyPartitioner implements Partitioner {
 
 Регистрация через partitioner.class=com.example.MyPartitioner.
 
-## Delivery guarantees сочетания
+## Delivery guarantees combinations
 
 Combinations settings определяют guarantees.
 
 At-most-once. acks=0 или 1 plus retries=0. Может потерять messages, не задваивает. Использование для metrics где потеря одной метрики не критична.
 
-At-least-once. acks=all plus retries>0. Не потеряет message, может задвоить (при retry без idempotence). Standard for reliable data. Idempotency consumer критична.
+At-least-once. acks=all plus retries>0. Не потеряет message, может задвоить (при retry без idempotence). Standard для reliable data. Idempotency consumer критична.
 
 Exactly-once в one producer. acks=all plus enable.idempotence=true. Не потеряет, не задваивает в рамках одной partition. Ideal для single-partition scenarios.
 
-Exactly-once transactional требует transactional.id plus producer.initTransactions plus wrap operations in beginTransaction/commitTransaction. Для multi-partition atomic writes plus consumer offset commits в one transaction.
+Exactly-once transactional требует transactional.id plus producer.initTransactions plus wrap operations в beginTransaction/commitTransaction. Для multi-partition atomic writes plus consumer offset commits в one transaction.
 
-## Consumer детально
+## Consumer детально: poll model
 
-Основной цикл consumer:
+Consumer read model fundamentally pull based. Consumer decides when to fetch messages. Different от push model в RabbitMQ где broker pushes to consumer.
+
+Основной цикл:
 ```java
 Consumer<String, Order> consumer = new KafkaConsumer<>(props);
 consumer.subscribe(List.of("orders"));
@@ -125,7 +142,6 @@ try {
                 process(record.value());
             } catch (Exception e) {
                 log.error("Failed to process offset {}", record.offset(), e);
-                // strategy: retry, skip, DLT
             }
         }
 
@@ -136,11 +152,21 @@ try {
 }
 ```
 
-poll model. Kafka pull-based (в отличие от RabbitMQ push). Consumer сам запрашивает данные через poll(timeout).
+Что происходит на poll(timeout). Multiple internal steps.
 
-poll(timeout) забирает batch messages up to max.poll.records (default 500). Ждёт до timeout если нет данных. Также используется для heartbeat к coordinator — важная function.
+First — if consumer part of group и joined, checked whether rebalance needed. If yes — participate in rebalance protocol. Wait для new partition assignment.
 
-Если между poll'ами прошло больше max.poll.interval.ms (default 5 минут) — coordinator считает consumer мёртвым и triggers rebalance. Отсюда правило — обрабатывать batch быстро, для долгих операций либо увеличить max.poll.interval.ms либо offload обработку в отдельные threads.
+Second — for each assigned partition, check if pending fetch requests в flight. If not — send fetch request к broker owning that partition. Multiple partitions от same broker batched в one fetch request.
+
+Third — wait for fetch responses. При arrival — deserialize records. Store в internal buffer.
+
+Fourth — return records to caller. Up to max.poll.records (default 500).
+
+Fifth — if no records в буфере plus no data ready — wait up to timeout. Return empty result если timeout expires.
+
+Каждый poll также used для heartbeat к coordinator. Consumer signals «я жив, обрабатываю» через regular polls. Missing polls (например processing takes too long) — coordinator marks consumer dead.
+
+Если между poll'ами прошло больше max.poll.interval.ms (default 5 минут) — coordinator considers consumer dead и triggers rebalance. Отсюда critical rule — обрабатывать batch быстро, для долгих операций либо увеличить max.poll.interval.ms либо offload обработку в отдельные threads.
 
 ## Consumer ключевые настройки
 
@@ -168,19 +194,13 @@ fetch.min.bytes=1
 fetch.max.wait.ms=500
 ```
 
-auto.offset.reset определяет behavior при первом запуске когда нет saved offset.
+auto.offset.reset определяет behavior при первом запуске когда нет saved offset. earliest — с начала topic. latest — только новые сообщения пропуская history. none — throw exception если no offset.
 
-earliest — с начала topic. Consumer reads все historical messages.
+Для новых consumers на existing topic обычно latest — не хотим reprocess historical data. Для migration scenarios earliest — process всё accumulated data.
 
-latest — только новые сообщения. Пропускает history.
+## Consumer group mechanics
 
-none — throw exception если no offset. Для strict scenarios где либо offset есть либо fail.
-
-Для новых consumers на existing topic обычно latest — не хотим reprocess historical data.
-
-## Consumer group
-
-Consumer group это набор consumers делящих обработку topic. Ключевая абстракция для parallelism.
+Consumer group это набор consumers делящих обработку topic. Fundamentally coordinated mechanism для parallel processing с maintaining partition ordering.
 
 ```
 Topic "orders" (partitions 0, 1, 2, 3)
@@ -193,34 +213,33 @@ Topic "orders" (partitions 0, 1, 2, 3)
 └───────────────────────────────────┘
 ```
 
-Правило — каждая partition назначена ровно одному consumer в group. Если consumers меньше partitions некоторые consumers обслуживают multiple partitions. Если consumers больше partitions лишние простаивают.
+Внутри Kafka group coordinator (один из brokers) manages group. Assigns partitions to consumers. Tracks heartbeats. Detects failures. Coordinates rebalances.
 
-Отсюда важное следствие. Partition это единица parallelism. Хочешь больше parallelism — создавай больше partitions. Меньше partitions чем ожидаемых consumers — waste resources.
+Правило — каждая partition назначена ровно одному consumer в group. Если consumers меньше partitions — some consumers обслуживают multiple partitions. Если consumers больше partitions — лишние простаивают completely.
 
-Разные groups подписанные на same topic получают каждая свою копию сообщений:
-```
-Topic "orders"
-    │
-    ├─ Group "order-processor" (consumers A, B) — получают все сообщения
-    │
-    ├─ Group "audit-logger" (consumers C, D) — тоже получают все
-    │
-    └─ Group "analytics" (consumers E) — все сообщения
-```
+Отсюда important implication. Partition это единица parallelism. Хочешь больше parallelism — создавай больше partitions при создании topic. Меньше partitions чем ожидаемых consumers — waste resources. Планировать partition count based на maximum expected consumer count.
 
-Это equivalent fanout pattern в RabbitMQ. Каждая group processes independently — не влияют друг на друга.
+Разные groups подписанные на same topic получают каждая свою копию сообщений. Independent processing per group.
 
 ## Rebalancing
 
 Rebalance это перераспределение partitions между consumers группы. Triggered в нескольких сценариях. Новый consumer join группу. Consumer покинул (normal shutdown или crash). Изменение partition count в topic.
 
-Во время rebalance вся группа не потребляет — freeze. Может занять секунды. Всё group operations paused до completion.
+Во время rebalance — вся группа не потребляет — freeze. Может занять секунды или минуты для large groups. All group operations paused до completion. Значительный impact на processing latency during rebalance.
 
-Rebalancing storm это проблема когда consumers нестабильны и rebalances происходят часто. Fixing через настройку heartbeat.interval.ms и session.timeout.ms.
+Rebalancing storm это проблема когда consumers нестабильны и rebalances происходят часто. Обычно из-за slow processing exceeding max.poll.interval.ms triggering false failure detection. Fixing через настройку heartbeat.interval.ms и session.timeout.ms plus max.poll.interval.ms basedна expected processing time.
 
-Стратегии assignor определяют как partitions распределяются между consumers. RangeAssignor default — topics в alphabetical order, partitions в ranges. RoundRobinAssignor — round-robin по всем topics вместе. StickyAssignor минимизирует reassignment при rebalance — preserves previous assignments где возможно. CooperativeStickyAssignor (Kafka 2.4+) — incremental rebalance, не полный freeze.
+Стратегии assignor определяют как partitions распределяются между consumers.
 
-Правило для новых consumers — CooperativeStickyAssignor. Значительно меньше disruption во время rebalance.
+RangeAssignor default. Topics в alphabetical order, partitions distributed в ranges. Consumer 1 gets partitions 0-3, Consumer 2 gets 4-7, etc. Simple но can create uneven distribution across topics.
+
+RoundRobinAssignor. Round-robin distribution через all topics вместе. Better balance но не preserves topic locality.
+
+StickyAssignor. Minimizes partition reassignment при rebalance. Preserves previous assignments where possible. Only necessary changes made.
+
+CooperativeStickyAssignor (Kafka 2.4+). Incremental rebalance — не полный freeze. Consumers gradually reassigned один за одним, keeping most active. Significantly reduces disruption during rebalances.
+
+Правило для новых consumers — CooperativeStickyAssignor. Значительно меньше disruption во время rebalance. Migration от older assignors requires coordinated update всех consumers в group.
 
 ## Offset management
 
@@ -249,26 +268,26 @@ while (running) {
 }
 ```
 
-Обработать сначала, только потом commit. Если crash до commit — messages обрабатываются снова при restart (idempotency важна для safety).
+Обработать сначала, только потом commit. Если crash до commit — messages обрабатываются снова при restart. Idempotency обязательна.
+
+commitSync внутри — Kafka producer operation. Consumer opens connection к coordinator, sends offset commit request, waits for response. Small overhead per commit — не хочется commit после каждого message в high-throughput scenarios.
 
 Ручной offset control:
 ```java
-// commit конкретных offsets
 Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
 offsets.put(new TopicPartition("orders", 0), new OffsetAndMetadata(42L));
 consumer.commitSync(offsets);
 
-// seek к конкретному offset
 consumer.seek(new TopicPartition("orders", 0), 100L);
 consumer.seekToBeginning(...);
 consumer.seekToEnd(...);
 ```
 
-seek useful для replay событий (start from earlier point), skip poisoned messages (jump past known bad offset).
+seek useful для replay событий (start from earlier point), skip poisoned messages (jump past known bad offset), reprocess specific range.
 
 commitSync vs commitAsync trade-offs. Sync блокирует до подтверждения — надёжно but slow. Async не блокирует plus callback — быстро но crash before callback loss commit.
 
-Практика — commitSync после каждого batch. commitAsync between batches если want быстрый intermediate commits. Combination gives reliability plus reasonable performance.
+Практика — commitSync после каждого batch. commitAsync между batches если want быстрый intermediate commits. Combination gives reliability plus reasonable performance.
 
 ## Delivery semantics в consumer
 
@@ -288,9 +307,7 @@ consumer.commitSync();
 
 Дубли возможны (crash между process и commit). Always идемпотентный consumer.
 
-Exactly-once комбо всех features. Idempotent producer. Transactional producer для multi-partition writes. isolation.level=read_committed на consumer чтобы читать только committed transactions. Обработка plus commit внутри Kafka-транзакции.
-
-Пример stream processing exactly-once:
+Exactly-once комбо всех features. Idempotent producer. Transactional producer для multi-partition writes. isolation.level=read_committed на consumer чтобы читать только committed transactions. Обработка plus commit внутри Kafka-транзакции:
 ```java
 producer.beginTransaction();
 try {
@@ -309,11 +326,11 @@ try {
 
 ## Heartbeat и session
 
-Consumer посылает heartbeat coordinator'у чтобы «я жив». Два разных timing параметра.
+Consumer посылает heartbeat coordinator'у чтобы signal alive. Два разных timing параметра важно understand.
 
 heartbeat.interval.ms=3000 — как часто (default 3 секунды). Идёт в отдельном thread от processing.
 
-session.timeout.ms=10000 — если нет heartbeat за N миллисекунд consumer считается dead и triggers rebalance. Default 10 секунд, максимум 30 секунд до Kafka 3.0, 45 секунд в 3.0+.
+session.timeout.ms=10000 — если нет heartbeat за N миллисекунд consumer считается dead и triggers rebalance. Default 10 секунд.
 
 max.poll.interval.ms=300000 (5 минут) — независимый timeout. Если между poll calls больше — dead. Ловит случаи где heartbeat thread живой но main processing застрял.
 
@@ -328,21 +345,18 @@ Callback выполняющийся при rebalance:
 consumer.subscribe(List.of("orders"), new ConsumerRebalanceListener() {
     @Override
     public void onPartitionsRevoked(Collection<TopicPartition> parts) {
-        // Партиции забирают → commit оставшиеся offsets
         consumer.commitSync();
     }
     @Override
     public void onPartitionsAssigned(Collection<TopicPartition> parts) {
-        // Новые partitions — можно инициализировать state
+        // Инициализация state для новых partitions
     }
 });
 ```
 
-onPartitionsRevoked вызывается перед losing partitions. Хорошее место для commit offsets того что already processed чтобы не reprocess после rebalance.
+onPartitionsRevoked вызывается перед losing partitions. Хорошее место для commit offsets already processed чтобы не reprocess после rebalance.
 
 onPartitionsAssigned вызывается при getting new partitions. Инициализация state, seek к desired offset if applicable, cleanup previous state.
-
-Полезно для graceful commit при shutdown или rebalance scenarios.
 
 ## Дедуп на consumer стороне
 
@@ -358,7 +372,6 @@ processedRepo.save(new Processed(record.key()));
 Идемпотентные UPDATE через condition:
 ```sql
 UPDATE orders SET status='PROCESSED' WHERE id=? AND status='NEW';
--- второй раз ничего не изменит потому что status уже PROCESSED
 ```
 
 UPSERT для inserts:
@@ -391,25 +404,25 @@ while (running) {
 
 Caveat — теряется ordering обработки внутри partition. Если ordering matters — не делать multi-threading внутри partition.
 
-Spring Kafka имеет concurrency setting который по сути создаёт несколько consumers в одном приложении. Более structured approach.
+Spring Kafka имеет concurrency setting который по сути создаёт несколько consumers в одном приложении. Более structured approach через framework abstraction.
 
 ## Real-world типичные ошибки
 
 Медленный consumer plus rebalance. max.poll.interval.ms истёк — coordinator убил — rebalance — after rebalance тот же consumer снова медленный — loop.
 
-Fix. Уменьшить max.poll.records плюс увеличить max.poll.interval.ms. Или профилировать почему обработка медленная.
+Fix. Уменьшить max.poll.records плюс увеличить max.poll.interval.ms. Или профилировать почему обработка медленная — обычно external calls внутри processing loop.
 
 Poison pill. Message с invalid форматом — Deserializer падает при poll — poll throws exception — бесконечный retry потому что offset не commited.
 
-Fix. ErrorHandlingDeserializer (Spring Kafka) оборачивает parsing и отправляет problematic messages в DLT (Dead Letter Topic). Или custom code с try/catch десериализации.
+Fix. ErrorHandlingDeserializer (Spring Kafka) оборачивает parsing и отправляет problematic messages в DLT (Dead Letter Topic). Или custom code с try/catch десериализации плюс skip poisoned messages.
 
 Дубли из-за crash между process и commit. Обычная реальность at-least-once semantics. Идемпотентность consumer'а обязательна — no way around.
 
 Offset lag растёт. Consumer не догоняет producer. Причины. Медленный consumer processing time exceeds message arrival rate. Мало consumers в группе. Мало partitions (нельзя добавить больше consumers чем partitions). Downstream БД или API тормозит.
 
-Мониторить consumer lag = latest_offset - current_offset per partition. Grafana dashboards с alerts на growing lag.
+Мониторить consumer lag = latest_offset - current_offset per partition. Grafana dashboards с alerts на growing lag. Sustained lag increase indicates capacity problem needing action.
 
-Hot partition — один key берёт большую часть трафика — одна partition перегружена, другие простаивают. Fix через sharding ключа либо custom partitioner distributing load more evenly.
+Hot partition — один key берёт большую часть трафика — одна partition перегружена, другие простаивают. Fix через sharding ключа либо custom partitioner distributing load more evenly. Sometimes require redesign key strategy — не use natural id как key если distribution uneven.
 
 ## Kafka Streams кратко
 
@@ -422,21 +435,23 @@ orders
     .to("big-orders");
 ```
 
-Возможности. Exactly-once semantics built-in. Stateful operations через RocksDB local state stores. Joins между streams. Windowed aggregations по времени. Full stream processing capabilities.
+Возможности. Exactly-once semantics built-in. Stateful operations через RocksDB local state stores. Joins между streams. Windowed aggregations по времени.
 
 Отдельная тема — не в этом file. Важно знать что existence — для сложных stream processing scenarios Kafka Streams мощнее чем raw consumer.
 
 ## Итоги
 
-Producer. acks=all plus enable.idempotence=true plus reasonable batching через linger.ms и batch.size. compression.type=zstd для network efficiency.
+Producer internal — buffer, batching, sender thread separate от caller. acks=all plus enable.idempotence=true plus reasonable batching через linger.ms и batch.size. compression.type=zstd для network efficiency.
 
 Ключ равно partition равно ordering. Same key routes к same partition preserving order per business entity.
 
-Consumer group делит partitions между consumers. Partition единица parallelism.
+Consumer pull model. Poll returns immediately if data, waits до timeout otherwise. Также drives heartbeats к coordinator.
 
-Rebalance freezes group during redistribution. CooperativeStickyAssignor минимизирует disruption.
+Consumer group делит partitions между consumers. Partition единица parallelism. Coordinator manages assignment plus rebalancing.
 
-Manual commit после обработки. commitSync для reliability. commitAsync between batches для performance.
+Rebalance freezes group during redistribution. CooperativeStickyAssignor минимизирует disruption через incremental rebalance.
+
+Manual commit после обработки. commitSync для reliability. commitAsync между batches для performance.
 
 At-least-once plus идемпотентность = стандартный setup. Exactly-once требует transactions plus consumer в read_committed mode.
 
@@ -448,6 +463,6 @@ Poison pill handling через ErrorHandlingDeserializer или explicit try/ca
 
 Multi-threading внутри consumer теряет partition ordering. Better увеличить consumers в группе если ordering не критичен.
 
-Kafka Streams для сложных stream processing scenarios.
+Kafka Streams для сложных stream processing scenarios с exactly-once semantics.
 
 Дальше — Spring Kafka как high-level abstraction над raw Kafka client в Spring экосистеме.

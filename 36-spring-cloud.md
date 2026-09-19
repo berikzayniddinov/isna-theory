@@ -1,119 +1,108 @@
-# 36. Spring Cloud обзор
+# 36. Spring Cloud: инфраструктурный набор для микросервисной архитектуры
 
-## Что такое Spring Cloud
+## Зачем нужен Spring Cloud
 
-Spring Cloud это набор проектов на основе Spring Boot для решения типовых задач в микросервисной архитектуре. Не единая библиотека а «зонтик» из множества специализированных компонентов каждый со своей ролью. Service discovery, externalized configuration, client-side load balancing, circuit breakers, distributed tracing, API gateway, messaging — все эти инфраструктурные concerns покрываются отдельными Spring Cloud подпроектами.
+Разработчик, пишущий монолит на Spring Boot, живёт в удобном мире. База данных одна, конфиг в application.yml, вызовы к сторонним сервисам через RestTemplate или Feign с указанием конкретного URL. Всё просто. Но когда монолит распиливается на десятки микросервисов, простые вопросы становятся сложными. Куда обращаться за данными пользователя — какой URL у user-service? Что делать если user-service временно недоступен — падать вместе с ним или как-то деградировать? Как обеспечить чтобы конфиги 30 сервисов не разъехались между окружениями? Как отследить один запрос проходящий через пять сервисов чтобы понять где именно возникла проблема?
 
-Философия Spring Cloud — брать проверенные patterns и tools из индустрии (изначально многое из Netflix стека, потом отдельные independent projects) и предоставлять idiomatic Spring integration. Разработчик получает автоконфигурацию, аннотации, интеграцию с остальной Spring экосистемой вместо ручной настройки каждого компонента.
+Каждый из этих вопросов имеет свой класс решений. Service discovery — где найти сервис. Circuit breaker — как защитить от каскадных отказов. Configuration server — как централизовать конфиги. Distributed tracing — как проследить запрос через границы сервисов. API gateway — как разграничить внешний мир от внутренней топологии. Client-side load balancing — как распределить нагрузку между несколькими инстансами одного сервиса. Все эти решения реализованы через различные technology choices в индустрии, но unified в один umbrella-project — Spring Cloud.
 
-Каждый компонент называется spring-cloud-* — spring-cloud-consul-discovery, spring-cloud-openfeign, spring-cloud-gateway. Подключаются как отдельные dependencies по необходимости. Проект не заставляет использовать всё — можно выбрать нужные компоненты для конкретной архитектуры.
+Разница между разработчиком «использующим Spring Cloud» и «понимающим Spring Cloud» проявляется когда что-то идёт не так. Первый следует туториалу и надеется. Второй знает что Netflix Ribbon пропущен и заменён на Spring Cloud LoadBalancer с существенно другой семантикой (например case-sensitivity в service names), знает почему Zuul 1 не совместим с Java 17+ и нужна миграция на Spring Cloud Gateway с reactive stack, знает как Discovery Client'ы кэшируют service instances и почему свежедобавленный сервис не сразу виден остальным. Знает конкретную interoperability версий — Spring Boot 2.6 работает только с Spring Cloud 2021.0.x, попытка использовать 2022.0.x приведёт к странным NoClassDefFoundError в runtime.
 
-## Совместимость Spring Boot и Spring Cloud
+В этом файле мы разберём этот landscape. Spring Cloud как umbrella-проект: что такое release train, почему совместимость версий критична. Три категории компонентов: живые (активно развиваются), deprecated Netflix stack (сохранены для legacy но не для новых проектов), attractive-but-rare (interesting concepts но редко нужны в реальных проектах). Detailed разбор каждого живого компонента — Consul discovery, OpenFeign, Spring Cloud LoadBalancer, Spring Cloud Gateway, Resilience4j, Micrometer Tracing. Что реально используется в КНП и почему определённые выборы сделаны так а не иначе.
 
-Spring Cloud тесно привязан к версии Spring Boot. Каждый Spring Cloud release train совместим только с конкретным диапазоном Spring Boot версий. Использование несовместимых версий приведёт либо к ошибкам сборки либо к runtime failures.
+## Umbrella и release train
 
-Таблица соответствия:
+Spring Cloud это не одна библиотека а набор проектов. Spring Cloud Config, Spring Cloud Consul, Spring Cloud OpenFeign, Spring Cloud LoadBalancer, Spring Cloud Gateway, Spring Cloud Stream, Spring Cloud Bus, Spring Cloud Sleuth (deprecated) — каждый отдельный Maven/Gradle module со своими versioning и dependencies. Использовать их все одновременно необязательно — типичный микросервис КНП использует Consul, OpenFeign, LoadBalancer, но не Config, Stream, или Bus.
 
-| Spring Boot | Spring Cloud release train |
-|---|---|
-| 2.2.x | Hoxton |
-| 2.3.x | Hoxton |
-| 2.4.x | 2020.0.x (Ilford) |
-| 2.6.x | 2021.0.x (Jubilee) |
-| 3.0.x | 2022.0.x (Kilburn) |
-| 3.1.x | 2022.0.x |
-| 3.2.x | 2023.0.x (Leyton) |
-| 3.3.x | 2023.0.x |
+Release train это concept для координации versioning всех этих subprojects. Каждый release train имеет alphabetical name (Angel, Brixton, Camden, Dalston, Edgware, Finchley, Greenwich, Hoxton, Ilford, Jubilee, Kilburn, Leyton) плюс sequence number. Все subprojects в одном train tested to work together. Внутри одного train mismatch между subprojects обычно not допустим.
 
-Practical rule — при апгрейде Spring Boot обязательно проверить и обновить Spring Cloud dependency management BOM. При апгрейде Spring Cloud обязательно проверить что версия совместима с текущим Boot.
+Совместимость с Spring Boot критична и строго ограничена. Spring Boot 2.2 требует Spring Cloud Hoxton. Spring Boot 2.6 — Spring Cloud 2021.0. Spring Boot 3.0 — Spring Cloud 2022.0. Попытка использовать неcompatible пару обычно даёт странные runtime errors — ClassNotFoundException, NoSuchMethodError, mysterious autoconfiguration failures. Причина — Spring Cloud внутренне использует Spring Boot internals (autoconfiguration mechanisms, ConditionalOn annotations), и эти API меняются между major versions Spring Boot.
 
-В КНП master branch использует Boot 2.2 plus Cloud Hoxton.SR3. Master-21 branch с миграцией на Java 21 использует Boot 3 plus Cloud 2022.x. Различные модули на разных Boot версиях подтверждают что Cloud version должен строго matching для каждого.
+Практическое правило — при апгрейде Spring Boot всегда проверять и обновлять Spring Cloud version согласно compatibility matrix. При апгрейде Spring Cloud — проверить что Spring Boot version подходит. Никаких «downgrade Spring Boot а Cloud оставить» или обратно — recipe для disaster.
 
-## Spring Cloud Config
+В КНП это правило проявляется буквально. Master branch использует Spring Boot 2.2 плюс Spring Cloud Hoxton.SR3. Все модули на этой ветке живут в этом ограничении. Master-21 branch мигрирует на Java 21 плюс Spring Boot 3 плюс Spring Cloud 2022.0. Все модули этой ветки должны быть на consistent versions. Cross-branch merges (например если фича сделана в master и мержится в master-21) требуют careful attention к Spring Cloud API differences.
 
-Централизованный конфиг-сервер. Клиенты читают свои конфигурации на старте из этого сервера вместо чтения из локальных application.yml. Позволяет управлять конфигурацией централизованно для множества сервисов.
+## Три категории компонентов
 
-Backend обычно Git repository содержащий yml или properties файлы:
-```
-config-repo/
-├── application.yml            ← общий для всех
-├── isna-knp.yml               ← для isnaknp
-└── isna-knp-prod.yml          ← для isnaknp с profile=prod
-```
+Spring Cloud эволюционировал через несколько эр. Изначально heavily leveraged Netflix OSS stack — Eureka, Ribbon, Hystrix, Zuul. Netflix открыл эти компоненты open source в 2013-2015 годах когда они были cutting edge. Но в 2018-2020 годах Netflix постепенно свёл их к maintenance mode — новых features не добавляется, только critical bug fixes.
 
-Клиент указывает URL config-server и своё application name:
-```yaml
-# bootstrap.yml
-spring:
-  application:
-    name: isna-knp
-  cloud:
-    config:
-      uri: http://config-server:8888
-```
+Первая категория — живые компоненты которые активно развиваются и рекомендованы для новых проектов. Spring Cloud Consul для service discovery. Spring Cloud OpenFeign для declarative HTTP clients. Spring Cloud LoadBalancer как current-generation client-side balancer. Spring Cloud Gateway как reactive gateway. Resilience4j как current circuit breaker library. Micrometer Tracing как distributed tracing. Все эти проекты имеют active development, regular releases, strong community support.
 
-На старте client tries pull конфиг из Config Server. Если недоступен — startup может fail (или использовать local fallback в зависимости от настройки).
+Вторая категория — deprecated Netflix stack. Netflix Eureka для service discovery — не развивается. Netflix Ribbon для client-side balancing — deprecated, users migrate to Spring Cloud LoadBalancer. Netflix Hystrix для circuit breaker — maintenance mode с 2018, миграция на Resilience4j. Netflix Zuul 1 для gateway — не совместим с Java 17+, миграция на Spring Cloud Gateway. Netflix Archaius для dynamic configuration — рекомендуется Spring Cloud Config.
 
-В КНП Config Server не используется. Конфиги через application.yml plus environment variables в K8s манифестах. Проще и не создаёт дополнительной точки отказа. Config Server имеет смысл для больших deployments с многими environments и dynamic reloading требованиями.
+Spring Cloud поддерживает эти компоненты в legacy branches для совместимости с existing systems. Но новые проекты не должны использовать. Существующие проекты обычно вынуждены migrate когда апгрейд Java или Spring Boot делает старые компоненты incompatible. В КНП именно это происходит — isna-knp-gateway остаётся на Java 11 потому что использует Zuul 1, миграция на Java 21 требует переход на Spring Cloud Gateway.
 
-## Service Discovery Consul или Eureka
+Третья категория — attractive-but-rare компоненты. Spring Cloud Config сентовый conceptual — централизованный git-backed конфиг с dynamic refresh. Practically редко используется потому что в K8s environments ConfigMap+Secret plus environment variables проще. Spring Cloud Stream — declarative messaging поверх RabbitMQ/Kafka. Elegant но abstraction leaky — производственные troubleshoot situations всё равно требуют knowledge underlying broker. Обычно прямой Spring AMQP или Kafka client проще. Spring Cloud Bus — event bus для system-wide events (например refresh конфига через message). В K8s rollout restart deployment проще. Spring Cloud Contract — consumer-driven contract testing. Elegant но требует discipline не available в большинстве команд.
 
-Service discovery позволяет сервисам находить друг друга по имени вместо hard-coded URLs. Клиент запрашивает у registry «где сервис X?» и получает список активных instances.
+В КНП практически используется только first category. Consul discovery, Feign, LoadBalancer, Circuit Breaker точечно. Gateway на Zuul 1 (legacy) с плановой миграцией на Spring Cloud Gateway. Attractive-but-rare категория не используется — принципиально проще без них.
 
-Consul это решение от HashiCorp. Универсальный service registry plus KV store plus health checking plus multi-datacenter федерация. В КНП стандартный выбор — Consul.
+## Service Discovery: Consul как основа
 
-Eureka был решением от Netflix. Только discovery без дополнительных функций. Устарел, находится в maintenance mode. Не рекомендуется для новых проектов. Kubernetes Service обеспечивает discovery через DNS и endpoints автоматически что делает Eureka излишним в K8s environments.
+Service discovery решает проблему «где найти сервис по имени». Сервис А хочет вызвать сервис Б — вместо hardcoded URL «http://users.internal:8080» А спрашивает у Discovery «какие instances Users доступны?» и получает список текущих alive instances.
 
-Детально Consul обсуждался в файле 11 consul-detailed.
+Как это работает механически. При старте каждый Spring Boot микросервис регистрируется в Consul через spring-cloud-consul-discovery starter. Регистрация включает service name (isnaknpuser), IP address (обычно pod IP в K8s), port, plus health check URL. Consul сохраняет эту регистрацию в своей data structure (KV store через Raft consensus). Периодически (каждые 10 seconds) Consul вызывает health check URL — если возвращает 200, instance считается healthy, если нет — marked unhealthy. Автоматически unhealthy instances убираются из discovery results через несколько failed checks.
 
-## Spring Cloud LoadBalancer
+Client discovery работает так. Когда сервис А хочет позвать service B — spring-cloud-loadbalancer запрашивает у Consul список healthy instances of B. Consul возвращает список (может быть кэшированный локально). LoadBalancer выбирает один instance согласно algorithm (round-robin по default). Actual HTTP request идёт напрямую к выбранному instance IP:port — Consul только предоставил discovery, не participating в actual data path.
 
-Client-side load balancer как замена deprecated Ribbon. Работает с RestTemplate, WebClient, Feign через integration.
+Detailed Consul обсуждается в файле 11. Здесь важно отметить как Spring Cloud interfaces с Consul. Spring-cloud-consul-discovery starter добавляет ConsulDiscoveryClient bean который implements DiscoveryClient interface. LoadBalancer uses ServiceInstanceListSupplier which internally uses DiscoveryClient. Feign integrates с LoadBalancer через LoadBalancerInterceptor — Feign target «lb://isnaknpuser» resolves к service name, LoadBalancer picks instance, Feign делает call.
 
-Использование через service name вместо URL:
-```java
-@Autowired RestTemplate rest;   // с @LoadBalanced аннотацией
+Health check тонкость. По default Consul-registered service exposes /actuator/health как health check endpoint. Spring Boot Actuator health включает многие indicators — БД, RabbitMQ, Redis, disk space. Если любой indicator DOWN — general health DOWN — Consul marks unhealthy. При проблемах с одной dependency (например Redis) весь сервис может стать unavailable из discovery perspective, даже если он способен обрабатывать requests не требующих Redis. Practical mitigation — configurate health indicators explicitly, use readinessState indicator instead of general health для discovery purposes.
 
-UserDto u = rest.getForObject("http://isnaknpuser/api/users/1", UserDto.class);
-// isnaknpuser → Consul lookup → выбор instance → replace URL → request
-```
+## OpenFeign: декларативные HTTP clients
 
-Под капотом Spring Cloud LoadBalancer использует ServiceInstanceListSupplier получающий список instances из Consul или другого registry. Применяет configured algorithm (RoundRobin, Random, custom) для выбора конкретного instance. Заменяет service name в URL на actual host:port и выполняет запрос.
-
-Детально в файле 31 load-balancer.
-
-## Spring Cloud OpenFeign
-
-Декларативный HTTP клиент. Определяется как Java interface с annotations, Spring генерирует реализацию:
+OpenFeign это declarative REST client library. Вместо императивного кода вызывающего RestTemplate или WebClient, разработчик описывает REST API как Java interface с annotations, и Feign генерирует implementation:
 ```java
 @FeignClient(name = "isnaKnpUser")
 public interface UserClient {
     @GetMapping("/api/users/{id}")
     UserDto getById(@PathVariable Long id);
+    
+    @PostMapping("/api/users")
+    UserDto create(@RequestBody UserCreateRequest req);
 }
 ```
 
-Использование как обычный @Autowired bean:
+Injection работает как обычно:
 ```java
 @Autowired UserClient userClient;
 UserDto u = userClient.getById(42L);
 ```
 
-Интегрируется автоматически с Spring Cloud LoadBalancer для service discovery. Поддерживает Circuit Breaker integration для resilience. Настраиваемая retry и timeout policies.
+Механика под капотом сложнее чем кажется. При старте Spring @EnableFeignClients scans classes с @FeignClient. Для каждого interface создаётся FeignClient proxy через JDK dynamic proxy. Proxy implements указанный interface. Method invocation intercepted — Feign inspects annotations (@GetMapping, @PathVariable, etc), builds HTTP request с proper URL, headers, body serialization. Отправляет через underlying HTTP client (Apache HttpComponents по default, но конфигурируется). Deserializes response через Jackson. Возвращает результат.
 
-Замена ручного использования RestTemplate или WebClient плюс manual service discovery. Cleaner code, less boilerplate, easier testing через interface mocking.
+Integration со Spring Cloud LoadBalancer автоматическая. Feign target «name = isnaKnpUser» resolves как service name не URL. Perinstead LoadBalancer picks instance from Consul-registered list. Actual URL built dynamically per-call. Из view of application code это transparent.
 
-Детально Feign обсуждался в файле 11 consul-detailed.
+Retry, timeout, error handling конфигурируется через various mechanisms. Default retry disabled — Feign fails fast on any HTTP error. Explicit retryer bean можно добавить для retry logic. Feign имеет timeout settings (connectTimeout, readTimeout) конфигурируемые per client или globally. ErrorDecoder для custom translation HTTP errors в specific exceptions.
 
-## Spring Cloud Circuit Breaker
+Circuit Breaker integration с Resilience4j через spring-cloud-starter-circuitbreaker-resilience4j. При enabled — Feign calls wrapped в CircuitBreaker automatically. Failed calls counted, thresholds trigger open state, subsequent calls fail-fast с fallback if configured.
 
-Абстракция над разными circuit breaker implementations. Позволяет менять underlying реализацию без изменения application code.
+Practical caveats. Feign уходит в maintenance mode — не отвергнут но не активно развивается. Spring Cloud shifts focus к WebClient (reactive) и RestClient (blocking, Spring 6+). Для существующих проектов Feign still fine — миграция не urgent. Для новых проектов возможно RestClient более future-proof choice.
 
-Реализации. Resilience4j — современная замена Hystrix, наиболее часто используется. Sentinel — решение от Alibaba, популярно в Азии. Spring Retry — простой retry без full circuit breaker behavior.
+Serialization gotchas. Feign по default uses Jackson через SpringDecoder. LocalDateTime и другие Java time types требуют proper Jackson configuration — обычно ObjectMapper.registerModule(new JavaTimeModule()) через Spring auto-config. Отсутствие configuration приводит к ошибкам serialization/deserialization на HTTP calls.
 
-Hystrix от Netflix был первым mainstream circuit breaker в Java. Deprecated с 2018 года. В maintenance mode — только критические bug fixes, никакого нового функционала. Не рекомендуется для новых проектов.
+## Spring Cloud LoadBalancer: замена Ribbon
 
-Пример с Resilience4j:
+Netflix Ribbon был classic client-side load balancer десятилетие назад. Ribbon интегрировался с Feign, RestTemplate, Eureka discovery. Netflix прекратил его развитие. Spring Cloud LoadBalancer это preferred replacement.
+
+Semantic difference критична. Ribbon был case-insensitive при resolving service names — «IsnaKnpUser», «isnaknpuser», «ISNA_KNP_USER» все resolved to same registered service. Spring Cloud LoadBalancer строгий case-sensitive. Migration Ribbon → LoadBalancer в existing codebase может expose bugs где service references case-inconsistent.
+
+Реальный кейс из КНП memory knp-fo-consul-lb-mr1223-latent-mine. При миграции с Ribbon на Spring Cloud LoadBalancer часть Feign clients использовала camelCase service names («isnaKnpUser») в @FeignClient(name = ...) annotation. Consul registered services как lowercase («isnaknpuser»). Ribbon lookup workedдержался благодаря case-insensitive comparison. LoadBalancer failed lookup — service not found — Feign call fails with 500 error. Все places где service names могли differ должны быть carefully audited и unified.
+
+Механика LoadBalancer. При call на service name — LoadBalancer использует ServiceInstanceListSupplier для получения текущего списка available instances. Список обычно fetched from Consul через DiscoveryClient. Instances могут быть filtered — например через ZoneAffinityFilter for preferring instances в same availability zone. Затем ReactorLoadBalancer picks one instance по algorithm.
+
+Default algorithm RoundRobinLoadBalancer — простая round-robin distribution requests между instances. RandomLoadBalancer alternative для non-sequential distribution. Custom algorithms реализуются через ReactorLoadBalancer interface — например weighted based на capacity или health metrics.
+
+Кэширование instances важно для performance. Fetching from Consul на каждый request — network round-trip. Locally cached list refreshed periodically. По default refresh каждые 15-30 seconds. Между refreshes changes в registered services не visible — new service just registered в Consul может быть invisible for a period. Практически not проблема для normal operations но important для understanding behavior at scale.
+
+## Circuit Breaker с Resilience4j
+
+Circuit breaker решает cascading failure problem. Downstream service starts failing — upstream service continues calling — retries pile up — resources exhaust — upstream service tоже становится unresponsive — clients upstream тоже начинают fail — весь system down.
+
+Idea — detect downstream problem quickly, stop calling для period, wait for recovery, gradually resume. Analogous к electrical circuit breaker — при overcurrent разомкается предотвращая damage.
+
+Три состояния circuit breaker. CLOSED — normal operation, all requests pass through к downstream. OPEN — detected sustained failures, all requests immediately fail с error/fallback без attempt call downstream. HALF_OPEN — after cooldown period, allow limited number of test requests to check если downstream recovered.
+
+Transition CLOSED → OPEN triggered когда failure rate exceeds threshold within sliding window. Например «50% failure rate за last 20 requests → OPEN for 30 seconds». Configuration через properties или @CircuitBreaker annotation:
 ```java
 @CircuitBreaker(name = "isnaKnpUser", fallbackMethod = "fallback")
 public UserDto getUser(Long id) {
@@ -125,17 +114,23 @@ public UserDto fallback(Long id, Throwable t) {
 }
 ```
 
-Circuit breaker имеет три состояния. CLOSED normal operation — все запросы проходят. OPEN при обнаружении проблем downstream — запросы сразу fail с fallback, не отправляются в downstream. HALF_OPEN после cooldown period — pass через определённое количество test запросов, based на их результате принимается решение возвращаться в CLOSED или оставаться OPEN.
+Fallback method имеет same signature plus Throwable как last parameter. Вызывается когда circuit OPEN или actual call fails. Returns fallback value обеспечивая graceful degradation.
 
-Настройка порогов — например «50 процентов ошибок за последние 20 запросов → OPEN на 30 секунд → HALF_OPEN с 5 test запросами». Настраивается per-circuit для разных services.
+Resilience4j implementation через AOP proxy подобный @Transactional. При @CircuitBreaker annotated method call — proxy checks circuit state. CLOSED — actual call, result или exception recorded в metrics. OPEN — immediate return fallback. HALF_OPEN — limited test calls, based on results transition either back to CLOSED or forward to OPEN.
 
-Плюсы circuit breaker. Защита от каскадных отказов — падение одного downstream не блокирует upstream сервисы. Fast fail улучшает UX — пользователь получает ошибку быстро вместо ожидания timeout. Даёт downstream время на recovery без continued нагрузки.
+Sliding window это внутренняя structure tracking recent call results. Two types available. Count-based — considers last N calls (например 20). Time-based — considers calls в last M seconds. Threshold calculated based on window contents.
+
+Metrics exposed via Micrometer для monitoring. resilience4j.circuitbreaker.state gauge showing текущее состояние. resilience4j.circuitbreaker.calls counter partitioned by outcome (successful, failed, ignored, not_permitted). Alerts на sustained OPEN state critical для operational awareness.
+
+Practical rules для usage. Не любой downstream call нуждается в circuit breaker — overhead и complexity. Полезно для критичных external services или потенциально slow downstream. Fallback method должна быть fast и safe — не calling other services которые тоже могут fail.
 
 ## Spring Cloud Gateway
 
-Современная замена Zuul (устаревшего Netflix gateway). Reactive gateway на Spring WebFlux plus Netty. Обеспечивает production-grade API gateway functionality.
+Netflix Zuul 1 был popular gateway solution — thread-per-request model, blocking IO. Zuul 2 released но никогда не supported by Spring Cloud. Spring Cloud Gateway — modern replacement built on Spring WebFlux plus Netty — reactive, non-blocking, higher throughput per resource.
 
-Конфигурация через yml или Java:
+Gateway это entry point для внешнего трафика. Все external requests hit gateway first. Gateway routes to appropriate internal service based on rules. Along the way applies filters — authentication, rate limiting, header manipulation, request logging.
+
+Configuration через yml declarative:
 ```yaml
 spring:
   cloud:
@@ -150,129 +145,42 @@ spring:
             - AddRequestHeader=X-Source, gateway
 ```
 
-Возможности. Роутинг по любым атрибутам HTTP — path, headers, method, cookies, host. Filters для transformations — authentication, rate limiting, header manipulation, retry. Circuit breaker integration через Resilience4j. Metrics через Micrometer. Custom filters через Java для сложной logic.
+Predicates определяют когда route applies. Path predicate matches URL patterns. Method matches HTTP methods. Header matches specific headers. Query matches query parameters. Multiple predicates combined через AND — все должны match.
 
-В КНП isna-knp-gateway использует Zuul 1 (Netflix, deprecated). Не мигрирован на Spring Cloud Gateway. Memory кейс knp-gateway-no-java21 отмечает что gateway остаётся на Java 11 потому что Zuul 1 не совместим с новыми Java версиями. Миграция на Spring Cloud Gateway необходима для дальнейшего upgrade path но не выполнена по причине сложности и complexity.
+Filters transform request/response. Pre-filters run before forwarding to downstream. Post-filters run after response received. Built-in filters include StripPrefix (remove path prefixes), AddRequestHeader/AddResponseHeader (inject headers), RewritePath (URL rewriting), Retry (automatic retries), CircuitBreaker (integration with Resilience4j), RequestRateLimiter (rate limiting), TokenRelay (OAuth2 token propagation).
 
-## Distributed Tracing
+Custom filters через Java классы implementing GatewayFilter interface. Мощно для business-specific transformations — например custom authentication schemes, complex routing based на content, tenant identification.
 
-Sleuth или Micrometer Tracing. Sleuth deprecated с Boot 3, Micrometer Tracing это замена в новых версиях.
+Reactive nature imposes некоторые constraints. All Java code в custom filters должно быть non-blocking. Blocking calls (например synchronous JDBC, synchronous HTTP) в reactive stack приводят к thread starvation. Debugging reactive code more complex — stack traces less informative, error propagation через reactive operators.
 
-Что делает. Автоматически добавляет traceId и spanId в MDC — все логи request имеют одинаковый traceId. Пробрасывает эти identifiers через HTTP headers к downstream services — все связанные операции получают одинаковый traceId. Экспортирует traces в специализированные системы — Zipkin, Jaeger, OpenTelemetry compatible backends.
+В КНП isna-knp-gateway использует Zuul 1 не Spring Cloud Gateway. Legacy решение сохранившееся с ранних этапов проекта. Memory knp-gateway-no-java21 отмечает что gateway остаётся на Java 11 потому что Zuul 1 не совместим с Java 17+. Миграция на Spring Cloud Gateway необходима для дальнейшего upgrade path но complex — все routing rules plus custom filters нужно переписать в reactive style. Постоянно в planning не выполнено пока.
 
-Пример лога с trace ID:
+## Distributed Tracing: Sleuth и Micrometer
+
+Distributed tracing решает problem tracing единого request через несколько services. Пользователь делает HTTP request → gateway → service A → service A calls service B → service B queries database. Если что-то slow или fails — как определить где именно?
+
+Concept trace and span. Trace это все work поставленная одному logical request. Trace ID uniquely identifies trace. Span это piece of work within trace — HTTP request, database query, external call. Каждый span has unique span ID plus optional parent span ID forming tree.
+
+Как propagates через service boundaries. Service A doing outgoing HTTP call inserts headers — X-B3-TraceId, X-B3-SpanId, X-B3-ParentSpanId. Service B receiving request extracts these headers и creates new span as child of received span. Continued down the chain — trace tree builds up.
+
+Sleuth (deprecated with Boot 3) был Spring's implementation. Provided integration с popular tracing backends — Zipkin, Jaeger. Automatically instrumented common integrations — Spring MVC controllers, RestTemplate, Feign, RabbitMQ, JDBC.
+
+Micrometer Tracing это replacement в Boot 3+. Same concept но based на Micrometer's observation abstraction. Same integrations available. Bridge adapters для both Zipkin and OpenTelemetry backends.
+
+MDC integration. Trace and span IDs automatically populated в SLF4J MDC. Logs включают them через pattern:
 ```
 2026-09-05 10:15:30 [traceId=abc123,spanId=def456] INFO OrderService - Order created
 ```
 
-В Zipkin или Jaeger UI видна полная trace одного запроса. HTTP /api/knp вызывает Feign который делает HTTP request к isnaKnpUser, который делает SQL query к PostgreSQL. Каждый шаг — отдельный span в trace с timing information. Легко определить где latency, где ошибки.
+При правильно configured centralized logging (ELK), searching for traceId shows все logs всей trace across services. Powerful debugging capability.
 
-В КНП distributed tracing используется частично. ELK plus custom correlation через headers покрывает большую часть use cases. Полноценный Zipkin/Jaeger может быть добавлен но требует инфраструктурной инвестиции.
+Sampling important. Instrumenting каждый request creates overhead. High-volume services often sample — например 10% of requests fully traced. Trade-off между observability и performance. Configuration через management.tracing.sampling.probability.
 
-## Spring Cloud Stream
+В КНП distributed tracing partially used. Full Zipkin/Jaeger deployment absent но traceId propagation через MDC and correlated logs в ELK provide most of the value. Full-fledged distributed tracing solutions пока не implemented.
 
-Абстракция над message brokers (Kafka, RabbitMQ) — код независим от конкретной implementation:
-```java
-@Bean
-public Function<OrderEvent, PaymentEvent> processOrder() {
-    return event -> {
-        // обработка
-        return new PaymentEvent(...);
-    };
-}
-```
+## Полная production конфигурация
 
-Binding конфигурируется в yml:
-```yaml
-spring.cloud.stream.bindings:
-  processOrder-in-0:
-    destination: orders
-    binder: kafka
-  processOrder-out-0:
-    destination: payments
-```
-
-Плюсы. Смена Kafka на RabbitMQ или наоборот одним изменением binder configuration без изменения application code. Единый API для всех message brokers. Автоматическая интеграция с Spring ecosystem.
-
-Минусы. Абстракция утечная — специфические features конкретных brokers не полностью доступны через generic API. Дополнительный слой между application и broker увеличивает complexity. Обычно требуется troubleshooting на уровне underlying broker что делает abstraction менее полезной.
-
-В КНП Spring Cloud Stream не используется. Прямой Spring AMQP через RabbitTemplate для Rabbit, прямой Kafka client если Kafka используется. Более straightforward, easier to reason about.
-
-## Spring Cloud Contract
-
-Consumer-driven contract testing framework. Producer генерирует stubs основанные на contract definitions. Consumer использует эти stubs в своих тестах. Гарантия — producer не сломает contract потому что stubs обновляются с каждым producer release.
-
-Идея — вместо polling downstream API для changes, contract testing catches API breaks early в CI pipeline. Consumer знает что если тесты proceed с новыми stubs — API совместим.
-
-Использование редкое. Применяется только в зрелых микросервисных командах с advanced testing practices. Requires discipline с contracts definitions и stubs versioning. Overhead может не оправдываться для small teams.
-
-## Spring Cloud Bus
-
-Распределённая шина для events, обычно поверх RabbitMQ или Kafka. Основной use case — refresh конфигурации на всех instances одним запросом:
-```
-POST /actuator/bus-refresh   → шлётся событие в Rabbit
-→ все подписчики (все instances) → refresh конфига из Config Server
-```
-
-Позволяет centralized configuration updates без manual redeploy или scripted process. Полезно в environments где instances плавают (auto-scaling groups) и hard to track individually.
-
-В Kubernetes окружениях необходимость меньше — просто rollout restart deployment применяет configuration changes. Spring Cloud Bus имеет смысл в non-K8s environments или для scenarios требующих runtime configuration updates без restart.
-
-## Spring Cloud Kubernetes
-
-Специфичный для K8s компонент интегрирующий Spring с Kubernetes native concepts. Позволяет использовать ConfigMap и Secret как источники конфигурации через standard Spring PropertySources. Kubernetes Service вместо Consul для service discovery — просто DNS resolution.
-
-Альтернатива Consul для чисто K8s deployments. Убирает необходимость в external service registry когда всё в одном cluster. Simpler infrastructure — меньше компонентов для support.
-
-В КНП может быть alternative migration path если решается уйти от Consul. Требует reevaluation service-to-service communication patterns.
-
-## Deprecated Netflix stack
-
-Netflix открыли много компонентов, потом остановили их развитие. Spring Cloud поддерживает старые версии для legacy compatibility но рекомендует замены для новых проектов.
-
-Таблица соответствия deprecated к current:
-
-| Deprecated | Замена |
-|---|---|
-| Hystrix (circuit breaker) | Resilience4j |
-| Ribbon (LB) | Spring Cloud LoadBalancer |
-| Zuul 1 (gateway) | Spring Cloud Gateway |
-| Eureka (discovery) | Consul или K8s Service |
-| Archaius (config) | Spring Cloud Config |
-
-В новых проектах — только замены. Legacy может продолжать использовать Netflix stack но не может upgrade на новые Boot версии без миграции.
-
-## Типичная микросервисная архитектура
-
-Собранная воедино архитектура с Spring Cloud компонентами:
-```
-Users
-  │
-  ▼
-[Ingress / nginx / F5]         ← L7 внешний
-  │
-  ▼
-[Spring Cloud Gateway]         ← routing, auth, rate limit
-  │
-  ▼
-[Consul discovery]             ← service registry
-  │
-  ├─ service A (Boot + Consul client)
-  │    ├─ Feign → service B
-  │    ├─ Circuit Breaker (Resilience4j)
-  │    └─ PostgreSQL
-  │
-  ├─ service B
-  │
-  └─ service C
-       └─ RabbitMQ / Kafka
-```
-
-Дополнительная инфраструктура. ELK для logs. Prometheus plus Grafana для metrics. Zipkin/Jaeger для distributed tracing. Keycloak для authentication.
-
-## Пример полной конфигурации
-
-Dependencies для типового микросервиса КНП стиля:
+Собранная воедино dependencies для типичного микросервиса КНП:
 ```gradle
 dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-web'
@@ -290,7 +198,7 @@ dependencies {
 }
 ```
 
-Конфигурация:
+Настройки в application.yml объединяют многие concerns:
 ```yaml
 spring:
   application:
@@ -311,24 +219,26 @@ management:
   tracing.sampling.probability: 0.1
 ```
 
-## Что реально используется в КНП
-
-Из практики и memory кейсов. Consul для service discovery и health checking. Feign для HTTP клиентов (isnaKnpUserFeignClient, IsnaFnoDictionaryFeignClient и другие). Spring Cloud LoadBalancer в master-21 (Java 21 модули), Ribbon в master (Java 11 модули). Actuator plus Micrometer для metrics в Prometheus format. Zuul 1 для gateway isna-knp-gateway, только Java 11 (memory knp-gateway-no-java21). Circuit breaker точечно применяется в критических интеграциях.
-
-Не используется. Spring Cloud Config — конфигурация через yml и env variables. Spring Cloud Stream — прямой Spring AMQP предпочтительнее. Spring Cloud Bus — K8s rollout restart достаточен. Spring Cloud Contract — тестирование через integration tests без formal contracts.
+Consul discovery configured. Feign integrated с circuit breaker. OAuth2 resource server для JWT. Actuator plus metrics exposed для Prometheus scraping. Tracing sampling at 10%.
 
 ## Итоги
 
-Spring Cloud это зонтик проектов для микросервисной инфраструктуры. Не единая библиотека — набор специализированных компонентов. Подключаются по необходимости.
+Spring Cloud это umbrella для микросервисной infrastructure. Не single library — collection of specialized subprojects. Использование selective — pick what needed for specific project.
 
-Живые актуальные компоненты. Consul для service discovery. Feign для HTTP clients. Spring Cloud LoadBalancer как замена Ribbon. Spring Cloud Gateway как замена Zuul. Resilience4j для circuit breaker. Micrometer Tracing для distributed tracing.
+Release train coordination critical. Spring Boot и Spring Cloud versions must match — incompatible combinations produce mysterious errors. В КНП master branch на Boot 2.2 + Cloud Hoxton, master-21 branch on Boot 3 + Cloud 2022.
 
-Deprecated Netflix стек. Hystrix, Ribbon, Zuul 1, Eureka. В новых проектах не использовать.
+Три категории компонентов. Живые — Consul, OpenFeign, LoadBalancer, Gateway, Resilience4j, Micrometer Tracing. Deprecated Netflix stack — Eureka, Ribbon, Hystrix, Zuul 1. Attractive-but-rare — Config, Stream, Bus, Contract.
 
-Attractive но редко нужны. Config Server, Stream, Bus, Contract. Имеют место в специфических scenarios но обычно overkill.
+Service Discovery через Consul в КНП. Каждый микросервис self-registers, health checks периодически, discovery client fetches instance lists. Case-sensitive service names in LoadBalancer (unlike old Ribbon) — miграция может обнаружить latent bugs.
 
-В КНП практика — Consul plus Feign plus Zuul 1 (legacy) plus LoadBalancer или Ribbon в зависимости от Java version модуля.
+OpenFeign declarative HTTP clients. Interface plus annotations plus generated proxy. Integration с LoadBalancer transparent. Serialization gotchas around Java time types.
 
-Совместимость Boot и Cloud версий критична. Использование несовместимых версий приведёт к build или runtime failures. Проверять release train при upgrade.
+Spring Cloud LoadBalancer replaces Ribbon. Case-sensitive resolution. Round-robin default algorithm. Cached instance lists refreshed периодически.
 
-Дальше — Nodes как universal термин в distributed systems, различные интерпретации в разных технологиях.
+Circuit Breaker via Resilience4j. Three states CLOSED/OPEN/HALF_OPEN. Threshold-based transitions. Fallback methods для graceful degradation. AOP proxy implementation similar to @Transactional.
+
+Spring Cloud Gateway replaces Zuul 1. Reactive stack на WebFlux plus Netty. Declarative routing rules plus filters. В КНП still Zuul 1 legacy — миграция pending.
+
+Distributed Tracing через Micrometer Tracing (Sleuth deprecated). Trace and span propagation через HTTP headers. MDC integration для traceId в logs. Sampling для managing overhead. В КНП partial usage — traceId в logs but not full-fledged Zipkin/Jaeger.
+
+Дальше — nodes как universal concept в distributed systems, разные interpretations в разных technologies.

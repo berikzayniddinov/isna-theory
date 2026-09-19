@@ -1,26 +1,30 @@
-# 38. Логирование: SLF4J, Logback, ELK
+# 38. Логирование: SLF4J, Logback, MDC, ELK
 
-## Зачем логи
+## Зачем понимать logging глубже println
 
-Logging решает несколько связанных задач в production системе. Debugging — найти причину bugа когда пользователь сообщает о проблеме. Audit — «кто что сделал когда» для compliance и security investigations. Monitoring — «сколько ошибок за минуту» через log-based метрики. Compliance — регуляторные требования часто мандируют определённый logging. Observability — вместе с метриками и traces образует полную картину системы.
+Разработчик который впервые изучает Java обычно начинает с System.out.println. Это работает в hello-world tutorials, работает для debugging локальных программ, работает для простых утилит. Но когда приложение попадает в production — println становится проблемой. Куда идёт вывод? Как найти конкретное событие среди миллионов строк? Как понять что это было — request от пользователя или scheduled job? Как альтернативные компоненты (например мониторинг) могут узнать что произошла ошибка?
 
-Фундаментальное правило — логи в production это НЕ println. Это структурированные события с уровнем важности, timestamp, контекстной информацией. Каждый log message должен быть actionable — приносить value для troubleshooting или monitoring.
+Логи в production выполняют несколько связанных задач которые println не решает. Debugging — найти причину бага когда пользователь сообщает о проблеме несколькими часами позже. Audit — «кто что сделал когда» для compliance и security investigations. Monitoring — «сколько ошибок за минуту» через log-based метрики. Compliance — регуляторные требования могут мандировать конкретное logging (например налоговое законодательство, банковские регуляции). Observability — вместе с метриками и traces образует полную картину поведения системы во времени.
 
-## Уровни логирования
+Разница между разработчиком «пишущим логи» и «правильно пишущим логи» огромна и часто не осознаётся. Первый пишет log.info("Processing " + user.toString() + " with data " + data) и не думает. Второй знает что конкатенация string вычисляется всегда независимо от уровня logging (даже если INFO выключен), что String.format дорог, что placeholder syntax {} lazy evaluates и дешевле, что MDC привязан к thread и при @Async теряется, что printStackTrace идёт в stderr и не парсится ELK как error event, что log.debug("Deep info: {}", heavyComputation()) вычислит heavyComputation даже если DEBUG выключен если аргумент не lazy.
 
-Стандартные уровни от наименее до наиболее важного.
+В этом файле разберём logging как comprehensive system. Уровни logging и их семантика. Разница API (SLF4J) и implementation (Logback, Log4j). Что actually happens при вызове log.info на уровне library internals. Placeholders и почему они дешевле конкатенации. MDC (Mapped Diagnostic Context) и почему это mission-critical для tracing запросов. Logback конфигурация полностью — appenders, encoders, rolling policies, async processing. Structured logging JSON для machine-parseable output. ELK stack (Elasticsearch, Logstash, Kibana) plus Beats. Специфика Kubernetes logging pipelines. Real-world caveats — что не логировать, как не влиять на performance, как избежать sensitive data leaks. Кейсы КНП где неправильный logging создал реальные production issues.
 
-TRACE это очень детальный уровень — метод-по-методу execution. Редко используется в production потому что генерирует enormous volume. Полезен для сложных debugging сессий.
+## Уровни logging и их правильная семантика
 
-DEBUG детально для отладки — значения переменных, промежуточные шаги алгоритмов. Обычно off в production но включается для конкретных пакетов при необходимости.
+Стандартные уровни выстроены от наиболее детального к наиболее критичному.
 
-INFO важные события — старт сервиса, успешная обработка запроса, значимые state changes. Standard level для production business events.
+TRACE это очень детальный уровень — метод-по-методу execution, каждый значимый step алгоритма. Редко включается в production потому что генерирует enormous volume. Полезен для сложных debugging сессий где нужно проследить execution flow буквально каждого действия.
 
-WARN что-то подозрительное но не критичная ошибка — retry attempts, использование deprecated API, edge cases требующие attention.
+DEBUG детально для отладки — значения переменных, промежуточные шаги алгоритмов, decisions taken. Обычно off в production но включается для конкретных packages при активной investigation. Правильно написанный DEBUG log позволяет реконструировать что происходило без reproducing локально.
 
-ERROR ошибка требующая внимания — failure operation, exception при обработке. Обычно triggers alerting.
+INFO важные бизнес события — старт сервиса, успешная обработка значимого запроса, notable state changes. Standard level для production business events. Ключевой критерий — событие важно enough чтобы operators хотели видеть, но happens относительно infrequently (не десятки тысяч в секунду).
 
-FATAL критично, приложение может упасть. Редко используется — обычно ERROR достаточен.
+WARN что-то подозрительное но не критичная ошибка — retry attempts, использование deprecated API, edge cases требующие attention. Sign что-то нуждается в review но система функционирует.
+
+ERROR ошибка требующая внимания — failure operation, exception при обработке. Обычно triggers alerting в monitoring системах. Правильно используемый ERROR level это «человеку нужно об этом узнать и посмотреть».
+
+FATAL критично, приложение может упасть. Редко используется — обычно ERROR достаточен. Некоторые frameworks (Log4j) поддерживают, другие (Logback) нет — считают что error достаточно.
 
 Приложение настраивается на минимальный уровень. INFO показывает INFO, WARN, ERROR и скрывает DEBUG, TRACE:
 ```yaml
@@ -31,75 +35,81 @@ logging:
     org.hibernate.SQL: DEBUG
 ```
 
-Правило production — INFO на root plus DEBUG для своих packages при необходимости. Никогда DEBUG на root в production. Залил бы ELK, retention упал бы, файлы взорвались бы от volume.
+Правило production — INFO на root plus DEBUG для своих packages при необходимости. Никогда DEBUG на root в production. Залил бы ELK, retention упал бы, файлы взорвались бы от volume. Каждый DEBUG log цена в CPU, memory, disk I/O, ELK storage — умножить на throughput получишь real cost.
 
-## Экосистема Java logging
+Правильное использование levels критично для alerting. ERROR должен означать alert-worthy. WARN — «investigate когда есть время». INFO — событие для understanding но не urgent. Если ERROR используется на любой exception (включая expected validation failures) — alerting fatigue overwhelms real problems. Правильная calibration уровней это discipline.
 
-Разделение на API (фасад) и implementation. Приложение работает через API interfaces не привязываясь к конкретной implementation. Позволяет менять implementation без изменения code.
+## SLF4J vs Logback: API против implementation
 
-API options. SLF4J (Simple Logging Facade for Java) это стандарт де-факто, используется в 99 процентов Java проектов. Commons Logging (JCL) старый API, используется через bridge для legacy compatibility. JBoss Logging фасад от JBoss стека.
+Java ecosystem имеет несколько logging APIs и implementations. Понимание разницы critical для understanding как configuration работает.
 
-Implementation options. Logback это default в Spring Boot, разработан тем же автором что SLF4J (Ceki Gülcü). Log4j2 это альтернатива с good performance. Log4j 1.x устарел, имеет security уязвимости, не использовать. JUL (java.util.logging) встроен в JDK но редко используется напрямую из-за slow performance.
+SLF4J (Simple Logging Facade for Java) это APIs standard де-факто. Interfaces которые использует твой code. Компилируется против SLF4J API. При запуске находит implementation на classpath и делегирует. Позволяет менять implementation без recompilation code.
 
-Схема работы:
+Implementation options. Logback — default в Spring Boot, разработан тем же автором что SLF4J (Ceki Gülcü). Sensible defaults, широко используется, actively maintained. Log4j2 — альтернатива с хорошей performance especially для async logging. Некоторые enterprise projects prefer. Log4j 1.x — устарел, имеет security уязвимости, не использовать. JUL (java.util.logging) — встроен в JDK но редко используется напрямую из-за slow performance и weak features.
+
+Bridge libraries обеспечивают integration когда сторонние библиотеки используют другие logging APIs. jul-to-slf4j редиректит JUL calls в SLF4J. jcl-over-slf4j для Commons Logging. log4j-over-slf4j для Log4j 1.x. Spring Boot автоматически включает эти bridges — вся ecosystem logging goes through unified pipeline.
+
+Схема работы полная:
 ```
-Твой код → SLF4J → Logback → File / Console / ELK
+Твой код (import org.slf4j.Logger)
+   ↓ compile-time linking
+SLF4J API interfaces
+   ↓ runtime lookup через ServiceLoader
+Logback implementation
+   ↓ actual writing
+File / Console / Kafka / ELK
 ```
 
-Bridge libraries обеспечивают integration когда сторонние библиотеки используют другие logging APIs. jul-to-slf4j редиректит JUL calls в SLF4J. jcl-over-slf4j для Commons Logging. log4j-over-slf4j для Log4j 1.x. Spring Boot автоматически включает эти bridges чтобы все logging шло через единый pipeline.
+Log4Shell как historically important security incident. CVE-2021-44228 discovered late 2021. Log4j 2.x до version 2.17 vulnerable к RCE через ${jndi:...} pattern в log messages. Attacker sends specifically crafted string к приложению which logs it. Log4j 2 evaluates JNDI expression в message loading remote code. Полный remote code execution от single innocuous-looking log message.
 
-Важная security note — Log4Shell (CVE-2021-44228). Уязвимость в Log4j 2.x до версии 2.17. RCE через ${jndi:...} pattern в log messages. Attacker может отправить specially crafted строку в приложение, оно логирует, Log4j 2 evaluates JNDI expression загружая remote code. Обновиться немедленно если использовался Log4j 2. Logback не подвержен потому что не имеет такой feature.
+Все Log4j 2.x installations должны быть updated to 2.17+. Logback не подвержен — не имеет similar JNDI evaluation feature. Historical lesson — even simple-seeming subsystems like logging могут иметь catastrophic vulnerabilities.
 
-## Использование SLF4J
+## Логика вызова log.info
 
-Basic usage через LoggerFactory:
+Разберём что происходит когда developer пишет log.info("Message"). Understanding this deep помогает reasoning about performance implications.
+
+Loggers создаются через LoggerFactory:
 ```java
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-public class OrderService {
-    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
-
-    public void save(Order o) {
-        log.info("Saving order {}", o.getId());
-        try {
-            repo.save(o);
-            log.debug("Order saved: {}", o);
-        } catch (Exception e) {
-            log.error("Failed to save order {}", o.getId(), e);
-            throw e;
-        }
-    }
-}
+private static final Logger log = LoggerFactory.getLogger(OrderService.class);
 ```
 
-Через Lombok упрощается до одной аннотации:
+LoggerFactory это SLF4J's factory. Внутри при первом вызове initializes StaticLoggerBinder который binds к actual implementation (Logback). Возвращает org.slf4j.Logger interface. getLogger caches по className — same logger returned на repeated calls.
+
+При log.info("Message") — SLF4J Logger delegates к underlying Logback Logger. Первое что происходит — check level. Каждый Logger имеет configured level. Если log.isInfoEnabled() returns false (INFO disabled для этого logger) — метод returns immediately без further processing.
+
+Если level enabled — actual event created. LoggingEvent object с message, timestamp, thread, logger name, level, throwable if any, MDC contents. Событие passed через configured filters. Если passes — passed to appenders. Each appender processes event по своему — encoder formats event to string/JSON, writer sends output к destination (file, console, network).
+
+Actually blocking behavior важен. Default appenders synchronous — log.info blocks until output written. Для FileAppender это может mean disk I/O time — миллисекунды under load. Multiplied на high throughput — measurable performance impact.
+
+Async appender solution — обсудим ниже. Но understanding basic flow important — синхронный synchronous logging может быть bottleneck.
+
+## Placeholders и почему они важны
+
+Ключевое performance правило SLF4J — использовать placeholder syntax not concatenation:
 ```java
-@Slf4j
-public class OrderService {
-    // log переменная генерируется автоматически
-}
+log.debug("Order: " + o.toString());
+log.debug("Order: {}", o);
 ```
 
-Placeholders через {} критически важны. Использовать placeholder syntax, не string concatenation:
-```java
-log.debug("Order: " + o.toString());   // toString ВЫЗЫВАЕТСЯ ВСЕГДА, даже если DEBUG выключен
+Difference on runtime critical. First version — concatenation evaluated always. o.toString() called always. Result string constructed always. Только then log.debug called. If DEBUG disabled — event dropped immediately after level check, но CPU work already wasted.
 
-log.debug("Order: {}", o);              // toString ТОЛЬКО если DEBUG включён
-```
+Second version с placeholder — args passed as Object array. SLF4J internally checks level first. Only if enabled — invokes toString on args and substitutes into message template. Wasted work только when level enabled and message actually written.
 
-Разница на production. Тысячи toString в секунду on high-load когда логирование disabled равно significant CPU waste. С placeholders — 0 overhead когда level not enabled. SLF4J lazy evaluates placeholders только когда log actually pишется.
+Impact on production. High-throughput service processing 1000 requests/sec. Каждый request может иметь несколько log.debug calls "for future debugging". If concatenation used — 1000 × N × toString() calls per second even when DEBUG disabled. Complex objects with heavy toString (deep hierarchies) может cost seconds of CPU. With placeholders — zero cost when disabled.
 
-Exception как последний аргумент — SLF4J распознаёт и включает stacktrace:
+Exception logging pattern:
 ```java
 log.error("Failed to save {}", orderId, exception);
-// exception выводится как stacktrace, orderId подставляется в {}
 ```
 
-Anti-pattern — включение exception в message string теряет stacktrace:
+SLF4J recognizes when last argument is Throwable — treats it specially. Message formatted with orderId substituted. Exception logged with full stack trace separately. Correct pattern preserved through formatting.
+
+Anti-pattern — including exception in message:
 ```java
-log.error("Failed: " + exception.getMessage());   // теряется stacktrace!
+log.error("Failed: " + exception.getMessage());
 ```
+
+getMessage returns только localized message без stack trace. Stack trace lost. Debugging becomes much harder — you know что failed но not where.
 
 isDebugEnabled guard для heavy operations:
 ```java
@@ -108,9 +118,80 @@ if (log.isDebugEnabled()) {
 }
 ```
 
-Иначе heavyToString вычислится даже если DEBUG выключен. Для simple placeholders guard не нужен — SLF4J handles lazy evaluation.
+Иначе heavyToString(state) вычислится еще до вызова log.debug — args evaluated eagerly в Java даже с placeholder syntax. Guard explicit проверяет level перед expensive computation.
 
-## Logback конфигурация
+Для simple placeholders (existing variables) guard не нужен — минимальный overhead от argument passing.
+
+## MDC (Mapped Diagnostic Context)
+
+MDC это thread-local Map для storing context информации доступной для logging. Correlation ID, user ID, request ID — все хранятся в MDC и автоматически включаются в каждый log message без явной передачи в каждый вызов.
+
+Implementation через ThreadLocal<Map<String, String>>. Каждый thread имеет свою map. Values stored через MDC.put(key, value). Retrieved automatically pattern layout через %X{key}.
+
+Установка:
+```java
+MDC.put("traceId", UUID.randomUUID().toString());
+MDC.put("userId", currentUser.getId());
+try {
+    // работа
+} finally {
+    MDC.clear();
+}
+```
+
+В pattern использование через %X{key}:
+```
+%X{traceId} %X{userId}
+```
+
+Результат в логе:
+```
+2026-09-05 10:15 [abc123, berik] INFO OrderService - Saving order 42
+```
+
+MDC plus filter установка в начале каждого HTTP request:
+```java
+@Component
+class MdcFilter implements Filter {
+    public void doFilter(ServletRequest req, ServletResponse resp, FilterChain chain) {
+        try {
+            String traceId = ((HttpServletRequest) req).getHeader("X-Trace-Id");
+            if (traceId == null) traceId = UUID.randomUUID().toString();
+            MDC.put("traceId", traceId);
+            chain.doFilter(req, resp);
+        } finally {
+            MDC.clear();
+        }
+    }
+}
+```
+
+Все logs одного request будут с одинаковым traceId позволяя correlate их в ELK. Powerful debugging tool — search by traceId shows все logs всего request.
+
+MDC caveat с async operations. MDC привязан к потоку через ThreadLocal. При @Async, virtual threads, ExecutorService MDC теряется — новый thread не имеет исходного context. Reading MDC returns null.
+
+Решение через TaskDecorator копирующий MDC при передаче задачи в executor:
+```java
+public class MdcTaskDecorator implements TaskDecorator {
+    public Runnable decorate(Runnable runnable) {
+        Map<String, String> ctx = MDC.getCopyOfContextMap();
+        return () -> {
+            try {
+                MDC.setContextMap(ctx);
+                runnable.run();
+            } finally {
+                MDC.clear();
+            }
+        };
+    }
+}
+```
+
+Captures MDC state at submission time. Restores в worker thread before running task. Clears afterwards to avoid leaking context в pooled threads.
+
+Или использовать Micrometer Tracing which correctly propagates context через async boundaries automatically. Более cleanly integrated solution.
+
+## Logback конфигурация полностью
 
 Файл logback-spring.xml в src/main/resources стандартный location. Spring Boot автоматически обнаруживает и использует. Пример полной production конфигурации:
 ```xml
@@ -156,92 +237,17 @@ if (log.isDebugEnabled()) {
 </configuration>
 ```
 
-Ключевые элементы. Appender определяет куда писать — Console, File, Kafka, HTTP. Encoder форматирует output — pattern layout или JSON structured. RollingPolicy управляет rotation файлов по времени или размеру. Logger настраивает уровень для конкретного package. Root default для всего кроме specific loggers.
+Ключевые элементы конфигурации. Appender определяет куда писать — Console (stdout), File, Kafka, HTTP endpoint, etc. Encoder форматирует output — pattern layout или JSON structured. RollingPolicy управляет rotation файлов по времени или размеру предотвращая единый файл от unbounded growth. Logger настраивает уровень для конкретного package overriding root. Root default для всего кроме specific loggers.
 
-Pattern layout использует специальные placeholders. %d{format} для timestamp с custom format. %-5level уровень left-aligned до 5 chars. %X{key} для MDC context values. %thread имя потока обрабатывающего request. %logger{36} имя класса сокращённое до 36 chars. %msg сам message. %n newline. %ex exception details (stacktrace).
+Pattern layout использует специальные placeholders. %d{format} для timestamp с custom format. %-5level уровень left-aligned до 5 chars. %X{key} для MDC context values. %thread имя потока обрабатывающего request. %logger{36} имя класса сокращённое до 36 chars. %msg сам message. %n newline. %ex exception details (stack trace).
 
-## Async appenders
+Async appenders для performance. Synchronous logging значит каждая log.info блокирует текущий поток пока запись действительно попадёт на disk. На high-load это заметно.
 
-Synchronous logging значит каждая log.info блокирует текущий поток пока запись действительно попадёт на disk. На high-load это заметно — thousands calls в секунду каждый плюс несколько миллисекунд.
-
-AsyncAppender решает эту проблему через queue plus background thread. Application thread просто добавляет log event в queue и продолжает работу. Background thread достаёт events из queue и пишет к underlying appender:
-```xml
-<appender name="ASYNC" class="ch.qos.logback.classic.AsyncAppender">
-    <appender-ref ref="FILE"/>
-    <queueSize>512</queueSize>
-    <discardingThreshold>0</discardingThreshold>   <!-- 0 = не терять -->
-    <neverBlock>true</neverBlock>                   <!-- true = при переполнении дропать -->
-</appender>
-```
+AsyncAppender решает эту проблему через queue plus background thread. Application thread просто добавляет log event в queue и продолжает работу. Background thread достаёт events из queue и пишет к underlying appender.
 
 Caveats. При JVM crash необлитая queue теряется — recent logs могут пропасть. neverBlock=false — при full queue log.info блокируется что делает async бессмысленным для peaks. neverBlock=true — при full queue events просто dropped, тоже loss.
 
 Правило для production — async plus discardingThreshold=0 (не терять по threshold) plus увеличенный queueSize (например 1024-4096) для handling bursts.
-
-## MDC (Mapped Diagnostic Context)
-
-MDC это thread-local Map для storing context информации доступной для logging. Correlation ID, user ID, request ID — все хранятся в MDC и автоматически включаются в каждый log message.
-
-Установка:
-```java
-MDC.put("traceId", UUID.randomUUID().toString());
-MDC.put("userId", currentUser.getId());
-try {
-    // работа
-} finally {
-    MDC.clear();
-}
-```
-
-В pattern использование через %X{key}:
-```
-%X{traceId} %X{userId}
-```
-
-Результат в логе:
-```
-2026-09-05 10:15 [abc123, berik] INFO OrderService - Saving order 42
-```
-
-MDC plus filter установка в начале каждого HTTP request:
-```java
-@Component
-class MdcFilter implements Filter {
-    public void doFilter(ServletRequest req, ServletResponse resp, FilterChain chain) {
-        try {
-            String traceId = ((HttpServletRequest) req).getHeader("X-Trace-Id");
-            if (traceId == null) traceId = UUID.randomUUID().toString();
-            MDC.put("traceId", traceId);
-            chain.doFilter(req, resp);
-        } finally {
-            MDC.clear();
-        }
-    }
-}
-```
-
-Все logs одного request будут с одинаковым traceId позволяя correlate их в ELK.
-
-MDC caveat с async operations. MDC привязан к потоку через ThreadLocal. При @Async, virtual threads, ExecutorService MDC теряется — новый поток не имеет исходного context.
-
-Решение через TaskDecorator копирующий MDC при передаче задачи в executor:
-```java
-public class MdcTaskDecorator implements TaskDecorator {
-    public Runnable decorate(Runnable runnable) {
-        Map<String, String> ctx = MDC.getCopyOfContextMap();
-        return () -> {
-            try {
-                MDC.setContextMap(ctx);
-                runnable.run();
-            } finally {
-                MDC.clear();
-            }
-        };
-    }
-}
-```
-
-Или использовать Micrometer Tracing который правильно пробрасывает context через async boundaries.
 
 ## Structured logging JSON для ELK
 
@@ -270,33 +276,14 @@ vs JSON:
 implementation 'net.logstash.logback:logstash-logback-encoder:7.4'
 ```
 
-Конфигурация appender:
-```xml
-<appender name="JSON_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-    <file>logs/app.json</file>
-    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
-        <includeMdc>true</includeMdc>
-        <customFields>{"app":"isna-knp","env":"prod"}</customFields>
-    </encoder>
-    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-        <fileNamePattern>logs/app.%d.log.gz</fileNamePattern>
-    </rollingPolicy>
-</appender>
-```
+Конфигурация appender с LogstashEncoder. ELK парсит JSON легко и точно. Все fields доступны для filtering, aggregation, dashboards в Kibana.
 
-ELK парсит JSON легко и точно. Все fields доступны для filtering, aggregation, dashboards в Kibana.
-
-kv arguments для structured data:
+kv arguments для structured data. Логика — вместо embedding data в message string, ставить как separate fields:
 ```java
 log.info("Order saved", kv("orderId", o.getId()), kv("status", o.getStatus()));
 ```
 
-Через StructuredArguments из logstash-encoder:
-```java
-log.info("Order saved: {}", value("orderId", o.getId()));
-```
-
-Плюс — в Kibana можно filter orderId:42 напрямую вместо regex по message. Более efficient search и aggregation.
+В Kibana можно filter orderId:42 напрямую вместо regex по message. Более efficient search и aggregation. Data types preserved — числа как numbers, dates as dates.
 
 ## ELK stack
 
@@ -333,7 +320,7 @@ Kibana это UI для Elasticsearch. Search, dashboards, alerts, visualization
 
 Retention policies. Логи не хранятся вечно — expensive storage. Hot indices последние 7 дней быстрый доступ. Warm indices 30 дней медленнее. Cold 90+ дней архив. Delete старше. ILM (Index Lifecycle Management) в Elasticsearch автоматизирует эти transitions.
 
-## Kubernetes и логи
+## Kubernetes logging pipelines
 
 Приложения в контейнерах пишут в stdout и stderr. Docker или kubelet перехватывает, пишет в файлы на node (/var/log/pods/...).
 
@@ -358,23 +345,25 @@ Fluentd или Filebeat как DaemonSet на каждой worker node. Чита
 </encoder>
 ```
 
-Заменяет любой Bearer token на marker в log output. Predотвращает случайное logging tokens когда developer забыл.
+Заменяет любой Bearer token на marker в log output. Prevents accidental logging tokens когда developer забыл.
 
-Огромные objects. log.info Response: {}, hugeJson где hugeJson 10 MB — это 10 MB в лог per request. Смерть ELK при значительной нагрузке. Truncate или skip:
+Огромные objects. log.info("Response: {}", hugeJson) где hugeJson 10 MB — это 10 MB в лог per request. Смерть ELK при significant volume. Truncate или skip:
 ```java
 log.info("Response: {}", StringUtils.left(hugeJson, 500));
 ```
 
-Every SQL в production через `org.hibernate.SQL: DEBUG` — тысячи queries в секунду в лог. Only для debugging специфических issues. Regular production logging бы захлебнула storage.
+Every SQL в production через org.hibernate.SQL: DEBUG — тысячи queries в секунду в лог. Only для debugging специфических issues. Regular production logging бы захлебнула storage.
 
-## Правила использования
+## printStackTrace как классическая проблема
 
-Structured plus не printStackTrace. Никогда:
+Никогда не использовать e.printStackTrace(). Common anti-pattern в legacy code plus copy-paste tutorials:
 ```java
 } catch (Exception e) {
-    e.printStackTrace();       // stderr, ELK не парсит как error
+    e.printStackTrace();  // WRONG!
 }
 ```
+
+Проблемы. Output goes to stderr not through SLF4J. ELK typically parses stdout — stderr treated separately или ignored. Structured logging bypassed — no traceId, no MDC context. Not machine-parseable — alerting can't detect based на these. Development artifact leaking в production.
 
 Правильно:
 ```java
@@ -383,28 +372,32 @@ Structured plus не printStackTrace. Никогда:
 }
 ```
 
-Реальный кейс КНП knp-fo-sync-notification-bugs — printStackTrace создавало «ELK-слепую зону». Ошибки не видны в мониторинге. 6 багов копились месяцами потому что error monitoring not seeing их.
+Structured message plus context plus exception through SLF4J.
 
-Уровни правильно. ERROR — что-то надо делать (alert, incident). WARN — проверить когда есть время (deprecated API, retry). INFO — важные события пользователя. DEBUG — детали для отладки, off в prod.
+Реальный кейс из КНП. Memory knp-fo-sync-notification-bugs — printStackTrace создало «ELK-слепую зону». Ошибки не visible в ELK потому что stderr не indexed. 6 багов копились months потому что error monitoring не seeing их. Real cost of небольшой convenience shortcut.
 
-Не пиши log.error на любой exception — если это ожидаемая (validation) то WARN или INFO. Правильный уровень critical для alerting effectiveness. Log.error должно означать «investigate это».
+## Правила использования
 
-Correlation ID везде. Приходит в HTTP header X-Request-Id или генерируется если отсутствует. MDC plus traceId в pattern. Пробрасывается в downstream через Feign interceptor или HTTP client interceptor. Пробрасывается в Rabbit или Kafka message headers.
+Структурированный approach vs printStackTrace. Всегда SLF4J logging с exception как last arg.
 
-Потом в Kibana search traceId:abc123 показывает всю chain через все сервисы. Distributed tracing без full distributed tracing tool.
+Уровни правильно calibrated. ERROR alert-worthy. WARN — investigate когда есть время. INFO — важные business events. DEBUG — details for debugging, off in production. Не log.error на любую exception — если это expected (validation) то WARN или INFO.
 
-Не логировать в hot path. Метод дёргается 100000 раз в секунду — каждый log call это disk write, смерть системы. Используй метрики (counter, gauge) для такого monitoring, а лог только для аномалий требующих investigation.
+Correlation ID везде. HTTP header X-Request-Id или generated. MDC plus %X{traceId} в pattern. Пробрасывается downstream через Feign interceptor или HTTP client interceptor. Через RabbitMQ или Kafka message headers.
 
-Sampling для partial logging когда полное невозможно:
+Search traceId:abc123 в Kibana shows всю chain через все services. Distributed tracing without full distributed tracing tool.
+
+Не logging в hot path. Метод дёргается 100000 раз в секунду — каждый log call is disk write, смерть системы. Используй метрики (counter, gauge) для monitoring, log только для аномалий требующих investigation.
+
+Sampling для partial logging когда полное overkill:
 ```java
 if (ThreadLocalRandom.current().nextInt(100) == 0) {
     log.info("Sampled request: {}", req);
 }
 ```
 
-Логирует 1 процент requests. Statistical sample достаточен для understanding patterns без volume overhead. Или через Micrometer Tracing sampling для automatic scheme.
+Логирует 1 процент requests. Statistical sample достаточен для understanding patterns без volume overhead.
 
-## Best-practice logger для сервиса
+## Best-practice logger
 
 Собранный воедино правильный approach:
 ```java
@@ -441,52 +434,32 @@ public class OrderService {
 }
 ```
 
-Комбинация logging plus метрики. INFO для важных бизнес events. DEBUG для деталей. ERROR plus stacktrace на неожиданное. Metrics counter и timer параллельно с logs для aggregate monitoring.
-
-## Реальные кейсы КНП
-
-Memory knp-fo-sync-notification-bugs — printStackTrace создало «ELK-слепую зону». 6 багов копились месяцами потому что error monitoring не видел их. Urok — structured logging обязательно, printStackTrace никогда не использовать.
-
-Memory knp-prod-historical-logs-elk — kubectl logs показывает только current, историческое через ES queries. kubectl exec в pod ES для complex historical searches. Standard practice знать где искать historical logs.
-
-Fno328 регенерация — важен log каждой обработанной entity чтобы отследить прогресс job. Long-running batch operations без progress logging сложно troubleshoot когда что-то идёт wrong.
-
-## Правила для команды
-
-Никакого printStackTrace. Всегда log.error с exception как last argument.
-
-Structured logging JSON для production. Text logs только для local development.
-
-MDC plus traceId в каждом request. Correlation across services.
-
-Метрики параллельно с логами. Log для events plus metrics для counters/timers.
-
-Уровни правильно. ERROR означает alert-worthy. Не логировать expected exceptions как ERROR.
+Комбинация logging plus метрики. INFO для важных бизнес events. DEBUG для деталей. ERROR plus stack trace на неожиданное. Metrics counter и timer параллельно с logs для aggregate monitoring без heavy log volume.
 
 ## Итоги
 
-SLF4J API plus Logback implementation default в Spring Boot. Правильно использовать через SLF4J API для decoupling.
+SLF4J API plus Logback implementation default в Spring Boot. Использовать через SLF4J API для decoupling.
 
-{} placeholders никогда конкатенация. Lazy evaluation экономит CPU когда level not enabled.
+Placeholder syntax `{}` не concatenation. Lazy evaluation экономит CPU когда level not enabled.
 
-Уровни — DEBUG для development, INFO для важных events, WARN для подозрительного, ERROR для alert-worthy.
+Уровни — DEBUG для development, INFO для важных events, WARN для подозрительного, ERROR для alert-worthy. Правильная calibration критична для alerting.
 
-MDC для correlation ID и context. Thread-local через ThreadLocal — теряется на async boundaries без proper handling.
+MDC для correlation ID и context. Thread-local через ThreadLocal — теряется на async boundaries без proper handling (TaskDecorator plus MDC copying).
 
-Structured JSON для ELK. logstash-logback-encoder library. Custom fields plus MDC.
+Structured JSON для ELK. logstash-logback-encoder library. Custom fields plus MDC. Machine-parseable, precise filtering в Kibana.
 
 AsyncAppender для performance. discardingThreshold=0 чтобы не терять. Increased queueSize для bursts.
 
 ELK stack (Elasticsearch plus Logstash или Beats plus Kibana) стандарт для centralized logging. Retention через ILM.
 
-Kubernetes stdout/stderr перехватывается kubelet. Filebeat DaemonSet шипает в ELK.
+Kubernetes stdout/stderr перехватывается kubelet. Filebeat DaemonSet шипает в ELK. kubectl logs только для current, historical через ELK.
 
-Никогда логировать секреты, PII, huge objects, every SQL в prod.
+Никогда логировать секреты, PII, huge objects, every SQL в prod. Regex masking в encoder patterns.
 
-Никогда printStackTrace — используй log.error с exception. Реальный urok из КНП.
+Никогда printStackTrace — используй log.error с exception. Реальный урок из КНП где attentioning ELK-blind zone позволил bugs копиться месяцами.
 
 Correlation ID через MDC plus HTTP headers plus message headers для distributed traceability.
 
-Метрики параллельно с логами. Observability = logs + metrics + traces.
+Метрики параллельно с логами. Observability = logs + metrics + traces. Each provides different perspective, combined give complete picture.
 
 Дальше — Kafka базовые concepts как основа для understanding streaming platform.
