@@ -1,23 +1,30 @@
-# 53. Тестирование: пирамида + Unit тесты
+# 53. Тестирование: пирамида, unit tests с JUnit, Mockito, AssertJ
 
-Зачем тесты, виды, детально про unit-тесты с JUnit + Mockito + AssertJ.
+## Зачем понимать тесты глубоко
 
----
+Разработчик который недавно в профессии часто рассматривает тесты как «должны быть» — обязательство писать, а не инструмент для эффективного разработки. Пишет тесты чтобы удовлетворить coverage metric в CI. Тесты медленные, flaky, тесно связанные с implementation details — при рефакторинге ломаются, требуют переписывания. Тесты становятся burden а не asset.
 
-## 1. Зачем писать тесты
+Разница между разработчиком «пишущим тесты» и «понимающим тестирование» очевидна в скорости работы через кодовую базу. Первый боится менять существующий код — тесты падают из-за implementation coupling. Второй знает что тесты должны быть fast, isolated, repeatable, self-validating, timely (F.I.R.S.T principles). Знает что unit tests should test behavior не implementation — refactoring should not break tests. Знает что pyramid pattern (many unit, some integration, few E2E) provides good coverage при maintainable cost. Знает Mockito idioms — how mocks differ от stubs vs spies, when ArgumentCaptor нужен, avoiding brittle test setups.
 
-- **Regression prevention** — правишь одно, ломаешь другое → тест ловит.
-- **Documentation** — тест показывает как использовать код.
-- **Confidence при рефакторинге** — переписал, тесты зелёные → работает.
-- **Design feedback** — если код сложно тестировать → плохо спроектирован.
-- **Faster development** — на самом деле, ловля багов раньше = дешевле.
+В этом файле разберём testing глубоко. Зачем реально писать тесты (beyond obligation). Test pyramid как model. Levels tests. JUnit 5 mechanics — annotations, lifecycle, parameterized tests, nested tests, extensions. AssertJ fluent assertions — почему лучше JUnit assertions. Mockito comprehensively — mocks, verification, argument matchers, ArgumentCaptor, spy. Test doubles terminology (dummy, stub, spy, mock, fake). F.I.R.S.T principles applied. AAA pattern. Naming conventions. Code coverage tools plus limitations. Что тестировать и что не тестировать.
 
-Без тестов через 6 месяцев страшно менять код.
+## Реальные reasons писать тесты
 
----
+Regression prevention — правишь одно, ломаешь другое. Test catches. Without tests — bugs escape к production. Users find them. Cost multiplies.
 
-## 2. Пирамида тестов
+Documentation. Тест показывает как код should be used. Executable documentation что stays current (unlike text docs that rot).
 
+Confidence при refactoring. Переписал, тесты зелёные — работает. Without tests — every refactor risky. Developers become afraid to change code — codebase stagnates.
+
+Design feedback. Если код сложно тестировать — плохо спроектирован. High coupling, hidden dependencies, side effects — all make testing hard. Testing pain forces better design.
+
+Faster development. Counter-intuitive but true — ловля багов раньше = дешевле. Bug fixed при написании тестового case takes 5 minutes. Same bug fixed через customer support через 6 months takes hours or days.
+
+Без тестов через 6 месяцев страшно менять код. Fear leads к workarounds (adding parallel functionality вместо fixing existing). Codebase entropy accelerates.
+
+## Пирамида тестов
+
+Classic model от Mike Cohn. Different levels tests в correct proportions:
 ```
                   ▲
                   │
@@ -32,71 +39,35 @@
                  /__________________\
 ```
 
-**Правило**: много unit, меньше integration, ещё меньше E2E.
+Правило — много unit, меньше integration, ещё меньше E2E. Обеспечивает balance между coverage, speed, maintenance cost.
 
-Обратная пирамида (много E2E, мало unit) — anti-pattern. Медленно, flaky, дорого поддерживать.
+Обратная пирамида (много E2E, мало unit) — anti-pattern. Медленно (feedback slow). Flaky (many dependencies fail intermittently). Дорого поддерживать (complex setup).
 
-### 2.1 Ice cream cone (anti-pattern)
+Ice cream cone — anti-pattern. Много manual plus E2E, мало unit. Classical legacy без тестов. Common если tests added late.
 
-Наоборот: много manual + E2E, мало unit. Классический legacy без тестов.
+Diamond shape — middle-heavy. Много integration, средне unit plus E2E. Sometimes OK для микросервисов (много interaction тesting warranted). Not standard rec but not wrong per se.
 
-### 2.2 Diamond
+## Уровни тестов
 
-Middle-heavy: много integration, средне unit + E2E. Иногда OK для микросервисов (много interaction).
+Unit tests. Тестируют один класс / метод в изоляции. Мокают всё external. Быстро (milliseconds). Много (thousands). Легко писать. Не проверяют интеграцию.
 
----
+Integration tests. Тестируют связку компонентов (класс plus БД, класс plus Rabbit). Медленнее (seconds). Меньше (hundreds). Реалистичнее. Часто с Testcontainers для real dependencies.
 
-## 3. Уровни тестов
+Component tests. Один микросервис целиком, но external dependencies моканы (WireMock для HTTP downstreams). Boundary тестирование one service.
 
-### 3.1 Unit tests
+Contract tests. Тестируют контракт между сервисами (Spring Cloud Contract, Pact). Provider generates stubs — consumer tests against them. Ensures API stability across services.
 
-Тестируют **один класс / метод** в изоляции. Мокают всё внешнее.
+E2E tests. Полная цепочка через все сервисы plus БД plus broker. Медленно (minutes). Мало (dozens). Flaky. Ловят integration bugs missed elsewhere.
 
-- Быстро (мс).
-- Много (тысячи).
-- Легко.
-- **Не** проверяют интеграцию.
+Smoke tests. Быстрая проверка — система жива? Основные операции работают? Обычно после deploy — прогон 5-20 критичных сценариев за 1-5 минут.
 
-### 3.2 Integration tests
+Каждый level имеет свое место. Full coverage requires combination.
 
-Тестируют **связку компонентов** (класс + БД, класс + Rabbit).
+## JUnit 5 mechanics
 
-- Медленнее (секунды).
-- Меньше (сотни).
-- Реалистичнее.
-- Часто с **Testcontainers**.
+Стандарт в Java. JUnit 5 (Jupiter) replaced JUnit 4 около 2017.
 
-### 3.3 Component tests
-
-Один микросервис целиком, но external dependencies моканы (WireMock).
-
-### 3.4 Contract tests
-
-Тестируют **контракт между сервисами** (Spring Cloud Contract, Pact).
-
-### 3.5 E2E tests
-
-Полная цепочка через все сервисы + БД + broker.
-
-- Медленно (минуты).
-- Мало (десятки).
-- Flaky.
-- Ловят интеграционные баги.
-
-### 3.6 Smoke tests
-
-**Быстрая проверка**: система жива? Основные операции работают?
-
-Обычно после deploy — прогон 5-20 критичных сценариев.
-
----
-
-## 4. JUnit 5
-
-Стандарт в Java.
-
-### 4.1 Базовый тест
-
+Базовый тест:
 ```java
 class OrderServiceTest {
 
@@ -112,12 +83,9 @@ class OrderServiceTest {
 }
 ```
 
-- `@Test` — метод-тест.
-- Тестовый класс — по конвенции `<Class>Test`.
-- Метод — glagol_состояние (`createOrder_savesToDb`).
+@Test — метод-тест. Тестовый класс — по конвенции ClassNameTest. Метод — glagol_состояние format (createOrder_savesToDb).
 
-### 4.2 Lifecycle
-
+Lifecycle annotations:
 ```java
 class OrderServiceTest {
 
@@ -145,10 +113,9 @@ class OrderServiceTest {
 }
 ```
 
-### 4.3 Assertions
+@BeforeAll и @AfterAll — static, executed once per class. @BeforeEach и @AfterEach — instance methods, executed per test.
 
-**AssertJ** — намного лучше JUnit assertions:
-
+Assertions с AssertJ — намного лучше JUnit standard assertions:
 ```java
 // JUnit standard
 assertEquals(expected, actual);
@@ -166,10 +133,9 @@ assertThat(exception)
     .hasCauseInstanceOf(SQLException.class);
 ```
 
-Более читаемо + лучшие сообщения об ошибках. Стандарт де-факто.
+Более читаемо plus лучшие сообщения об ошибках. Стандарт де-факто.
 
-### 4.4 Exception testing
-
+Exception testing:
 ```java
 @Test
 void createOrder_throwsWhenInvalid() {
@@ -188,8 +154,7 @@ void createOrder_throwsWhenInvalid() {
 }
 ```
 
-### 4.5 Nested tests
-
+Nested tests для организации:
 ```java
 class OrderServiceTest {
 
@@ -209,10 +174,9 @@ class OrderServiceTest {
 }
 ```
 
-Организовать группы связанных тестов.
+Groups related tests. IDE display shows organized structure.
 
-### 4.6 Parameterized tests
-
+Parameterized tests:
 ```java
 @ParameterizedTest
 @ValueSource(strings = {"", " ", "\t"})
@@ -242,20 +206,18 @@ static Stream<Arguments> orderProvider() {
 }
 ```
 
-Один тест — много cases. Уменьшает copy-paste.
+Один тест — много cases. Reduces copy-paste. Standard когда testing multiple inputs.
 
-### 4.7 Display name
-
+Display names:
 ```java
 @Test
 @DisplayName("Order с amount > 0 сохраняется в БД")
 void createOrder_savesToDb() { ... }
 ```
 
-Красиво в отчёте.
+Красиво в отчёте. Improves readability especially для business stakeholders reviewing test reports.
 
-### 4.8 Disabled / conditional
-
+Disabled и conditional tests:
 ```java
 @Test
 @Disabled("флаки, чинить в JIRA-123")
@@ -270,8 +232,7 @@ void linuxOnly() { ... }
 void onlyInCI() { ... }
 ```
 
-### 4.9 Assumptions
-
+Assumptions для skip logic:
 ```java
 @Test
 void test() {
@@ -280,14 +241,13 @@ void test() {
 }
 ```
 
----
+Different from assertion — assumption не failing test, marks as skipped.
 
-## 5. Mockito
+## Mockito comprehensively
 
-Библиотека моков.
+Библиотека моков. Стандарт в Java для test doubles.
 
-### 5.1 Простой mock
-
+Простой mock:
 ```java
 OrderRepository repo = mock(OrderRepository.class);
 
@@ -298,18 +258,20 @@ Optional<Order> result = repo.findById(1L);
 assertThat(result).isPresent();
 ```
 
-### 5.2 Verify (проверка что вызван)
+Mockito.mock creates fake implementation. when.thenReturn programs behavior. Not doubling real object — full fake.
 
+Verify (проверка что вызван):
 ```java
-verify(repo).save(any());              // ровно 1 раз
+verify(repo).save(any());              // ровно 1 раз (default)
 verify(repo, times(3)).save(any());    // ровно 3
 verify(repo, atLeast(1)).save(any());
 verify(repo, never()).delete(any());
 verifyNoMoreInteractions(repo);
 ```
 
-### 5.3 Argument matchers
+Ensures methods called as expected. Testing interactions between components. VerifyNoMoreInteractions catches unexpected calls.
 
+Argument matchers:
 ```java
 verify(repo).save(any(Order.class));
 verify(repo).save(argThat(o -> o.getStatus() == NEW));
@@ -317,11 +279,9 @@ verify(repo).findById(eq(1L));
 verify(repo).findByStatus(any(OrderStatus.class));
 ```
 
-Правило: если один argument — matcher, то **все** через matchers.
+Правило — если один argument matcher, то все через matchers. Cannot mix concrete values с matchers.
 
-### 5.4 ArgumentCaptor
-
-Захватить аргумент для inspection:
+ArgumentCaptor захватить аргумент для inspection:
 ```java
 ArgumentCaptor<Order> captor = ArgumentCaptor.forClass(Order.class);
 verify(repo).save(captor.capture());
@@ -331,21 +291,24 @@ assertThat(saved.getStatus()).isEqualTo(NEW);
 assertThat(saved.getCreatedAt()).isCloseTo(now(), within(1, SECONDS));
 ```
 
-### 5.5 Throw exception
+More powerful than argThat lambdas — captured value inspectable через все assertions. Useful для complex object verification.
 
+Throw exception:
 ```java
 when(repo.findById(1L)).thenThrow(new RuntimeException("DB error"));
 ```
 
-### 5.6 Void methods
+Simulates error scenarios. Testing error handling paths.
 
+Void methods special syntax:
 ```java
 doNothing().when(repo).delete(any());
 doThrow(new RuntimeException()).when(repo).delete(any());
 ```
 
-### 5.7 Spy (частичный mock)
+when.thenReturn не работает с void — использовать doNothing.when.
 
+Spy — частичный mock:
 ```java
 List<String> list = new ArrayList<>();
 List<String> spy = spy(list);
@@ -355,10 +318,9 @@ verify(spy).add("a");
 assertThat(spy).hasSize(1);   // реальный метод выполнился
 ```
 
-Использовать редко — обычно plain mock лучше.
+Real object underneath. Methods actually execute unless stubbed. Verification works normally. Useful для partial mocking когда most behavior real, some parts stubbed. Использовать редко — обычно plain mock лучше (cleaner).
 
-### 5.8 @Mock / @InjectMocks аннотации
-
+@Mock и @InjectMocks annotations:
 ```java
 @ExtendWith(MockitoExtension.class)
 class OrderServiceTest {
@@ -376,11 +338,9 @@ class OrderServiceTest {
 }
 ```
 
-Mockito автоматически создаёт mocks + inject в `@InjectMocks` через конструктор.
+Mockito автоматически создаёт mocks plus inject в @InjectMocks через конструктор. Cleaner чем manual creation в @BeforeEach.
 
-### 5.9 mockStatic
-
-Для static методов:
+mockStatic для static методов:
 ```java
 try (MockedStatic<Instant> mocked = mockStatic(Instant.class)) {
     mocked.when(Instant::now).thenReturn(Instant.parse("2026-09-05T10:00:00Z"));
@@ -389,35 +349,41 @@ try (MockedStatic<Instant> mocked = mockStatic(Instant.class)) {
 }
 ```
 
-Использовать редко (static usage — плохой дизайн).
+Использовать редко. Static usage — плохой дизайн usually. Prefer clock injection для controlling time в tests.
 
----
+## Test doubles terminology
 
-## 6. Test doubles — терминология
+Meszaros в «xUnit Test Patterns» defined precise terminology.
 
-Meszaros в «xUnit Test Patterns»:
-- **Dummy** — объект-заглушка, значение не важно (для параметра).
-- **Stub** — возвращает заранее заданные ответы.
-- **Spy** — записывает вызовы для проверки + может выполнять реальную логику.
-- **Mock** — как stub, но verify что вызван.
-- **Fake** — упрощённая реальная реализация (in-memory DB).
+Dummy — объект-заглушка, значение не важно (для параметра метода что doesn't use it).
 
-Mockito делает **все**, часто просто говорят «mock».
+Stub — возвращает заранее заданные ответы. Simple canned responses.
 
----
+Spy — записывает вызовы для проверки plus может выполнять реальную логику. Real object with additional recording.
 
-## 7. Хороший unit test
+Mock — как stub, но verify что вызван. Behavior expectations verified.
 
-### 7.1 F.I.R.S.T принципы
+Fake — упрощённая реальная реализация. In-memory database instead of real one. Functional but simplified.
 
-- **F**ast — миллисекунды.
-- **I**solated / **I**ndependent — тест не зависит от других.
-- **R**epeatable — одинаковый результат каждый раз.
-- **S**elf-validating — pass/fail автоматически (без ручного просмотра).
-- **T**imely — писать одновременно с кодом (TDD) или сразу после.
+Mockito делает все категории, часто просто говорят «mock». Practical usage doesn't strictly distinguish типы часто. Общепринятое использование — mock covers все.
 
-### 7.2 AAA pattern
+## F.I.R.S.T principles
 
+Хороший unit test следует пяти principles.
+
+Fast — миллисекунды. Slow tests не runable часто. Feedback loop broken. Developers stop running tests.
+
+Isolated / Independent — тест не зависит от других. Order шouldn't matter. Test доменый state не affects другие.
+
+Repeatable — одинаковый результат каждый раз. Not depending on time, random, environment. Deterministic outputs.
+
+Self-validating — pass/fail автоматически. No manual output inspection required. Assertions clear yes/no.
+
+Timely — писать одновременно с кодом (TDD) или сразу после. Retroactive testing painful. Design suffers.
+
+## AAA pattern
+
+Arrange / Act / Assert structure:
 ```java
 @Test
 void createOrder_savesToDb() {
@@ -434,11 +400,15 @@ void createOrder_savesToDb() {
 }
 ```
 
-3 секции. Читается сверху вниз.
+Три секции. Читается сверху вниз. Standard structure понятная любому reader.
 
-### 7.3 Один assert per test (не догма)
+Sometimes called Given/When/Then (BDD style) — same three sections different names.
 
-Идеал — один assert на тест. Но:
+## Один assert per test
+
+Идеал — один assert на тест. Reduces confusion при failure — know exactly what went wrong.
+
+Но не dogma. Multiple assertions на одном объекте — норма:
 ```java
 assertThat(order)
     .satisfies(o -> {
@@ -448,13 +418,11 @@ assertThat(order)
     });
 ```
 
-Несколько assertions на **одном объекте** — норма.
+Several aspects of one object make sense в one test. Different behaviors обычно разные tests.
 
-Несколько **разных вещей** — обычно разные тесты.
+## Naming conventions
 
-### 7.4 Naming
-
-Формат: `methodName_condition_expectedResult`
+Format methodName_condition_expectedResult:
 ```
 createOrder_withValidRequest_savesToDb
 createOrder_withNullRequest_throwsException
@@ -466,16 +434,19 @@ findById_whenNotFound_returnsEmpty
 should_save_order_when_request_is_valid
 ```
 
-### 7.5 Что мокать
+Consistency важна. Team agreement — pick one style, use consistently. Test names read like specification.
 
-- **External** (БД, HTTP, файлы) → mock.
-- **Slow** (сеть, GC) → mock.
-- **Non-deterministic** (time, random) → mock / inject.
+## Что мокать
 
-- **Own logic** — НЕ мокать (иначе тестируешь mock, не код).
+External. БД (unless using @DataJpaTest with H2), HTTP calls, files, sockets — mock. Real infrastructure = slow.
 
-### 7.6 Правило не мокать value objects
+Slow. Сеть, GC-triggering operations — mock. Otherwise tests slow.
 
+Non-deterministic. Time, random — mock или inject. Otherwise tests flaky.
+
+Own logic — НЕ мокать. Иначе тестируешь mock, не код. Мoking your own code creates fake tests.
+
+Правило не мокать value objects:
 ```java
 // плохо
 Instant now = mock(Instant.class);
@@ -485,30 +456,19 @@ when(now.isBefore(...)).thenReturn(true);
 Instant now = Instant.parse("2026-09-05T10:00:00Z");
 ```
 
-`Instant`, `String`, `LocalDate` — value objects. Просто создавай реальные.
+Instant, String, LocalDate — value objects. Просто создавай реальные. Cheap. Better test clarity.
 
----
+## Code coverage
 
-## 8. Code coverage
+Мера сколько процентов кода покрыто тестами.
 
-Мера сколько % кода покрыто тестами.
+Инструменты. JaCoCo — стандарт в Java. Cobertura (старый).
 
-### 8.1 Инструменты
+Уровни coverage. Line coverage — процент строк выполнено. Branch coverage — процент условных ветвей (if branches). Method coverage. Class coverage.
 
-- **JaCoCo** — стандарт в Java.
-- **Cobertura** (старый).
+Обычно смотрят line plus branch. Branch coverage more revealing — catches paths not exercised.
 
-### 8.2 Уровни
-
-- **Line coverage** — % строк выполнено.
-- **Branch coverage** — % условных ветвей (`if`).
-- **Method coverage**.
-- **Class coverage**.
-
-Обычно смотрят line + branch.
-
-### 8.3 Как настроить
-
+Setup через build:
 ```gradle
 plugins {
     id 'jacoco'
@@ -526,54 +486,35 @@ jacocoTestReport {
 }
 ```
 
-`./gradlew test jacocoTestReport` → отчёт в `build/jacoco/`.
+`./gradlew test jacocoTestReport` → отчёт в build/jacoco/.
 
-### 8.4 Coverage ВРЁТ
-
-**100% coverage ≠ 100% tested**.
-
+Coverage ВРЁТ важное caveat. 100% coverage ≠ 100% tested:
 ```java
 @Test
 void test() {
     calculator.add(1, 2);
-    // никаких assertions! но 100% строк выполнено
+    // никаких assertions!
+    // 100% строк выполнено но ничего не проверено
 }
 ```
 
-Coverage говорит **какой код выполнен**, не **правильно ли работает**.
+Coverage говорит какой код выполнен, не правильно ли работает. Assertion quality matters more than code coverage.
 
-Используй как guide (что НЕ покрыто), не как цель.
+Используй как guide (что НЕ покрыто), не как цель. Chasing 95%+ coverage everywhere leads к low-quality tests written just для coverage.
 
-### 8.5 Разумные цели
+Разумные цели. 60-80% overall — норма. 90%+ для критичной бизнес-логики. 0-40% для boilerplate (DTOs, config). Focus coverage on important code.
 
-- 60-80% overall — норма.
-- 90%+ для критичной бизнес-логики.
-- 0-40% для boilerplate (DTO, config).
+## Что тестировать в unit
 
-Погоня за 95%+ на всём → пишешь тесты ради тестов.
+Тестируй. Бизнес-логика — расчёты, валидация, state transitions. Edge cases — null, empty, boundary (0, -1, MAX_VALUE). Exception paths — что выбрасывается на invalid input. Interaction — что нужный метод вызывается (verify).
 
----
+Не тестируй. Getters/setters — не полезно. Framework code — Spring, Hibernate уже тестировали. Trivial code — return this.field. Реализацию — тестируй поведение, не implementation details (иначе refactoring = ломает тесты).
 
-## 9. Что тестировать в unit
+Testing behavior means tests pass после refactoring same behavior. Testing implementation means tests break when internals change even если behavior same. Brittleness от implementation testing painful для maintenance.
 
-### 9.1 Тестируй
+## Пример полного unit test
 
-- **Бизнес-логика** — расчёты, валидация, state transitions.
-- **Edge cases** — null, empty, boundary (0, -1, MAX_VALUE).
-- **Exception paths** — что выбрасывается на invalid input.
-- **Interaction** — что нужный метод вызывается (verify).
-
-### 9.2 Не тестируй
-
-- **Getters/setters** — не полезно.
-- **Framework code** — Spring, Hibernate уже тестировали.
-- **Trivial code** — `return this.field`.
-- **Реализацию** — тестируй **поведение**, не implementation details (иначе рефакторинг = ломает тесты).
-
----
-
-## 10. Пример полного unit test
-
+Comprehensive example demonstrating best practices:
 ```java
 @ExtendWith(MockitoExtension.class)
 class OrderServiceTest {
@@ -645,36 +586,34 @@ class OrderServiceTest {
 }
 ```
 
----
+Demonstrates. Multiple tests per class. Different scenarios explicitly named. ArgumentCaptor для detailed inspection. verify never для negative assertions. Parameterized test для multiple similar inputs.
 
-## 11. Собесные вопросы
+## Итоги
 
-1. **Что такое пирамида тестов?** — Много unit (быстро), меньше integration, ещё меньше E2E (медленно).
-2. **JUnit 5 vs JUnit 4?** — Другой пакет (jupiter), @BeforeEach вместо @Before, Extension model, native parameterized, nested tests.
-3. **Что такое AssertJ?** — Fluent assertion library; лучше JUnit assertions по читаемости и сообщениям.
-4. **Что такое Mockito?** — Библиотека моков; `mock()`, `when().thenReturn()`, `verify()`.
-5. **@Mock vs mock()?** — Аннотация для JUnit; работает через MockitoExtension.
-6. **Что такое ArgumentCaptor?** — Захват аргумента для inspection после вызова.
-7. **spy vs mock?** — spy на реальном объекте (частично реальный); mock — полностью fake.
-8. **AAA pattern?** — Arrange / Act / Assert.
-9. **F.I.R.S.T?** — Fast, Isolated, Repeatable, Self-validating, Timely.
-10. **Что такое code coverage?** — % кода выполненного тестами; JaCoCo стандарт.
-11. **100% coverage — хорошо?** — Coverage не гарантирует качество; хорошо для критичной логики, вредно для boilerplate.
-12. **Test doubles?** — Dummy/Stub/Spy/Mock/Fake (терминология xUnit).
-13. **Что мокать?** — External (БД, HTTP), slow, non-deterministic; НЕ own logic.
-14. **Что не тестировать unit?** — Getters/setters, framework, trivial code, implementation details.
-15. **Parameterized tests — когда?** — Один тест на много cases с разными inputs.
+Testing serves multiple purposes — regression prevention, documentation, refactoring confidence, design feedback, faster development. Not just obligation.
 
----
+Pyramid pattern — many unit, some integration, few E2E. Balance between coverage, speed, maintenance cost.
 
-## Итог
+JUnit 5 provides. Test annotations. Lifecycle methods. Assertions (though AssertJ preferred). Parameterized tests. Nested tests. Extensions model.
 
-- **Пирамида**: много unit, меньше integration, чуть E2E.
-- **JUnit 5** + **AssertJ** + **Mockito** = стандартный стек.
-- **AAA pattern**, **F.I.R.S.T**.
-- **Verify** взаимодействий + **ArgumentCaptor** для inspection.
-- **Coverage** как guide, не цель.
-- **Тестируй поведение**, не implementation.
-- Мокать external, не own logic.
+AssertJ preferred over JUnit assertions. Fluent API. Better error messages. Rich matchers.
 
-Следующий — `54-testing-integration-slice.md`.
+Mockito для test doubles. Mock creation через mock() или @Mock. when.thenReturn programs behavior. verify checks invocations. ArgumentCaptor для detailed inspection. @InjectMocks automated wiring.
+
+Test doubles terminology — dummy, stub, spy, mock, fake. Practical usage uses «mock» generically.
+
+F.I.R.S.T principles — Fast, Isolated, Repeatable, Self-validating, Timely.
+
+AAA pattern — Arrange, Act, Assert. Standard structure.
+
+Один assert идеал но не dogma. Multiple assertions on same object OK. Different behaviors — separate tests.
+
+Naming — methodName_condition_expectedResult или should_behavior_when_condition. Team consistency важна.
+
+Coverage as guide не цель. 100% coverage ≠ 100% tested. Assertion quality более important than coverage percentage.
+
+Тестировать бизнес-логику, edge cases, exception paths, interactions. Не тестировать getters, framework code, trivial code, implementation details.
+
+Мокать external, slow, non-deterministic. Не мокать own logic и value objects.
+
+Дальше — integration testing plus slice tests в Spring Boot с Testcontainers.

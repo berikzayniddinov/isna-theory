@@ -1,119 +1,87 @@
-# 55. E2E, Smoke, Selenium, Performance тесты
+# 55. E2E, Smoke, Selenium, Performance testing
 
-Тесты вершины пирамиды. Реальные user flows.
+## Зачем нужны вершинные уровни pyramid
 
----
+Разработчик который acquiring understanding testing hierarchy обычно останавливается на unit plus integration tests. Considers whole story. Production reality приносит другие категории проблемы. UI работает functionally но regression в CSS ломает business flow. Api tests зелёные но end-to-end user journey fails из-за timing issues между sync services. Load performance passes для one instance но degrades при deployment scale. All these выходят за scope unit и integration tests.
 
-## 1. E2E (End-to-end) тесты
+Разница между разработчиком «знающим unit/integration» и «понимающим full test spectrum» проявляется в production incident response. Первый видит user-reported bug и says «unit tests зелёные, must be user error». Второй знает что E2E tests catch integration bugs between services и UI, smoke tests catch deployment issues быстро, performance tests catch degradation при scale, chaos engineering catches resilience gaps. Знает что каждый level имеет своё место и свою cost — pyramid balances all of them.
 
-**E2E** = полная цепочка через **все компоненты**: UI → backend → БД → external → response.
+В этом файле разберём вершину pyramid глубоко. E2E tests — real user journeys through полную систему. Smoke tests — быстрая post-deploy verification. Виды тестов по функционалу (functional vs non-functional). Selenium как industry standard для UI automation, mechanics plus caveats. Alternative UI tools — Playwright, Cypress. API E2E через REST-assured, Karate. Performance testing — load, stress, soak, spike. SLA/SLO/SLI terminology. Инструменты — JMeter, Gatling, k6. Chaos engineering. Security testing (SAST, DAST, SCA). Реальные КНП кейсы. CI/CD integration тестов.
 
-### 1.1 Пример
+## E2E: end-to-end tests
 
-Пользователь на сайте:
-1. Открывает `knp.kgd.gov.kz`.
-2. Логинится через ЭЦП.
-3. Открывает форму ФНО.
-4. Заполняет.
-5. Подписывает.
-6. Отправляет.
-7. Видит в списке отправленных.
+Полная цепочка через все компоненты. UI → backend → БД → external → response. Testing complete user journey не just individual pieces.
 
-E2E тест: делает всё это программно, проверяет что каждый шаг работает.
+Пример scenario. Пользователь на сайте. Открывает knp.kgd.gov.kz. Логинится через ЭЦП. Открывает форму ФНО. Заполняет. Подписывает. Отправляет. Видит в списке отправленных.
 
-### 1.2 Зачем
+E2E test делает всё это программно. Verifies что каждый шаг работает. Catches integration bugs invisible в unit/integration tests.
 
-- Ловит **integration bugs**, невидимые в unit/integration.
-- Проверяет **critical user journeys**.
-- Regression на **production**-like environment.
+Зачем E2E. Ловит integration bugs missed в other levels. Проверяет critical user journeys. Regression на production-like environment. Business confidence — тесты show system works end-to-end.
 
-### 1.3 Кавет
+Caveats E2E. Медленные — минуты на тест vs milliseconds для unit. Flaky — сеть, timing, UI-элементы могут vary. Дорого — поддержка plus infrastructure. Сложно отладить — что упало где в chain?
 
-- **Медленные** — минуты на тест.
-- **Flaky** — сеть, timing, UI-элементы.
-- **Дорого** — поддержка + инфраструктура.
-- **Сложно отладить** — что упало где?
+Правило pyramid. Мало E2E, только критичные paths. Не comprehensive coverage через E2E — too expensive и слишком slow.
 
-Правило: **мало E2E**, только критичные paths.
+## Smoke tests
 
----
+Дым идёт? Быстрая проверка что базовые вещи работают.
 
-## 2. Smoke тесты
+Идея. После deploy — прогнать 5-20 критичных тестов за 1-5 минут. Если зелёные — всё OK, если красное — откатить.
 
-**Smoke test** = «дым идёт?». Быстрая проверка что базовые вещи работают.
+Что проверять. Приложение отвечает (/actuator/health). Логин работает. Основной GET endpoint возвращает данные. POST одного ресурса создаётся.
 
-### 2.1 Идея
+Не проверять. Edge cases. Полные бизнес-процессы. Smoke = «критичное работает», не «всё работает».
 
-После deploy — прогнать 5-20 критичных тестов за 1-5 минут. Если зелёные → всё OK, если красное → откатить.
+В КНП — knp-e2e. Из memory. knp-e2e — раннер для e2e-тестов против живого стенда. Прод-смок (prod-smoke-*) — набор критичных проверок. Разные наборы для разных сервисов — prod-smoke-fno-ul, prod-smoke-fo-ul.
 
-### 2.2 Что проверять
+Правила пользователя (memory knp-e2e-prod-smoke-scope-rules). НЕ смокать мутирующие/опасные API (send/запись/запрос в ЛС-ИШ-ОС под ЭЦП владельца). Только gap-эндпоинты — покрывать отсутствующие сейчас, потом только safe GET.
 
-- Приложение отвечает (`/actuator/health`).
-- Логин работает.
-- Основной GET endpoint возвращает данные.
-- POST одного ресурса создаётся.
+Синтетический мониторинг. Smoke прогоны каждые N минут (Grafana Synthetics, Pingdom, Datadog Synthetics). Даёт alert если что-то упало между полными деплоями.
 
-**Не проверять**: edge cases, полные бизнес-процессы. Smoke = «критичное работает», не «всё работает».
+Continuous synthetic monitoring разительно улучшает detection outages. Traditional monitoring reports когда metrics deviate. Synthetic monitoring proactively tests actual user paths.
 
-### 2.3 В ИСНА — knp-e2e
+## Виды тестов по функционалу
 
-Из memory:
-- `knp-e2e` — раннер для e2e-тестов против живого стенда.
-- **Прод-смок** (`prod-smoke-*`) — набор критичных проверок.
-- Разные наборы для разных сервисов: `prod-smoke-fno-ul`, `prod-smoke-fo-ul`.
+Functional tests. Проверяют что функция работает как ожидается. Unit/integration/E2E — все могут быть functional. Behavior verification.
 
-Правила пользователя (memory `knp-e2e-prod-smoke-scope-rules`):
-1. **НЕ смокать мутирующие/опасные API** (send/запись/запрос в ЛС-ИШ-ОС под ЭЦП владельца).
-2. **Только gap-эндпоинты** — покрывать отсутствующие сейчас, потом только safe GET.
+Non-functional. Different aspects beyond «works correctly».
 
-### 2.4 Синтетический мониторинг
+Performance — скорость. How fast operations complete.
 
-Smoke прогоны каждые N минут (Grafana Synthetics, Pingdom, Datadog Synthetics).
+Load — сколько req/sec система обрабатывает. Normal expected traffic testing.
 
-Даёт alert если что-то упало между полными деплоями.
+Stress — до какого предела. Increasing load until breaking point.
 
----
+Soak — работает ли долго (утечки). Sustained load для hours detecting memory leaks, resource exhaustion.
 
-## 3. Виды тестов по функционалу
+Spike — как переживёт резкий всплеск. Sudden traffic surge handling.
 
-### 3.1 Functional tests
+Security — уязвимости. Attack vectors testing.
 
-Проверяют что функция работает как ожидается. Unit/integration/E2E — все могут быть functional.
+Usability — удобство UI. Human-centered evaluation.
 
-### 3.2 Non-functional
+Accessibility — a11y (accessibility for disabled users). WCAG compliance testing.
 
-- **Performance** — скорость.
-- **Load** — сколько req/sec.
-- **Stress** — до какого предела.
-- **Soak** — работает ли долго (утечки).
-- **Spike** — как переживёт резкий всплеск.
-- **Security** — уязвимости.
-- **Usability** — удобство UI.
-- **Accessibility** — a11y.
+## Selenium для UI автоматизации
 
----
+Selenium WebDriver — стандарт для UI automation. Long-established, widely used.
 
-## 4. UI тесты — Selenium
-
-**Selenium WebDriver** — стандарт для UI-автоматизации.
-
-### 4.1 Как работает
-
+Как работает:
 ```
 Test code (Java) → Selenium WebDriver API → Browser (ChromeDriver / GeckoDriver) → реальный Chrome / Firefox
 ```
 
-Программно управляешь браузером: клики, ввод, чтение элементов.
+Программно управляешь браузером. Клики, ввод, чтение элементов. Real browser behavior.
 
-### 4.2 Зависимости
-
+Зависимости:
 ```gradle
 testImplementation 'org.seleniumhq.selenium:selenium-java:4.16.0'
-testImplementation 'io.github.bonigarcia:webdrivermanager:5.6.0'   // авто-скачивание driver
+testImplementation 'io.github.bonigarcia:webdrivermanager:5.6.0'
 ```
 
-### 4.3 Базовый пример
+WebDriverManager автоматически downloads correct browser driver.
 
+Базовый пример:
 ```java
 class LoginTest {
 
@@ -149,23 +117,17 @@ class LoginTest {
 }
 ```
 
-### 4.4 Локаторы
+Headless mode (--headless) — без visual browser. Faster, works в CI environments без displays.
 
-- `By.id("username")`.
-- `By.name("email")`.
-- `By.className("btn-primary")`.
-- `By.cssSelector("input[type='text']")`.
-- `By.xpath("//button[contains(text(), 'Submit')]")`.
-- `By.linkText("Log out")`.
+Локаторы для finding elements. By.id("username") — most preferred, stable. By.name("email"). By.className("btn-primary"). By.cssSelector("input[type='text']"). By.xpath("//button[contains(text(), 'Submit')]"). By.linkText("Log out").
 
-Правило: **id > css > xpath**. Xpath ломкий.
+Правило локатор priority. id > css > xpath. Xpath ломкий — DOM changes break selectors easily.
 
-### 4.5 Waits
+Waits критически важны для reliable tests.
 
-**Fatal error**: `Thread.sleep(5000)` — flaky.
+Fatal error. Thread.sleep(5000) — flaky. Sometimes слишком мало, sometimes слишком много. Timing depends на environment.
 
-**Правильно**: explicit waits.
-
+Правильно — explicit waits:
 ```java
 WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(10));
 
@@ -185,20 +147,24 @@ wait.until(ExpectedConditions.urlContains("/dashboard"));
 wait.until(d -> d.findElements(By.className("row")).size() > 0);
 ```
 
-**Implicit wait** — глобальный (не рекомендуется, скрывает проблемы):
+Wait для actual condition вместо fixed time. Tests complete when ready instead of waiting fixed duration. Faster и more reliable.
+
+Implicit wait — глобальный:
 ```java
 driver.manage().timeouts().implicitlyWait(Duration.ofSeconds(10));
 ```
 
-### 4.6 Page Object Model
+Не рекомендуется. Скрывает проблемы (unclear waiting behavior). Prefer explicit waits.
 
-Абстракция: page → отдельный класс с методами.
+## Page Object Model
+
+Абстракция page → отдельный класс с методами. Design pattern для maintainable UI tests.
 
 Плохо (везде By.id):
 ```java
 driver.findElement(By.id("username")).sendKeys(...);
 driver.findElement(By.id("submit")).click();
-// разбросано по всем тестам
+// selectors разбросаны по всем тестам
 ```
 
 Хорошо (Page Object):
@@ -229,31 +195,26 @@ DashboardPage dashboard = login.loginAs("berik", "secret");
 assertThat(dashboard.isOpen()).isTrue();
 ```
 
-Плюсы:
-- Логика page — в одном месте.
-- Тесты читаемы (business language).
-- Изменение UI → правка одного Page Object.
+Плюсы. Логика page — в одном месте. Тесты читаемы (business language). Изменение UI → правка одного Page Object. Multiple tests reuse same Page Object.
 
-### 4.7 Selenium Grid
+Standard practice для serious UI testing. Reduces maintenance burden significantly.
 
-Запускать тесты параллельно на много browser'ов / машин.
+## Selenium Grid
 
+Запускать тесты параллельно на много browser'ов и машин:
 ```
 Hub → Node 1 (Chrome)
     → Node 2 (Firefox)
     → Node 3 (Safari)
 ```
 
-Тесты параллельно ускоряют прогон.
+Тесты параллельно ускоряют прогон. Cross-browser testing enabled. Different browsers detect different bugs sometimes.
 
----
+Enterprise Selenium setups use Grid либо cloud services (Sauce Labs, BrowserStack) для same effect.
 
-## 5. Альтернативы Selenium
+## Альтернативы Selenium
 
-### 5.1 Playwright
-
-Модерн от Microsoft. Быстрее, стабильнее.
-
+Playwright — modern от Microsoft. Быстрее, стабильнее:
 ```java
 try (Playwright pw = Playwright.create()) {
     Browser browser = pw.chromium().launch();
@@ -265,31 +226,23 @@ try (Playwright pw = Playwright.create()) {
 }
 ```
 
-Плюсы:
-- Auto-wait (не нужен explicit).
-- Multi-language (Java, TS, Python, .NET).
-- Быстрее.
-- Network interception.
+Плюсы. Auto-wait (не нужен explicit). Multi-language (Java, TS, Python, .NET). Быстрее. Network interception. Better reliability чем Selenium.
 
-### 5.2 Cypress
+Gaining popularity. Consider для new projects.
 
-JS-only, для frontend команд. Живёт в браузере, не через WebDriver.
+Cypress. JS-only, для frontend команд. Живёт в браузере, не через WebDriver.
 
-Плюсы: быстрый, DX хороший.
-Минусы: JS only, single tab.
+Плюсы. Быстрый. DX хороший. Time-travel debugging. Automatic waiting.
 
-### 5.3 Puppeteer
+Минусы. JS only (frontend teams). Single tab (limitation). Не cross-browser все.
 
-JS-only, для Chrome. Google.
+Puppeteer. JS-only, для Chrome. Google product. Precursor Playwright.
 
----
+## API E2E tests
 
-## 6. API E2E тесты (без UI)
+Часто проще тестировать через API, не UI. Faster, more reliable, easier to maintain.
 
-Часто проще тестировать через API, не UI.
-
-### 6.1 REST-assured
-
+REST-assured:
 ```java
 import static io.restassured.RestAssured.*;
 
@@ -315,12 +268,9 @@ void createOrder_returnsCreated() {
 }
 ```
 
-Читаемо. Стандарт для API E2E.
+Читаемо. Стандарт для API E2E тестов. Fluent DSL familiar most Java developers.
 
-### 6.2 Karate
-
-DSL для API tests. Один файл описывает scenario:
-
+Karate. DSL для API tests. Один файл описывает scenario:
 ```gherkin
 Feature: Order API
 
@@ -332,13 +282,11 @@ Scenario: Create order
     And match response.status == 'NEW'
 ```
 
-Плюсы: BDD-style, не Java-код.
-Минусы: свой DSL, не Java.
+Плюсы. BDD-style, не Java-код. Readable business stakeholders.
 
-### 6.3 WireMock
+Минусы. Свой DSL, не Java. Learning curve. Less flexibility.
 
-Мок для внешних сервисов в тестах.
-
+WireMock. Мок для внешних сервисов в тестах:
 ```java
 @RegisterExtension
 WireMockExtension wm = WireMockExtension.newInstance()
@@ -357,49 +305,53 @@ void test() {
 }
 ```
 
----
+Simulates HTTP downstream в tests. Verifies что expected calls made.
 
-## 7. Performance тесты
+## Performance testing
 
-### 7.1 Виды
+Виды tests.
 
-- **Load** — нормальная нагрузка; можем ли обслужить N req/sec?
-- **Stress** — увеличиваем до отказа; сколько выдержит?
-- **Soak / Endurance** — постоянная нагрузка часами; утечки, деградация?
-- **Spike** — резкий всплеск; graceful?
-- **Volume** — большие данные (терабайты).
+Load — нормальная нагрузка. Can we handle N req/sec? Baseline verification.
 
-### 7.2 SLA / SLO / SLI
+Stress — увеличиваем до отказа. Сколько выдержит? Finding limits.
 
-- **SLA (Service Level Agreement)** — контракт с клиентом («99.9% uptime»).
-- **SLO (Service Level Objective)** — цель («p99 latency < 500 ms»).
-- **SLI (Service Level Indicator)** — измерение (реальные p99 = 320 ms).
+Soak / Endurance — постоянная нагрузка часами. Утечки, деградация? Memory leaks, resource exhaustion.
 
-Performance testing доказывает что SLO выполним.
+Spike — резкий всплеск. Graceful? Handling sudden traffic increases.
 
-### 7.3 Метрики
+Volume — большие данные (терабайты). Testing с data at scale.
 
-- **Throughput** — req/sec.
-- **Latency percentiles** — p50, p95, p99, p99.9.
-- **Error rate**.
-- **Resource utilization** — CPU, memory, DB pool.
+## SLA / SLO / SLI
 
----
+SLA (Service Level Agreement) — контракт с клиентом. 99.9% uptime. Formal commitment. Consequences для violations (financial penalties, credits).
 
-## 8. Инструменты performance
+SLO (Service Level Objective) — цель. p99 latency less than 500 ms. Internal target. Guides operations decisions.
 
-### 8.1 JMeter
+SLI (Service Level Indicator) — измерение. Реальные p99 = 320 ms. Actual observed metric.
 
-Старейший, GUI + XML config.
+Relationship. SLIs measure. SLOs targets. SLAs contractual commitments. SLIs continuously monitored, SLO thresholds trigger alerting, SLA violations trigger business consequences.
 
-Плюсы: много фич, plugins, готовые готовые sample.
+Performance testing доказывает что SLO выполним. Не replaces monitoring но validates система can meet targets under expected load.
 
-Минусы: XML config неудобен, memory-hungry, старый UI.
+## Метрики performance
 
-### 8.2 Gatling
+Throughput — req/sec. How much traffic system serves.
 
-Scala DSL, современный.
+Latency percentiles — p50 (median), p95, p99, p99.9. Distribution of response times. Not average — average hides outliers.
 
+Error rate — процент failed responses. Higher под load обычно.
+
+Resource utilization — CPU, memory, DB pool. Where bottleneck resides.
+
+Combined metrics tell full story. Throughput high, latency low, errors near zero, utilization sustainable = healthy. Any degradation reveals problem area.
+
+## Инструменты performance
+
+JMeter. Старейший, GUI plus XML config. Много features, plugins, готовые sample scripts.
+
+Минусы. XML config неудобен. Memory-hungry. Старый UI.
+
+Gatling. Scala DSL, современный:
 ```scala
 val scn = scenario("Order flow")
   .exec(http("Login").post("/login").body(...))
@@ -411,12 +363,9 @@ setUp(
 )
 ```
 
-Плюсы: код в Scala, HTML отчёты, async engine (много concurrent).
+Плюсы. Код в Scala. HTML отчёты beautiful. Async engine (много concurrent).
 
-### 8.3 k6
-
-Modern, JS-scripting.
-
+k6. Modern, JS-scripting:
 ```javascript
 import http from 'k6/http';
 import { check } from 'k6';
@@ -432,98 +381,56 @@ export default function () {
 }
 ```
 
-Плюсы: простой JS, cloud (k6 Cloud), CI-friendly.
+Плюсы. Простой JS. Cloud (k6 Cloud) для distributed load. CI-friendly. Modern developer experience.
 
-**В ИСНА** — k6 используется (из memory).
+В КНП — k6 используется (из memory).
 
-### 8.4 wrk / wrk2
-
-CLI, простой. Быстрая проверка throughput.
-
+wrk / wrk2. CLI, простой. Быстрая проверка throughput:
 ```bash
 wrk -t8 -c100 -d30s https://api.example.com/health
 ```
 
----
+Simple но powerful для quick benchmarks.
 
-## 9. Chaos testing
+## Chaos engineering
 
-Уже упоминал в `52-microservices-resilience.md`.
+Ломаем намеренно. Kill pods, slow network → проверяем что система пережила. Discussed в файле 52.
 
-Ломаем намеренно (kill pods, slow network) → проверяем что система пережила.
+Инструменты. Chaos Monkey (Netflix). Chaos Mesh (K8s). Gremlin. Litmus.
 
-Инструменты:
-- **Chaos Monkey** (Netflix).
-- **Chaos Mesh** (K8s).
-- **Gremlin**.
-- **Litmus**.
+Chaos testing verifies resilience patterns work в practice. Не just theoretical — actually recovers from failures.
 
----
+## Security testing
 
-## 10. Security тесты
+SAST (Static Application Security Testing). Анализ исходного кода на уязвимости. Not running application — static analysis.
 
-### 10.1 SAST (Static Application Security Testing)
+Инструменты. SonarQube. Checkmarx. Semgrep. Snyk Code. Integrated в CI pipeline typically.
 
-Анализ **исходного кода** на уязвимости.
+DAST (Dynamic Application Security Testing). Тестирование работающего приложения. SQL injection, XSS attempts.
 
-- **SonarQube**.
-- **Checkmarx**.
-- **Semgrep**.
-- **Snyk Code**.
+Инструменты. OWASP ZAP. Burp Suite. Automated crawling plus vulnerability probing.
 
-### 10.2 DAST (Dynamic)
+SCA (Software Composition Analysis). Проверка зависимостей на известные CVE.
 
-Тестирование **работающего приложения** — SQL injection, XSS.
+Инструменты. Snyk. OWASP Dependency-Check. Dependabot (GitHub). Trivy (для Docker images). Automated scanning against vulnerability databases.
 
-- **OWASP ZAP**.
-- **Burp Suite**.
+Penetration testing. Ручное тестирование "белыми хакерами". Human expertise finding vulnerabilities automated tools miss. Periodic engagements.
 
-### 10.3 SCA (Software Composition Analysis)
+## Real ИСНА cases
 
-Проверка **зависимостей** на известные CVE.
+knp-e2e runner — custom Java-based runner против живого стенда. Из memory. knp-e2e-runner-ops — как поднять и гонять flow-runner. knp-e2e-feign-smoke — синтетические Feign-смоки (проверка всех Feign-клиентов). knp-e2e-trigger-topology — как модули триггерят раннер (inline / E2E_LIST / E2E_SCOPE). knp-fo-frequency-tiering — правило 3/2/1 happy-кейсов для ФО. knp-e2e-liquidation-reversal-repro — flow воспроизводит баг переразноски. knp-e2e-prod-taxrep21-smoke-local-run — как локально гонять prod-smoke.
 
-- **Snyk**.
-- **OWASP Dependency-Check**.
-- **Dependabot** (GitHub).
-- **Trivy** (для Docker images).
+Правила scope. knp-e2e-prod-smoke-scope-rules — не смокать мутирующие; только gap-endpoints.
 
-### 10.4 Penetration testing
+gate-knp. Gate — проверка что тесты прошли перед merge. Реальный кейс knp-e2e-runner-hikari-isolation-poisoning — HikariCP отравлялся, gate краснел 18 минут. Fix — явный isolation setting.
 
-Ручное тестирование "белыми хакерами".
+e2e-gate-check-master race. Memory knp-e2e-gate-check-master-race — проверил гейт раньше чем release e2e дозавершился → Retry джобы.
 
----
+Все эти cases показывают что testing infrastructure сложна и evolves с системой. Custom tooling часто необходимо для specific needs.
 
-## 11. Real ИСНА cases
+## CI/CD и тесты
 
-### 11.1 knp-e2e runner
-
-Custom Java-based runner против живого стенда. Из memory:
-
-- **`knp-e2e-runner-ops`** — как поднять и гонять flow-runner.
-- **`knp-e2e-feign-smoke`** — синтетические Feign-смоки (проверка всех Feign-клиентов).
-- **`knp-e2e-trigger-topology`** — как модули триггерят раннер (inline / E2E_LIST / E2E_SCOPE).
-- **`knp-fo-frequency-tiering`** — правило 3/2/1 happy-кейсов для ФО.
-- **`knp-e2e-liquidation-reversal-repro`** — flow воспроизводит баг переразноски.
-- **`knp-e2e-prod-taxrep21-smoke-local-run`** — как локально гонять prod-smoke.
-
-### 11.2 Правила scope
-
-- `knp-e2e-prod-smoke-scope-rules` — не смокать мутирующие; только gap-endpoints.
-
-### 11.3 gate-knp
-
-Gate — проверка что тесты прошли перед merge. Реальный кейс `knp-e2e-runner-hikari-isolation-poisoning` — HikariCP отравлялся → gate краснел 18 мин; фикс — явный isolation.
-
-### 11.4 e2e-gate-check-master race
-
-Memory `knp-e2e-gate-check-master-race`: проверил гейт раньше чем release e2e дозавершился → Retry джобы.
-
----
-
-## 12. CI/CD и тесты
-
-### 12.1 Pipeline
-
+Pipeline stages:
 ```
 commit
    │
@@ -546,8 +453,9 @@ commit
 [production smoke]       ← post-deploy verify
 ```
 
-### 12.2 Test parallelization
+Каждый stage gates progression. Fail — stop pipeline. Investigate.
 
+Test parallelization для speed:
 ```gradle
 test {
     maxParallelForks = 4
@@ -555,56 +463,62 @@ test {
 }
 ```
 
-Каждый fork — отдельная JVM. Ускоряет прогон.
+Каждый fork — отдельная JVM. Ускоряет прогон. Trade-off — more resource intensive.
 
----
+## Best practices E2E
 
-## 13. Best practices E2E
+Мало E2E — только критичные paths. Comprehensive coverage через unit / integration.
 
-1. **Мало E2E** — только критичные paths.
-2. **Test data setup** — известное, не полагайся на существующие.
-3. **Cleanup** после тестов (или используй non-critical accounts).
-4. **Явные waits**, никаких `Thread.sleep`.
-5. **Page Object** для UI.
-6. **Screenshots on failure** — что видел браузер.
-7. **Video recording** для debug.
-8. **Retry flaky** ограниченно (`maxAttempts = 3`) — но чинить причину.
-9. **Timeout всё** — тест не должен висеть.
-10. **Environment isolation** — не тестируй в prod прямыми записями.
-11. **Мониторинг** прогонов (JUnit XML + Grafana Test Analytics).
+Test data setup — известное, не полагайся на existing. Reproducible test data important.
 
----
+Cleanup после тестов (или используй non-critical accounts). Don't pollute test environment.
 
-## 14. Собесные вопросы
+Явные waits, никаких Thread.sleep. Reliability requires explicit conditions.
 
-1. **Что такое E2E?** — Полная цепочка через все компоненты (UI/API → backend → БД).
-2. **Что такое smoke test?** — Быстрая проверка что критичное работает после deploy.
-3. **Selenium — как работает?** — Test → WebDriver API → ChromeDriver → реальный Chrome.
-4. **Selenium waits — какие?** — Explicit (WebDriverWait), implicit (не рекомендуется), никогда Thread.sleep.
-5. **Что такое Page Object Model?** — Абстракция: page → класс с методами; логика UI в одном месте.
-6. **Selenium vs Playwright?** — Playwright новее, быстрее, auto-wait, multi-language.
-7. **REST-assured — зачем?** — Fluent DSL для API E2E тестов.
-8. **Load vs Stress vs Soak?** — Load: нормальная; stress: до отказа; soak: длительная (утечки).
-9. **SLA vs SLO vs SLI?** — Agreement (контракт) / Objective (цель) / Indicator (измерение).
-10. **Инструменты performance?** — JMeter, Gatling, k6, wrk.
-11. **k6 — что за?** — JS-scripting, современный, CI-friendly.
-12. **Что такое chaos engineering?** — Намеренная поломка prod (kill pods) для проверки resilience.
-13. **SAST vs DAST?** — Static (код) vs Dynamic (running app).
-14. **Как избежать flaky E2E?** — Explicit waits, не полагаться на порядок, изолированные данные, идемпотентные setup.
-15. **WireMock — зачем?** — Mock external HTTP-сервисов в тестах.
+Page Object для UI. Maintainability critical для UI tests.
 
----
+Screenshots on failure — что видел браузер. Debugging visual issues requires seeing state.
 
-## Итог
+Video recording для debug. Some frameworks support (Playwright). Priceless for flaky test investigation.
 
-- **E2E** — критичные full-chain flows; **мало**, но важно.
-- **Smoke** — быстрая post-deploy проверка.
-- **Selenium/Playwright** для UI; **REST-assured** для API.
-- **Page Object** обязательно для Selenium.
-- **Explicit waits**, никогда Thread.sleep.
-- **Performance**: JMeter/Gatling/k6.
-- **SLA/SLO/SLI** — терминология уровня сервиса.
-- **CI**: unit → integration → smoke → prod.
-- В **ИСНА**: `knp-e2e` custom runner; prod-smoke по строгим правилам scope.
+Retry flaky ограниченно (maxAttempts = 3) — но чинить причину. Retry hides symptoms — fix underlying cause.
 
-Следующий — `56-testing-best-practices.md`.
+Timeout всё — тест не должен висеть. Ensure tests complete в bounded time.
+
+Environment isolation — не тестируй в prod прямыми записями. Sandbox environments preferred.
+
+Мониторинг прогонов (JUnit XML plus Grafana Test Analytics). Test flakiness metrics tracked over time.
+
+## Итоги
+
+E2E тесты critical для critical user journeys. Мало но important. Full-chain verification.
+
+Smoke тесты для post-deploy verification. Быстро (1-5 min). Прогон критичного.
+
+В КНП — knp-e2e custom runner. prod-smoke по строгим правилам scope (не мутирующие, gap-endpoints).
+
+Виды тестов по функционалу. Functional (behavior). Non-functional (performance, load, stress, soak, spike, security, usability, accessibility).
+
+Selenium — industry standard для UI. Explicit waits обязательно. Page Object Model для maintainability. Grid для parallel execution.
+
+Alternatives Selenium. Playwright более modern. Cypress для frontend teams (JS only).
+
+API E2E — REST-assured (fluent DSL), Karate (BDD-style), WireMock (mocking external HTTP).
+
+Performance testing. JMeter, Gatling, k6. Load, stress, soak, spike, volume different concerns.
+
+SLA / SLO / SLI terminology. Contract, target, measurement respectively.
+
+Метрики. Throughput, latency percentiles, error rate, resource utilization. Combined picture.
+
+Chaos engineering для verification resilience. Ломаем намеренно, наблюдаем recovery.
+
+Security testing. SAST (static code), DAST (running app), SCA (dependencies), penetration testing (human expertise).
+
+CI/CD pipeline stages — unit, integration, smoke, production smoke. Each gates progression.
+
+Real КНП cases показывают что testing infrastructure evolves с системой. Custom tooling часто необходимо.
+
+Best practices E2E. Мало tests. Isolated data. Explicit waits. Page Object. Screenshots. Timeouts. Fix flaky.
+
+Testing spectrum от unit to E2E to chaos to security обеспечивает production confidence. Pyramid balance keeps costs sustainable.

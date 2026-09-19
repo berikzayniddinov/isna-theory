@@ -1,28 +1,26 @@
-# 54. Integration и Slice тесты
+# 54. Integration и Slice testing в Spring Boot с Testcontainers
 
-Spring Boot тесты уровня выше unit. `@SpringBootTest`, slice tests, Testcontainers.
+## Зачем идти выше unit tests
 
----
+Unit tests обеспечивают fast feedback plus isolated verification одного класса. Хорошее покрытие unit tests catches many bugs. Но некоторые категории issues fundamentally beyond unit test scope. Как поведёт Spring wire beans при startup? Работает ли JPA mapping правильно с actual PostgreSQL? Правильно ли HTTP endpoints сериализуют/десериализуют JSON? Настроена ли Spring Security correctly? Что происходит при real network calls к real Kafka?
 
-## 1. Что такое integration test
+Разница между разработчиком «пишущим unit tests» и «понимающим integration testing» проявляется в incident diagnosis. Первый видит production bug где Spring @Transactional не rollback'ит properly через inheritance. Unit tests все зелёные. Обнаруживается only when hitting real database. Второй знает что integration tests с real database (Testcontainers) catches этот класс issues. Знает что @DataJpaTest slice test даёт real JPA behavior fast. Знает @WebMvcTest для web layer testing без full context. Знает Testcontainers для realistic external systems (PostgreSQL, Kafka, RabbitMQ, Keycloak) в tests. Знает что @Transactional in tests provides automatic rollback maintaining test isolation.
 
-Тест **взаимодействия компонентов**. В отличие от unit — не мокаем всё, а тестируем реальные связки.
+В этом файле разберём Spring Boot integration testing глубоко. Что такое integration test. @SpringBootTest — полный контекст, its variants. Slice tests — @WebMvcTest, @DataJpaTest, @JsonTest, @RestClientTest. MockMvc для HTTP testing без реального сервера. @MockBean для замены beans в context. Testcontainers detailed — postgresql, kafka, rabbit, keycloak. @DynamicPropertySource для dynamic properties. Test profiles. Test data management. Contract testing. Best practices. Реальные caveats.
 
-Виды:
-- **Component test** — весь сервис, но external моки.
-- **Integration test** — часть сервиса (controller + service + repo + БД).
-- **System test** — весь сервис + реальные dependencies.
+## Что такое integration test
 
-В Spring Boot чаще всего:
-- **Slice test** — часть Spring контекста (`@WebMvcTest`, `@DataJpaTest`).
-- **Full context test** — `@SpringBootTest` (весь контекст + Testcontainers).
+Тест взаимодействия компонентов. В отличие от unit — не мокаем всё, а тестируем реальные связки.
 
----
+Виды integration testing. Component test — весь сервис, но external moks. Integration test — часть сервиса (controller plus service plus repo plus БД). System test — весь сервис plus реальные dependencies. Overlapping definitions в industry.
 
-## 2. @SpringBootTest — полный контекст
+В Spring Boot чаще всего. Slice test — часть Spring контекста (@WebMvcTest, @DataJpaTest). Full context test — @SpringBootTest (весь контекст plus Testcontainers).
 
-Поднимает весь Spring контекст. Медленно, но реалистично.
+Trade-off. Больше real components — реалистичнее но медленнее. Slice tests balance realism с speed для focused testing specific concerns.
 
+## @SpringBootTest — full context
+
+Поднимает весь Spring контекст. Медленно, но реалистично:
 ```java
 @SpringBootTest
 class OrderIntegrationTest {
@@ -38,17 +36,11 @@ class OrderIntegrationTest {
 }
 ```
 
-### 2.1 Что делает
+Что делает. Загружает @SpringBootApplication. Auto-configuration triggers. Создаёт все bean. Готовит для теста.
 
-1. Загружает `@SpringBootApplication`.
-2. Auto-configuration.
-3. Создаёт все бины.
-4. Готовит для теста.
+Время старта. 5-30 секунд первый раз (depending on application size). Cached между тестами того же класса при right configuration.
 
-Время старта: **5-30 секунд** первый раз, кэшируется между тестами того же класса.
-
-### 2.2 WebEnvironment
-
+WebEnvironment опции:
 ```java
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class HttpIntegrationTest {
@@ -66,14 +58,15 @@ class HttpIntegrationTest {
 }
 ```
 
-Опции:
-- **`MOCK`** (default) — MockMvc, без реального сервера.
-- **`RANDOM_PORT`** — реальный Tomcat на случайном порту.
-- **`DEFINED_PORT`** — на указанном.
-- **`NONE`** — не web.
+MOCK (default) — MockMvc, без реального сервера. Fastest option. HTTP interactions simulated в memory.
 
-### 2.3 @Transactional в тестах
+RANDOM_PORT — реальный Tomcat на случайном порту. Real HTTP stack. Tests real network behavior.
 
+DEFINED_PORT — на указанном порту. Rare — random обычно предпочтителен.
+
+NONE — не web application. Для non-web functionality.
+
+@Transactional в тестах:
 ```java
 @SpringBootTest
 @Transactional
@@ -90,35 +83,30 @@ class OrderTest {
 }
 ```
 
-**Rollback после теста** — избегаешь пересечения тестов.
+Rollback после теста — избегаешь пересечения тестов. Data changes visible during test но rolled back afterwards. Clean state for next test.
 
-Кавет: REQUIRES_NEW внутри не откатится с тестовой tx. Другой поток тоже не увидит изменения (свой session).
+Caveat REQUIRES_NEW внутри не откатится с тестовой tx. Отдельная транзакция commits независимо. Другой поток тоже не увидит изменения — свой session.
 
-### 2.4 @DirtiesContext
-
-Если тест **портит** контекст (изменяет singleton bean state) — заставить пересоздать:
+@DirtiesContext. Если тест портит контекст (изменяет singleton bean state) — заставить пересоздать:
 ```java
 @Test
 @DirtiesContext
 void breaksThings() { ... }
 ```
 
-Медленнее (пересоздание контекста). Избегай если можно.
+Медленнее (пересоздание контекста). Avoid если можно. Sometimes necessary для tests modifying singleton state.
 
----
+## Slice tests
 
-## 3. Slice tests
+Загружают только часть контекста → быстрее.
 
-Загружают **только часть** контекста → быстрее.
-
-### 3.1 @WebMvcTest — только web слой
-
+@WebMvcTest — только web слой:
 ```java
 @WebMvcTest(OrderController.class)
 class OrderControllerTest {
 
     @Autowired MockMvc mockMvc;
-    @MockBean OrderService svc;   // ← service мокается
+    @MockBean OrderService svc;
 
     @Test
     void getOrder() throws Exception {
@@ -144,22 +132,11 @@ class OrderControllerTest {
 }
 ```
 
-Только:
-- Controllers.
-- `@ControllerAdvice`.
-- Jackson.
-- Validation.
-- Filters.
-- Security (если on classpath).
+Only. Controllers. @ControllerAdvice. Jackson. Validation. Filters. Security (если on classpath).
 
-Не поднимает repositories, services, JPA.
+Не поднимает repositories, services, JPA. Тестирует HTTP-уровень plus JSON serialization plus validation.
 
-Тестирует **HTTP-уровень** + JSON serialization + validation.
-
-### 3.2 MockMvc
-
-Симулирует HTTP-запросы без реального сервера. Быстро.
-
+MockMvc симулирует HTTP-запросы без реального сервера. Быстро:
 ```java
 mockMvc.perform(get("/api/orders/1")
         .param("include", "items")
@@ -181,8 +158,9 @@ mockMvc.perform(post("/api/orders")
     .andExpect(header().exists("Location"));
 ```
 
-### 3.3 @DataJpaTest — только JPA слой
+Rich API для request building plus response assertions. jsonPath для JSON field verification.
 
+@DataJpaTest — только JPA слой:
 ```java
 @DataJpaTest
 class OrderRepositoryTest {
@@ -204,18 +182,15 @@ class OrderRepositoryTest {
 }
 ```
 
-Загружает только:
-- Repositories.
-- EntityManager.
-- DataSource.
-- Liquibase / Flyway.
+Загружает только. Repositories. EntityManager. DataSource. Liquibase / Flyway.
 
-**По умолчанию использует in-memory H2**. Для реалистичности — Testcontainers (см. §5).
+По умолчанию использует in-memory H2. Для реалистичности — Testcontainers (см. ниже).
 
-`@Transactional` включён + rollback автоматически.
+@Transactional включён plus rollback автоматически. Fresh state per test.
 
-### 3.4 @JsonTest — только сериализация
+TestEntityManager — helper для manipulating entities directly в tests. persist, find, flush, clear operations. Cleaner чем using repositories для test setup.
 
+@JsonTest — только сериализация:
 ```java
 @JsonTest
 class OrderJsonTest {
@@ -239,10 +214,9 @@ class OrderJsonTest {
 }
 ```
 
-Для проверки Jackson-схемы.
+Для проверки Jackson-схемы. Rarely needed unless heavy JSON customization.
 
-### 3.5 @RestClientTest — только HTTP-клиент
-
+@RestClientTest — только HTTP-клиент:
 ```java
 @RestClientTest(PaymentClient.class)
 class PaymentClientTest {
@@ -263,20 +237,17 @@ class PaymentClientTest {
 }
 ```
 
-MockRestServiceServer перехватывает исходящие HTTP-запросы, возвращает моки.
+MockRestServiceServer перехватывает исходящие HTTP-запросы, возвращает моки. Testing client-side HTTP integration.
 
----
-
-## 4. @MockBean
+## @MockBean
 
 Заменить бин в контексте на mock:
-
 ```java
 @SpringBootTest
 class OrderIntegrationTest {
 
-    @MockBean PaymentClient paymentClient;    // ← мок вместо реального
-    @Autowired OrderService svc;               // ← реальный, получит mock
+    @MockBean PaymentClient paymentClient;    // мок вместо реального
+    @Autowired OrderService svc;               // реальный, получит mock
 
     @Test
     void test() {
@@ -286,28 +257,24 @@ class OrderIntegrationTest {
 }
 ```
 
-Полезно когда хочешь реальный сервис + БД, но мокнуть **внешний API**.
+Полезно когда хочешь реальный сервис plus БД, но мокнуть внешний API. Common pattern — real internal, mocked external.
 
-**Кавет**: `@MockBean` **пересоздаёт контекст** для каждого теста → медленно, если много тестов с разными моками.
+Caveat @MockBean пересоздаёт контекст для каждого теста. Медленно, если много тестов с разными моками. Spring caching optimizes but @MockBean invalidates cache.
 
-Альтернатива: **`@SpyBean`** — обёртка над реальным.
+Альтернатива @SpyBean — обёртка над реальным. Real bean underlying, methods can be spied without full replacement.
 
----
+## Testcontainers
 
-## 5. Testcontainers
+Docker контейнеры в тестах. Реальные PostgreSQL, RabbitMQ, Kafka, Redis, Elasticsearch, Keycloak в isolated containers.
 
-Docker контейнеры в тестах. Реальные PostgreSQL, RabbitMQ, Kafka, Redis, Elasticsearch, Keycloak.
-
-### 5.1 Зависимости
-
+Зависимости:
 ```gradle
 testImplementation 'org.testcontainers:testcontainers'
 testImplementation 'org.testcontainers:postgresql'
 testImplementation 'org.testcontainers:junit-jupiter'
 ```
 
-### 5.2 Базовое использование
-
+Базовое использование:
 ```java
 @Testcontainers
 @SpringBootTest
@@ -338,47 +305,35 @@ class OrderRepositoryTest {
 }
 ```
 
-При запуске:
-1. Testcontainers pull image `postgres:15`.
-2. Запускает контейнер на случайном порту.
-3. Spring подхватывает через `@DynamicPropertySource`.
-4. Тесты бегут против реального PG.
-5. Контейнер убивается после.
+Что происходит. Testcontainers pull image postgres:15 при first run. Запускает контейнер на случайном порту. Spring подхватывает URL через @DynamicPropertySource. Тесты бегут против реального PostgreSQL. Контейнер убивается после.
 
-### 5.3 Reuse
+Real PostgreSQL vs H2. H2 быстрее старт но different dialect. Behaviors различаются. Some Postgres features (JSONB, arrays, specific SQL) не работают в H2. Bugs found в H2 tests не reproduce в prod. Testcontainers обеспечивает realism.
 
-Между тест-классами — можно переиспользовать контейнер:
+Reuse containers между тестовыми классами:
 ```java
 static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:15")
     .withReuse(true);
 ```
 
-Плюс `~/.testcontainers.properties`:
+Плюс ~/.testcontainers.properties:
 ```
 testcontainers.reuse.enable=true
 ```
 
-Первый запуск — медленно; последующие — секунды.
+Первый запуск — медленно (image pull, startup). Последующие — секунды (reuse existing container). Substantial speed improvement для test suites с many test classes.
 
-### 5.4 Готовые модули
+Готовые модули для common systems. org.testcontainers:postgresql — PostgreSQL. org.testcontainers:kafka — Kafka. org.testcontainers:rabbitmq — RabbitMQ. org.testcontainers:elasticsearch. com.github.dasniko:testcontainers-keycloak — Keycloak. org.testcontainers:localstack — AWS emulator.
 
-- `org.testcontainers:postgresql` — PG.
-- `org.testcontainers:kafka` — Kafka.
-- `org.testcontainers:rabbitmq` — Rabbit.
-- `org.testcontainers:elasticsearch`.
-- `com.github.dasniko:testcontainers-keycloak` — Keycloak.
-- `org.testcontainers:localstack` — AWS emulator.
-
-### 5.5 GenericContainer для custom
-
+GenericContainer для custom images:
 ```java
 GenericContainer<?> app = new GenericContainer<>("my/image:latest")
     .withExposedPorts(8080)
     .waitingFor(Wait.forHttp("/actuator/health").forPort(8080));
 ```
 
-### 5.6 Docker Compose
+Waits ensures container ready before tests run. Various wait strategies — port available, HTTP endpoint responds, log message appears.
 
+Docker Compose support:
 ```java
 @Container
 static DockerComposeContainer compose = new DockerComposeContainer(
@@ -387,12 +342,11 @@ static DockerComposeContainer compose = new DockerComposeContainer(
     .withExposedService("rabbit_1", 5672);
 ```
 
----
+Multi-container test environments. Reuse existing compose files.
 
-## 6. @DynamicPropertySource
+## @DynamicPropertySource
 
-Динамически регистрирует properties **до** старта контекста:
-
+Динамически регистрирует properties до старта контекста:
 ```java
 @DynamicPropertySource
 static void props(DynamicPropertyRegistry r) {
@@ -401,17 +355,15 @@ static void props(DynamicPropertyRegistry r) {
 }
 ```
 
-Метод — **static**, вызывается **один раз** перед контекстом.
+Метод — static, вызывается один раз перед контекстом.
 
-Заменил старый `@TestPropertySource(properties = "...")` для динамических значений.
+Заменил старый @TestPropertySource(properties = "...") для динамических значений. TestPropertySource requires constant values known at compile time. DynamicPropertySource supports dynamic values (например ports of containers).
 
----
+Standard mechanism для integrating Testcontainers с Spring configuration.
 
-## 7. Test profiles
+## Test profiles
 
-Отдельная конфигурация для тестов:
-
-`src/test/resources/application-test.yml`:
+Отдельная конфигурация для тестов через application-test.yml:
 ```yaml
 spring:
   datasource:
@@ -420,6 +372,7 @@ spring:
     hibernate.ddl-auto: create-drop
 ```
 
+Activation:
 ```java
 @SpringBootTest
 @ActiveProfiles("test")
@@ -431,12 +384,11 @@ class MyTest { ... }
 mvn test -Dspring.profiles.active=test
 ```
 
----
+Different configuration для test environment без polluting main application.yml.
 
-## 8. Test data management
+## Test data management
 
-### 8.1 @Sql — SQL скрипты
-
+@Sql — SQL скрипты:
 ```java
 @Test
 @Sql("/test-data/orders.sql")
@@ -448,8 +400,9 @@ void test() { ... }
 void test2() { ... }
 ```
 
-### 8.2 Builder pattern / Fixtures
+Standard Spring approach. SQL executes automatically. Convenient для complex data setup.
 
+Builder pattern или Fixtures:
 ```java
 public class OrderFixture {
     public static OrderBuilder anOrder() {
@@ -463,22 +416,14 @@ public class OrderFixture {
 @Test
 void test() {
     Order o = anOrder().withAmount(BigDecimal.valueOf(500)).build();
-    // ...
 }
 ```
 
-Плюсы:
-- Читаемо.
-- Легко изменять defaults.
-- Меньше boilerplate.
+Плюсы. Читаемо. Легко изменять defaults. Меньше boilerplate. Business language в tests.
 
-### 8.3 @DataSet (DBUnit)
+@DataSet (DBUnit). XML/YAML fixture для БД. Использовать редко (сложно поддерживать when schema changes).
 
-XML/YAML fixture для БД. Использовать редко (сложно поддерживать).
-
----
-
-## 9. Testing Kafka с Testcontainers
+## Testing Kafka с Testcontainers
 
 ```java
 @Testcontainers
@@ -507,12 +452,11 @@ class KafkaIntegrationTest {
 }
 ```
 
-`await()` из **Awaitility** — ждать async condition.
+await() из Awaitility — ждать async condition. Standard для testing async operations. Prevents Thread.sleep anti-pattern.
 
----
+## Testing RabbitMQ
 
-## 10. Testing Rabbit
-
+Similar pattern с RabbitMQContainer:
 ```java
 @Testcontainers
 @SpringBootTest
@@ -532,14 +476,14 @@ class RabbitIntegrationTest {
     @Test
     void publishAndReceive() {
         template.convertAndSend("orders", new OrderEvent(...));
-        // ...
+        // await for consumer processing
     }
 }
 ```
 
----
+Real RabbitMQ behavior in tests. Publisher/consumer flow verified end-to-end.
 
-## 11. Testing Keycloak
+## Testing Keycloak
 
 ```java
 @Container
@@ -553,23 +497,15 @@ static void props(DynamicPropertyRegistry r) {
 }
 ```
 
-+ JSON exported из production Keycloak (users, clients, roles).
+Real Keycloak instance для authentication testing. JSON exported from production Keycloak (users, clients, roles) как fixture. Full OAuth2/OIDC flow testable.
 
----
+## Contract testing
 
-## 12. Contract testing
+Проблема. Producer меняет API — consumer ломается. Как узнать заранее?
 
-### 12.1 Проблема
+Consumer-Driven Contracts. Consumer describes expected response. Producer tested against этот contract. Ensures API stability across services.
 
-Producer меняет API → consumer ломается. Как узнать заранее?
-
-### 12.2 Consumer-Driven Contracts
-
-Consumer описывает какой response ожидает. Producer тестируется против этого contract.
-
-### 12.3 Spring Cloud Contract
-
-Producer определяет:
+Spring Cloud Contract. Producer определяет:
 ```yaml
 description: Should return order
 request:
@@ -580,34 +516,26 @@ response:
   body: {"id": 1, "status": "NEW"}
 ```
 
-Автоматически генерируется:
-- Тест для producer (реальный сервис должен вернуть указанный response).
-- Stub jar для consumer (mock server отвечает так).
+Автоматически генерируется. Test для producer (реальный сервис должен вернуть указанный response). Stub jar для consumer (mock server отвечает так).
 
 Consumer в своих тестах использует stub:
 ```java
 @AutoConfigureStubRunner(ids = "com.example:order-service:+:stubs:8080")
 ```
 
-### 12.4 Pact
+Pact — analog. Более популярен вне JVM (JS, Python, .NET).
 
-Аналог, более популярен вне JVM (JS, Python).
+Consumer описывает expected → генерируется contract → Pact Broker → Producer verify против contract. Different workflow но same concept.
 
-Consumer описывает expected → генерируется contract → Pact Broker → Producer verify против contract.
+Contract testing catches API breaking changes early в CI pipeline. Prevents runtime failures когда changes deployed.
 
----
+## Best practices
 
-## 13. Best practices
+Категории тестов и распределение.
 
-### 13.1 Категории
+Unit — 70% (быстро). Slice — 20% (@WebMvcTest, @DataJpaTest). Integration — 5-10% (@SpringBootTest plus Testcontainers). E2E — 5%.
 
-- **Unit** — 70% (быстро).
-- **Slice** — 20% (@WebMvcTest, @DataJpaTest).
-- **Integration** — 5-10% (@SpringBootTest + Testcontainers).
-- **E2E** — 5%.
-
-### 13.2 Тестовая пирамида в Spring
-
+Testovaya пирамида в Spring:
 ```
                  /  \      E2E (Selenium, real deployment)
                 /____\
@@ -619,95 +547,58 @@ Consumer описывает expected → генерируется contract → P
           /________________\
 ```
 
-### 13.3 Скорость
+Скорость benchmark. Unit — миллисекунды. Slice — секунды. Integration — 10-60 seconds. E2E — минуты.
 
-- Unit — миллисекунды.
-- Slice — секунды.
-- Integration — 10-60 секунд.
-- E2E — минуты.
+CI/CD stages. PR pipeline — unit plus slice plus быстрые integration (менее 5 min). Nightly — полный integration plus E2E. On demand — chaos, performance.
 
-### 13.4 CI/CD
+Изоляция tests. Каждый тест — свои данные. Не полагаться на порядок. @Transactional plus rollback. Уникальные IDs (UUID.randomUUID()).
 
-- **PR pipeline** — unit + slice + быстрые integration (< 5 мин).
-- **Nightly** — полный integration + E2E.
-- **On demand** — chaos, performance.
+Fast feedback. Тесты запускать при каждом commit. IDE — прогонять всё при save. Медленные тесты — только на CI.
 
-### 13.5 Изоляция
+## Realistic caveats
 
-- Каждый тест — свои данные.
-- Не полагаться на порядок.
-- `@Transactional` + rollback.
-- Уникальные IDs (`UUID.randomUUID()`).
+Slow tests. @SpringBootTest на каждом тесте — 30 seconds startup. 100 тестов = 50 минут только startup времени.
 
-### 13.6 Быстрая обратная связь
+Fix. Меньше @MockBean (пересоздаёт контекст). @DirtiesContext — избегать. Context caching (по default) — использовать. Разделить 90% unit plus 10% integration.
 
-**Fail fast**: тесты запускать при каждом commit. IDE — прогонять всё при save. Медленные тесты — только на CI.
+Flaky tests. Тесты иногда падают, иногда нет. Frustrating и trust destroying.
 
----
+Причины. Race conditions (async без Awaitility). Полагание на порядок или общее state. Time (использовать Clock injection, не Instant.now()). Внешние ресурсы (сеть).
 
-## 14. Реальные кейсы
+Fix. Чинить сразу, не игнорировать. Flaky test = broken test. Ignored flaky tests eventually accepted as normal.
 
-### 14.1 Slow tests
+БД в тестах. Options plus trade-offs.
 
-`@SpringBootTest` на каждом тесте — 30 секунд старт. 100 тестов = 50 минут только startup.
+H2 in-memory. Быстро, но диалект другой чем PostgreSQL. Bugs в prod не catchable в tests.
 
-**Fix**:
-- Меньше `@MockBean` (пересоздаёт контекст).
-- `@DirtiesContext` — избегать.
-- Context caching (по default) — использовать.
-- Разделить: 90% unit + 10% integration.
+Testcontainers PostgreSQL. Реалистично, медленнее. Real behavior. Recommended для integration tests.
 
-### 14.2 Flaky tests
+Shared PG в CI. Быстро, но общее state — изоляция сложнее. Not recommended для parallel tests.
 
-Тесты иногда падают, иногда нет.
+Правильно — Testcontainers для интеграционных tests.
 
-Причины:
-- Race conditions (async без Awaitility).
-- Полагание на порядок / общее state.
-- Time (использовать `Clock` инъекцию, не `Instant.now()`).
-- Внешние ресурсы (сеть).
+## Итоги
 
-**Fix**: чинить сразу, не игнорировать. Flaky test = broken test.
+Integration testing complements unit testing. Different concerns. Both необходимы для comprehensive coverage.
 
-### 14.3 БД в тестах
+@SpringBootTest — весь контекст, реалистично, медленно. Web environment options MOCK/RANDOM_PORT/DEFINED_PORT/NONE.
 
-- **H2 in-memory** — быстро, но диалект другой чем PG → баги в проде.
-- **Testcontainers PG** — реалистично, медленнее.
-- **Shared PG в CI** — быстро, но общее state → изоляция сложнее.
+Slice tests. @WebMvcTest для web слоя. @DataJpaTest для JPA. @JsonTest для serialization. @RestClientTest для HTTP client. Fast focused testing.
 
-Правильно — **Testcontainers** для интеграционных.
+MockMvc для HTTP без реального сервера. Fluent API для requests plus response assertions.
 
----
+@MockBean заменяет beans в Spring context. Slower через context recreation. @SpyBean для partial spy.
 
-## 15. Собесные вопросы
+Testcontainers для реалистичных external systems. PostgreSQL, Kafka, RabbitMQ, Keycloak — modules ready. Reuse capability для speed.
 
-1. **Что такое integration test?** — Тест взаимодействия компонентов (не мокаем всё).
-2. **@SpringBootTest — что делает?** — Загружает весь Spring контекст.
-3. **@WebMvcTest — когда?** — Только web слой (controllers, JSON, validation), сервис мокается.
-4. **@DataJpaTest — когда?** — Только repository + JPA, in-memory H2 по default.
-5. **Что такое MockMvc?** — Симулятор HTTP запросов без реального сервера; быстрее чем TestRestTemplate.
-6. **@MockBean vs @Mock?** — @MockBean заменяет bean в Spring контексте; @Mock — обычный Mockito mock без контекста.
-7. **Что такое Testcontainers?** — Docker контейнеры (PG, Kafka, ...) в тестах для реалистичности.
-8. **@DynamicPropertySource — зачем?** — Регистрирует properties (URLs Testcontainers) до старта контекста.
-9. **@Transactional в тестах?** — Auto-rollback после теста; изоляция.
-10. **Что такое @DirtiesContext?** — Пересоздать контекст (когда тест портит state); медленно, избегай.
-11. **Contract testing?** — Consumer описывает expected; producer тестируется против contract (Pact, Spring Cloud Contract).
-12. **@RestClientTest — что?** — Slice для HTTP-клиента; MockRestServiceServer.
-13. **Awaitility — зачем?** — Ждать async condition в тестах (`await().until(...)`).
-14. **Testcontainers reuse — как?** — `.withReuse(true)` + `~/.testcontainers.properties`; переиспользуется между тестами.
-15. **In-memory H2 vs Testcontainers PG — выбор?** — H2 быстро, но диалект другой; PG реалистично, медленнее. Testcontainers для integration.
+@DynamicPropertySource для integrating Testcontainers ports plus URLs в Spring configuration.
 
----
+Test profiles через @ActiveProfiles. Separate configuration для test environment.
 
-## Итог
+Test data management. @Sql для scripts. Builder patterns для readable fixtures.
 
-- **@SpringBootTest** — весь контекст, реалистично, медленно.
-- **Slice tests** (`@WebMvcTest`, `@DataJpaTest`) — быстро, часть контекста.
-- **MockMvc** для HTTP без реального сервера.
-- **@MockBean** для замены bean в контексте.
-- **Testcontainers** для реалистичных БД, Kafka, Rabbit, Keycloak.
-- **@Transactional** + auto-rollback = чистая БД.
-- **Contract testing** (Pact / Spring Cloud Contract) для API stability.
-- **Awaitility** для async.
+Contract testing (Spring Cloud Contract, Pact) для API stability. Consumer-driven contracts prevent breaking changes.
 
-Следующий — `55-testing-e2e-smoke-selenium.md`.
+Best practices. Pyramid distribution. Isolated tests. Fast feedback. Fix flaky tests immediately. Testcontainers over H2 для realism.
+
+Дальше — E2E, smoke tests, Selenium для UI, performance testing.

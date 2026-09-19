@@ -1,14 +1,18 @@
-# 52. Паттерны надёжности микросервисов
+# 52. Resilience patterns в микросервисах: Circuit Breaker, Retry, Bulkhead, Rate Limit
 
-Circuit Breaker, Retry, Timeout, Bulkhead, Rate Limit, Fallback. Как не упасть каскадно.
+## Зачем понимать resilience глубоко
 
----
+Разработчик который только начинает работать с микросервисами обычно думает про resilience как о something to «добавить потом когда работает». Reality — distributed systems fundamentally unreliable. Networks fail. Services crash. Databases become slow. External APIs return errors. Не заложить resilience patterns с самого начала означает построить fragile system которая ломается при первой transient проблеме.
 
-## 1. Проблема: cascading failure
+Разница между разработчиком «использующим Circuit Breaker» и «понимающим resilience» проявляется в production stability. Первый добавляет @CircuitBreaker к отдельным methods, надеется что достаточно. Второй знает fundamental proble — cascading failure. Один сервис падает медленно. Callers wait для timeout. Their thread pools забиваются. Их callers wait. Chain reaction. Целый system down. Знает что защита требует layered approach — timeout как absolute minimum, plus retry для transient issues, plus circuit breaker для sustained problems, plus bulkhead для resource isolation, plus rate limiting для controlling input, plus graceful degradation для user experience.
 
-Микросервисы = distributed system. Сеть ненадёжна.
+В этом файле разберём resilience patterns comprehensively. Fundamental проблема — cascading failure. Timeout — first line of defense. Retry с exponential backoff и jitter. Circuit Breaker mechanics — three states, thresholds, configuration. Bulkhead для resource isolation. Rate Limiting algorithms. Fallback strategies. Deadline / cancellation propagation. Health checks правильные. Feature flags как runtime kill switches. Graceful shutdown. Chaos engineering. Production configuration полная с Resilience4j. Correct ordering annotations (важно). ИСНА real cases.
 
-Пример:
+## Fundamental problem: cascading failure
+
+Микросервисы это distributed system. Сеть ненадёжна. Services fail. Latency variable. Understanding this reality shapes всю resilience design.
+
+Классический пример:
 ```
 Service A ──sync HTTP──► Service B (медленный)
                               │
@@ -16,44 +20,33 @@ Service A ──sync HTTP──► Service B (медленный)
                         Service C (умер)
 ```
 
-Что происходит:
-1. Service C умер → B не получает ответ → таймаутится через 30 сек.
-2. Пока B ждёт — его thread pool забит.
-3. A ждёт B → thread pool A тоже забит.
-4. Клиенты A ждут → **весь стек упал**.
+Что происходит step-by-step. Service C умер (crash, network partition, whatever). B calls C — не получает ответ. B waits для read timeout (default может быть 30 seconds или больше). Пока B ждёт — его request thread blocked. Same happens для all concurrent requests к B — thread pool забивается.
 
-**Cascading failure**. Одна проблема снежным комом валит всё.
+A ждёт B. Thread pool A тоже блокируется waiting. Clients A ждут responses.
 
-Защита — набор resilience patterns.
+Result — cascading failure. Один downstream problem cascades всё upstream. Whole system down несмотря на что root cause это just one service degraded.
 
----
+Это common pattern в production incidents. Sometimes traced к single downstream that got slow, потом weeks debugging показывает full impact chain.
 
-## 2. Timeout
+Защита — набор resilience patterns applied layered. No single pattern sufficient — combination обеспечивает reliability.
 
-**Первое и самое важное**.
+## Timeout: первая линия защиты
 
-Правило: **никогда без timeout**. Default в большинстве библиотек = **бесконечно** — плохо.
+Первое и самое важное patterns. Правило simple — никогда без timeout. Default в большинстве библиотек равно бесконечно — плохо.
 
-### 2.1 Что таймаутить
+Что таймаутить. HTTP connect timeout (TCP connection establishment). HTTP read timeout (waiting for response). DB connection timeout (getting connection from pool). DB statement timeout (query execution time limit). Kafka producer send timeout. Rabbit publish timeout. Message consumer processing time.
 
-- HTTP connect timeout (установление TCP).
-- HTTP read timeout (ожидание ответа).
-- DB connection timeout.
-- DB statement timeout.
-- Kafka producer send timeout.
-- Rabbit publish timeout.
-- Message consumer processing time.
+Значения guidelines.
 
-### 2.2 Значения
+Connect: 1-5 seconds. Fast fail когда downstream unreachable. TCP handshake должен complete быстро — если dovlyc — network problem.
 
-- **Connect**: 1-5 сек (быстро понять что нет соединения).
-- **Read** для user-facing: 5-30 сек.
-- **Read** для background jobs: до нескольких минут.
+Read for user-facing: 5-30 seconds. Balance между allowing legitimate slow operations и fast failing bad ones.
 
-Правило: **timeout < timeout вызывающего**. Иначе caller уже отвалился, а мы ещё ждём.
+Read для background jobs: до нескольких minutes. Batch operations могут требовать longer duration.
 
-### 2.3 Spring RestClient / WebClient
+Правило. Timeout < timeout вызывающего. Иначе caller уже отвалился, а мы ещё ждём. Waste ресурсов plus confusion. Deadline propagation (см. ниже) более principled approach.
 
+Spring RestClient / WebClient configuration:
 ```java
 RestClient client = RestClient.builder()
     .requestFactory(new HttpComponentsClientHttpRequestFactory(
@@ -66,8 +59,7 @@ RestClient client = RestClient.builder()
     .build();
 ```
 
-### 2.4 Feign
-
+Feign configuration через application.yml:
 ```yaml
 feign:
   client:
@@ -77,38 +69,21 @@ feign:
         readTimeout: 30000
 ```
 
-### 2.5 HikariCP
-
-Уже разбирали в `29-postgresql-spring-hikaricp.md`:
+HikariCP уже обсуждали в файле 29:
 ```yaml
 spring.datasource.hikari:
   connection-timeout: 10000
 ```
 
----
+## Retry с exponential backoff и jitter
 
-## 3. Retry
+При временной ошибке — попробовать снова. Not всегда appropriate но powerful в правильных cases.
 
-При временной ошибке — попробовать снова.
+Когда retry OK. Network glitch — transient issue that may pass. Timeout — connection dropped, retry might succeed. HTTP 503 Service Unavailable — server temporarily overloaded. Rate limit (429) — с backoff, respect Retry-After header. Deadlock БД — concurrent contention resolved through retry.
 
-### 3.1 Когда retry OK
+Когда retry НЕ OK. 400 Bad Request — request malformed, won't become valid. 401 Unauthorized — token won't fix itself. 404 Not Found — resource won't appear. Business validation errors — semantically failed.
 
-- Network glitch.
-- Timeout (возможно).
-- HTTP 503 Service Unavailable.
-- Rate limit (429) — с backoff.
-- Deadlock БД.
-
-### 3.2 Когда retry НЕ OK
-
-- 400 Bad Request — код не станет валидным.
-- 401 Unauthorized — токен не станет валидным сам.
-- 404 Not Found — не появится.
-- Business validation errors.
-
-### 3.3 Exponential backoff
-
-Не сразу retry — ждать увеличивающееся время:
+Exponential backoff. Не сразу retry — ждать увеличивающееся время:
 ```
 Попытка 1: сразу
 Попытка 2: ждать 1s
@@ -117,25 +92,20 @@ spring.datasource.hikari:
 Попытка 5: ждать 8s
 ```
 
-Плюс **jitter** (случайность):
+Doubling backoff intervals. Prevents overwhelming downstream still recovering. Balances persistence с backing off.
+
+Плюс jitter (случайность):
 ```
 delay = base * 2^attempt + random(0, base)
 ```
 
-Зачем jitter: если 1000 клиентов одновременно retry без jitter — все повторят одновременно → усугубят перегрузку.
+Зачем jitter. Если 1000 клиентов одновременно retry без jitter — все повторят одновременно → усугубят перегрузку. Thundering herd. Jitter spreads retries randomly — smoother load pattern.
 
-### 3.4 Idempotency
+Idempotency обязательна. Retry без idempotency = дубли. Пример POST /transfer — retry задваивает перевод. Money moved twice. Financial correctness violated.
 
-**Retry без идемпотентности = дубли**.
+Решения. Idempotency-Key header — server dedupes based на key. Idempotent semantics операции (state machine transitions). Ensures repeat safety.
 
-Пример: `POST /transfer` — retry задваивает перевод.
-
-Решения:
-- Idempotency-Key header.
-- Idempotent semantics операции (state machine).
-
-### 3.5 Spring Retry
-
+Spring Retry через AOP:
 ```gradle
 implementation 'org.springframework.retry:spring-retry'
 implementation 'org.springframework.boot:spring-boot-starter-aop'
@@ -163,10 +133,9 @@ class ExternalClient {
 }
 ```
 
-Через AOP — retry прозрачно для caller.
+@Retryable configuration retry attempts. @Recover method invoked when retries exhausted — fallback logic. Transparent для caller — retries happen через AOP interception.
 
-### 3.6 Resilience4j Retry
-
+Resilience4j Retry alternative approach:
 ```java
 Retry retry = Retry.of("myService", RetryConfig.custom()
     .maxAttempts(3)
@@ -177,20 +146,15 @@ Retry retry = Retry.of("myService", RetryConfig.custom()
 String result = retry.executeSupplier(() -> externalClient.call());
 ```
 
----
+Functional programming style. More explicit control. Composable с other Resilience4j patterns.
 
-## 4. Circuit Breaker
+## Circuit Breaker подробно
 
-Защита от каскадных отказов.
+Защита от каскадных отказов. Один of most important patterns для microservices.
 
-### 4.1 Идея
+Идея. Каждый вызов downstream — статистика (успех/провал). Если провалов много — разомкнуть цепь — новые вызовы fail fast без обращения к downstream. Через N времени — полу-открытый — пробный вызов — если ok замкнуть, если нет снова открыть.
 
-Каждый вызов downstream — статистика (успех/провал). Если провалов много → **разомкнуть цепь** — новые вызовы **fail fast** без обращения к downstream.
-
-Через N времени → полу-открытый → пробный вызов → если ок → замкнуть; если нет → снова открыть.
-
-### 4.2 Три состояния
-
+Три состояния circuit breaker:
 ```
                   timeout/many errors
    ┌────────┐  ─────────────────►  ┌────────┐
@@ -210,24 +174,25 @@ String result = retry.executeSupplier(() -> externalClient.call());
         └──────────────────────────────┘
 ```
 
-- **CLOSED** — normal, все вызовы идут в downstream.
-- **OPEN** — все вызовы **fail fast** (не идут в downstream).
-- **HALF-OPEN** — пробуем один-два запроса; если ок → CLOSED; если нет → OPEN.
+CLOSED — normal, все вызовы идут в downstream. Statistics tracking outcomes.
 
-### 4.3 Параметры
+OPEN — все вызовы fail fast (не идут в downstream). Immediate failure returned to caller. Reduces load on failing downstream. Wait duration passes.
 
-- **Failure rate threshold** — сколько % failures → OPEN (обычно 50%).
-- **Minimum calls** — минимум вызовов для оценки (иначе одна ошибка = OPEN).
-- **Sliding window** — окно оценки (count-based или time-based).
-- **Wait duration** — сколько ждать в OPEN до HALF-OPEN.
-- **Permitted calls in HALF-OPEN** — сколько тестовых.
+HALF-OPEN — пробуем один-два запроса. Если ok — CLOSED (recovery detected). Если нет — снова OPEN (still failing).
 
-### 4.4 Resilience4j
+Параметры важны.
 
-```gradle
-implementation 'io.github.resilience4j:resilience4j-spring-boot3'
-```
+Failure rate threshold — сколько процентов failures triggers OPEN (обычно 50%).
 
+Minimum calls — минимум вызовов для оценки. Prevents opening на one или two errors. Statistical significance требуется.
+
+Sliding window — окно оценки. Count-based (last N calls) или time-based (last N seconds).
+
+Wait duration — сколько ждать в OPEN до HALF-OPEN transition (обычно 30 seconds).
+
+Permitted calls в HALF-OPEN — сколько test requests allow (typically 3).
+
+Resilience4j configuration:
 ```yaml
 resilience4j.circuitbreaker:
   instances:
@@ -240,6 +205,7 @@ resilience4j.circuitbreaker:
       permitted-number-of-calls-in-half-open-state: 3
 ```
 
+Usage:
 ```java
 @Service
 class UserClient {
@@ -258,31 +224,17 @@ class UserClient {
 }
 ```
 
-При OPEN → сразу вызывается `fallback`.
+При OPEN — сразу вызывается fallback без attempt к downstream.
 
-### 4.5 Мониторинг
+Monitoring. Actuator endpoint /actuator/circuitbreakers показывает состояние всех CB. Metrics в Prometheus — resilience4j_circuitbreaker_state, resilience4j_circuitbreaker_calls. Alert on sustained OPEN state — indicates unresolved downstream problem.
 
-Actuator endpoint `/actuator/circuitbreakers` показывает состояние всех CB.
+## Bulkhead: resource isolation
 
-Метрики → Prometheus:
-- `resilience4j_circuitbreaker_state`.
-- `resilience4j_circuitbreaker_calls`.
-- Alert: state = OPEN.
+Изоляция ресурсов между зависимостями. Название от корабельных переборок (bulkhead) — если один отсек затопило, остальные держат корабль на плаву.
 
----
+Проблема. Downstream A медленный — thread pool у caller забит запросами к A — downstream B получить thread не могу — B tratil become slow тоже.
 
-## 5. Bulkhead
-
-**Изоляция ресурсов** между зависимостями.
-
-### 5.1 Проблема
-
-Downstream A медленный → thread pool у caller забит запросами к A → downstream B получить не могу.
-
-### 5.2 Решение
-
-Разные thread pools / semaphores для разных зависимостей:
-
+Решение — разные thread pools или semaphores для разных зависимостей:
 ```
 Caller
   │
@@ -291,12 +243,9 @@ Caller
   └─ Pool for downstream C (max 5)
 ```
 
-Если A завис — только 10 threads залипло. B, C работают.
+Если A завис — только 10 threads залипло. B, C работают normally. Failure contained к specific pool.
 
-Название от корабельных переборок (bulkhead) — если один отсек затопило, остальные держат корабль на плаву.
-
-### 5.3 Resilience4j Bulkhead
-
+Resilience4j Bulkhead configuration:
 ```yaml
 resilience4j.bulkhead:
   instances:
@@ -310,36 +259,27 @@ resilience4j.bulkhead:
 public UserDto getUser(Long id) { ... }
 ```
 
-Два типа:
-- **Semaphore** — просто счётчик, легковесный.
-- **ThreadPool** — отдельный executor per dependency, тяжелее.
+Два типа bulkhead.
 
----
+Semaphore — просто счётчик, легковесный. Каждый call decrements counter. Zero counter — reject new call. Zero overhead beyond counter tracking.
 
-## 6. Rate Limiting
+ThreadPool — отдельный executor per dependency. More heavyweight но provides thread isolation. Each dependency has separate thread resource. True isolation но more memory.
+
+Semaphore usually sufficient. ThreadPool когда downstream can block callers significantly и isolation critical.
+
+## Rate Limiting
 
 Ограничение rate от одного клиента или на API endpoint.
 
-### 6.1 Зачем
+Зачем. Защита от abuse (DDoS, brute force attacks). Защита downstream (не перегрузить). Fair usage (prevent one client hogging resources).
 
-- Защита от abuse (DDoS, brute force).
-- Защита downstream (не перегрузить).
-- Fair usage.
+Алгоритмы.
 
-### 6.2 Алгоритмы
+Token bucket. Bucket с N токенами. Каждый запрос — берёт токен. Токены восстанавливаются по времени (например, 10 в секунду). Bucket пустой — отказать или ждать.
 
-**Token bucket**:
-- Bucket с N токенами.
-- Каждый запрос — берёт токен.
-- Токены восстанавливаются по времени (например, 10 в секунду).
-- Bucket пустой → отказать / ждать.
+Sliding window. Считать запросы за последние N секунд. Больше threshold — отказать. Different from fixed window (counts within specific interval) — smoother behavior.
 
-**Sliding window**:
-- Считать запросы за последние N секунд.
-- Больше threshold → отказать.
-
-### 6.3 Resilience4j RateLimiter
-
+Resilience4j RateLimiter:
 ```yaml
 resilience4j.ratelimiter:
   instances:
@@ -354,8 +294,7 @@ resilience4j.ratelimiter:
 public UserDto getUser(Long id) { ... }
 ```
 
-### 6.4 nginx rate limit
-
+nginx rate limit (also обсуждался в файле 46):
 ```nginx
 limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
 server {
@@ -365,147 +304,98 @@ server {
 }
 ```
 
-10 req/sec per IP, burst 20.
+10 req/sec per IP, burst 20 (short spikes allowed).
 
-### 6.5 Redis-based distributed
-
-Для limits через все реплики:
-
+Redis-based distributed rate limiting. Для limits через все реплики:
 ```java
-// использует Redis для counter
 if (redis.incr("rate:user:42") > 100) {
     throw new RateLimitException();
 }
 redis.expire("rate:user:42", 60);
 ```
 
-Много готовых библиотек: Bucket4j, Resilience4j + Redis.
+Много готовых библиотек. Bucket4j — comprehensive rate limiting. Resilience4j плюс Redis — distributed variant.
 
----
+## Fallback strategies
 
-## 7. Fallback
+Что вернуть когда downstream упал. Multiple approaches.
 
-Что вернуть когда downstream упал.
-
-### 7.1 Простой fallback
-
+Простой fallback:
 ```java
 public UserDto fallback(Long id, Throwable t) {
     return UserDto.empty();
 }
 ```
 
-Пустой ответ / default.
+Empty response или default value. User sees «empty» state instead of error.
 
-### 7.2 Cached fallback
-
-Хранить последний успешный ответ:
+Cached fallback. Хранить последний успешный ответ:
 ```java
 public UserDto fallback(Long id, Throwable t) {
     return cache.get(id);   // last known good
 }
 ```
 
-### 7.3 Degraded response
+Stale data preferred over no data. Cache TTL determines staleness tolerance.
 
-Показать что можешь:
-- Список постов есть, автор пусто → показать посты без автора.
-- Каталог есть, рекомендации не работают → показать каталог без рекомендаций.
+Degraded response. Показать что можешь. Список постов есть, автор пусто — показать посты без автора. Каталог есть, рекомендации не работают — показать каталог без рекомендаций.
 
-**Graceful degradation** — пользователь получает частичный функционал, но не «сломано всё».
+Graceful degradation. Пользователь получает частичный функционал, но не «сломано всё». Better UX than error page.
 
-### 7.4 Fail loud
+Fail loud. Иногда лучше 5xx чем неправильный ответ (финансы, критичные операции). Not все operations acceptable для degraded response — money-related operations should not silently proceed with stale или default data.
 
-Иногда лучше 5xx чем неправильный ответ (финансы, критичные операции).
+Правило — выбирай осознанно based на business impact. Not one-size-fits-all decision.
 
-Правило: **выбирай осознанно**.
+## Deadline / cancellation propagation
 
----
+Клиент имеет бюджет времени на запрос — пробрасывать downstream. Advanced pattern но powerful для high-load systems.
 
-## 8. Deadline / cancellation propagation
+Идея. Клиент: «у меня 5 сек». Service A: получил в 1 сек — передаёт «осталось 4 сек» downstream. Service B: получил в 2 сек — передаёт «осталось 3 сек» дальше. Service C: работает не больше 3 сек.
 
-Клиент имеет **бюджет времени** на запрос → пробрасывать downstream.
+Если C увидит что осталось <500 ms → сразу вернуть, не запускать долгую операцию. Save resources для operations that can complete в time.
 
-### 8.1 Идея
-
-Клиент: «у меня 5 сек».
-Service A: получил в 1 сек → передаёт «осталось 4 сек» downstream.
-Service B: получил в 2 сек → передаёт «осталось 3 сек» дальше.
-Service C: работает не больше 3 сек.
-
-Если C увидит что осталось <500 ms → сразу вернуть, не запускать долгую операцию.
-
-### 8.2 Реализация
-
-HTTP header:
+Реализация. HTTP header:
 ```
 Deadline: 1704067200000     # unix timestamp когда expires
 ```
 
-Каждый service:
-- При приёме — считать оставшееся.
-- Передавать downstream с обновлённым значением.
-- Не запускать операцию если бюджет истёк.
+Каждый service — при приёме считать оставшееся, передавать downstream с обновлённым значением, не запускать операцию если бюджет истёк.
 
-**gRPC** имеет это встроено. HTTP/REST — свой custom header.
+gRPC имеет это встроено. HTTP/REST — свой custom header. Practical в systems where deadlines really matter for user experience.
 
-### 8.3 Практика
+Мало кто делает. But helps в highly-loaded systems where legitimate deadline propagation preserves resources.
 
-Мало кто делает. Но помогает в высоко-нагруженных системах.
+## Health checks правильные
 
----
+Уже разбирали в K8s context (файл 10). Ключевые types.
 
-## 9. Health checks
+Liveness — процесс жив. Simplest — accepts TCP connection or responds к endpoint.
 
-Уже разбирали в K8s. Ключевые:
+Readiness — готов принимать трафик. More sophisticated — checks downstream dependencies, initialization complete.
 
-- **Liveness** — процесс жив.
-- **Readiness** — готов принимать трафик.
-- **Startup** — для медленных стартов.
+Startup — для медленных стартов. Delayed liveness/readiness checks until startup complete.
 
-### 9.1 Хорошая readiness
+Хорошая readiness должна отражать реальную способность работать. Есть connection к БД? Consul registration OK? Rabbit / Kafka connection?
 
-Должна отражать реальную способность работать:
-- Есть connection к БД?
-- Consul registration OK?
-- Rabbit / Kafka connection?
+Плохая readiness. Только return 200 OK без проверок. TCP-only check при open port но application broken.
 
-**Плохая readiness**: только `return 200 OK` без проверок.
+Пример из КНП knp-form-hz5-actuator-cache-nosuchmethod — TCP-only readiness врала. Приложение сломалось при старте, порт открыт — K8s думал что healthy. Traffic routed к broken instance. Users saw errors несмотря на «healthy» status.
 
-Пример из ИСНА `knp-form-hz5-actuator-cache-nosuchmethod` — TCP-only readiness врала. Приложение сломалось при старте, порт открыт → K8s думал что healthy.
+Caveat с DB в readiness. Если БД временно недоступна — readiness DOWN — K8s исключает под из Service — все запросы 503.
 
-### 9.2 Кавет с DB in readiness
+Но БД восстановится через минуту. Хотим ли мы «убрать» реплику? Обычно нет. БД temporary issue — приложение продолжает работать (retry / circuit breaker), не должно быть исключено из LB.
 
-Если БД временно недоступна → readiness DOWN → K8s исключает под из Service → все запросы 503.
+Правило. Readiness = «могу принимать НОВЫЕ запросы», а не «работают ВСЕ downstream». Downstream problems handled through circuit breakers, not through pod exclusion.
 
-Но БД восстановится через минуту. Хотим ли мы «убрать» реплику?
-
-Обычно **нет**. БД temporary issue → приложение продолжает работать (retry / circuit breaker), не должно быть исключено из LB.
-
-Правило: **readiness = «могу принимать НОВЫЕ запросы»**, а не «работают ВСЕ downstream».
-
----
-
-## 10. Feature flags
+## Feature flags как kill switches
 
 Runtime переключатели функционала.
 
-### 10.1 Зачем
+Зачем. Постепенное включение фичи (canary для features). Мгновенное отключение проблемной фичи (kill switch). A/B testing different implementations. Различное поведение per user / tenant.
 
-- Постепенное включение фичи (canary для features).
-- Мгновенное отключение проблемной фичи (kill switch).
-- A/B testing.
-- Различное поведение per user / tenant.
+Реализации. LaunchDarkly — SaaS. Unleash — open-source. FF4J — Java. Custom — через БД / Consul KV / ConfigMap.
 
-### 10.2 Реализации
-
-- **LaunchDarkly** — SaaS.
-- **Unleash** — open-source.
-- **FF4J** — Java.
-- **Custom** — через БД / Consul KV / ConfigMap.
-
-### 10.3 Пример
-
+Пример:
 ```java
 if (featureFlags.isEnabled("new-checkout")) {
     newCheckout(order);
@@ -514,18 +404,15 @@ if (featureFlags.isEnabled("new-checkout")) {
 }
 ```
 
-При проблеме с new-checkout → админ выключает flag → все идут на old.
+При проблеме с new-checkout — админ выключает flag — все идут на old. Instant mitigation без redeployment.
 
----
+Powerful pattern для production safety. Deploy new code disabled, gradually enable через flag flipping, disable instantly if problems detected.
 
-## 11. Graceful shutdown
+## Graceful shutdown
 
-При SIGTERM (K8s scale down / rolling update):
-1. **Stop accepting new requests**.
-2. **Wait** for in-flight to finish.
-3. **Close** connections.
-4. **Deregister** from Consul.
-5. **Exit**.
+При SIGTERM (K8s scale down или rolling update).
+
+Stop accepting new requests. Wait for in-flight to finish. Close connections. Deregister from Consul. Exit.
 
 Spring Boot:
 ```yaml
@@ -536,42 +423,29 @@ spring:
     timeout-per-shutdown-phase: 30s
 ```
 
-K8s должен дать время (`terminationGracePeriodSeconds: 60` — больше чем timeout-per-shutdown-phase).
+K8s должен дать время. terminationGracePeriodSeconds: 60 — больше чем timeout-per-shutdown-phase. Ensures Spring shutdown completes before K8s force-kills.
 
-Иначе SIGKILL → in-flight потерялись.
+Иначе SIGKILL — in-flight потерялись. Users see errors для requests in progress at shutdown time.
 
----
+Proper graceful shutdown critical для zero-downtime deployments. Rolling updates depend on it. Users shouldn't see errors when deployments happen.
 
-## 12. Chaos engineering
+## Chaos engineering
 
-Как узнать что resilience patterns работают? **Ломать намеренно**.
+Как узнать что resilience patterns работают? Ломать намеренно.
 
-### 12.1 Netflix Chaos Monkey
+Netflix Chaos Monkey. Раз в день случайно убивает production под. Приложение должно пережить. Continuous chaos verifies resilience.
 
-Раз в день случайно убивает production под. Приложение должно пережить.
+Tools. Chaos Monkey для K8s. Litmus. Gremlin. Chaos Mesh.
 
-### 12.2 Tools
+Что тестировать. Kill random pod. Slow network to downstream. Return 500 from downstream. Full DB pool. Full disk. Various failure modes.
 
-- **Chaos Monkey** для K8s.
-- **Litmus**.
-- **Gremlin**.
+Если приложение переживает — resilience работает. Discovery bugs before they cause real incidents.
 
-### 12.3 Что тестировать
+Начинай в staging. Только зрелые системы — в production. Chaos in production requires substantial maturity и monitoring.
 
-- Kill random pod.
-- Slow network to downstream.
-- Return 500 from downstream.
-- Full DB pool.
-- Full disk.
+## Полная production конфигурация
 
-Если приложение переживает — resilience работает.
-
-Начинай в **staging**, только зрелые — в prod.
-
----
-
-## 13. Пример полной конфигурации
-
+Собранная воедино resilience configuration:
 ```yaml
 resilience4j:
   circuitbreaker:
@@ -606,6 +480,7 @@ management:
     circuitbreakers.enabled: true
 ```
 
+Combining multiple patterns via annotations:
 ```java
 @Service
 class UserClient {
@@ -628,56 +503,74 @@ class UserClient {
 }
 ```
 
-Порядок аннотаций matters: `@CircuitBreaker` снаружи, `@Retry` внутри (иначе CB считает retry как отдельные вызовы).
+## Correct ordering annotations
 
----
+Order важен. @CircuitBreaker снаружи, @Retry внутри. Иначе CB считает каждый retry attempt как отдельный вызов — CB opens после fewer actual failures than expected.
 
-## 14. Каскад: что и когда
+Correct order (outer to inner). CircuitBreaker — outermost. Retry — inside. Bulkhead — around actual call. TimeLimiter — closest к actual.
 
-**Правильный стек** на каждый downstream call:
+Wrong order examples. Retry outermost — retries увеличивают calls seen by CB, CB может open предварительно. TimeLimiter вне Retry — retries not counted against overall time limit.
 
-1. **Timeout** — first line of defense.
-2. **Retry** для transient errors.
-3. **Circuit Breaker** для длительных проблем.
-4. **Bulkhead** для isolation.
-5. **Rate Limit** на входе (input control).
-6. **Fallback** для user-friendly degradation.
+Resilience4j documentation specifies correct nesting. Follow guidance.
 
-Не все нужны везде. **Timeout — обязательно**, остальное — по situation.
+## Каскад: что и когда
 
----
+Правильный стек на каждый downstream call:
 
-## 15. Собесные вопросы
+1. Timeout — first line of defense. Absolute minimum.
 
-1. **Что такое cascading failure?** — Один сервис упал → thread pools вверх по цепочке забиты → все упали.
-2. **Как избежать?** — Timeout + Circuit Breaker + Bulkhead + Retry с backoff.
-3. **Что такое Circuit Breaker?** — Защита от повторных вызовов упавшего downstream; 3 состояния CLOSED/OPEN/HALF_OPEN.
-4. **Когда retry OK, когда нет?** — OK при transient (network, 503, timeout); НЕ OK при 400/401/404, business errors.
-5. **Зачем exponential backoff + jitter?** — Ждать растущее время; jitter — избежать «thundering herd» при массовом retry.
-6. **Что такое Bulkhead?** — Изоляция ресурсов (threads) между зависимостями.
-7. **Что такое Rate Limit?** — Ограничение запросов; token bucket / sliding window.
-8. **Что такое Fallback?** — Что вернуть когда downstream упал (empty, cached, degraded response).
-9. **Что такое graceful shutdown?** — SIGTERM → stop new requests → wait in-flight → close → exit.
-10. **Разница Hystrix и Resilience4j?** — Hystrix (Netflix, deprecated); Resilience4j (современная замена, functional style).
-11. **Порядок аннотаций CB + Retry?** — CircuitBreaker снаружи, Retry внутри (иначе retry считается как отдельные вызовы CB).
-12. **Что такое chaos engineering?** — Намеренная поломка prod (Chaos Monkey) чтобы проверить resilience.
-13. **Что такое feature flags?** — Runtime переключатели функционала (kill switch, canary, A/B).
-14. **Deadline propagation?** — Пробрасывать оставшийся бюджет времени downstream (gRPC встроено, HTTP через header).
-15. **Timeout — самое важное — почему?** — Без timeout любой freeze downstream → thread pool залипает → cascading failure.
+2. Retry для transient errors. Handles glitches.
 
----
+3. Circuit Breaker для длительных проблем. Fast fail during outages.
 
-## Итог
+4. Bulkhead для isolation. Prevent one dependency taking whole thread pool.
 
-- **Timeout** обязательно на всё.
-- **Retry** с exponential backoff + jitter для transient.
-- **Circuit Breaker** для длительных проблем downstream.
-- **Bulkhead** для isolation ресурсов.
-- **Rate Limit** на входе.
-- **Fallback + graceful degradation** для UX.
-- **Health checks** правильные (не только TCP).
-- **Graceful shutdown** обязательно.
-- **Resilience4j** — стандарт в Java.
-- **Chaos engineering** для проверки в prod.
+5. Rate Limit на входе (input control). Prevent abuse.
 
-Следующий — блок testing (`53-testing-unit.md`).
+6. Fallback для user-friendly degradation. Graceful UX during failures.
+
+Не все нужны везде. Timeout — обязательно. Others — по situation.
+
+## ИСНА real cases
+
+Из memory. Sync HTTP chains — potential cascading failure. Circuit breakers required.
+
+Feign clients — timeout configuration explicit. Feign default timeouts плохие для production.
+
+HikariCP — connection timeout, leak detection threshold. Prevent pool exhaustion.
+
+@Transactional patterns — external calls вне transaction. Don't hold connections during network waits.
+
+## Итоги
+
+Cascading failure fundamental risk в distributed systems. Layered defense через resilience patterns.
+
+Timeout обязательно на всё. Никогда default (usually бесконечно). Fast fail preferred.
+
+Retry с exponential backoff plus jitter для transient. Idempotency обязательна. Not для всех exception types.
+
+Circuit Breaker для длительных проблем downstream. Three states — CLOSED, OPEN, HALF-OPEN. Fast fail в OPEN state. Recovery detection через HALF-OPEN.
+
+Bulkhead для isolation ресурсов. Semaphore lightweight. ThreadPool для true isolation.
+
+Rate Limit на входе. Token bucket или sliding window algorithms. Protects downstream, prevents abuse.
+
+Fallback plus graceful degradation. Empty response, cached data, degraded functionality. Fail loud для critical operations.
+
+Deadline propagation в highly-loaded systems. Explicit budgets flow downstream.
+
+Health checks правильные. Liveness plus readiness plus startup. Real dependency checks, not just TCP open. But not too coupled к downstream либо всё falls over together.
+
+Feature flags как runtime kill switches. Instant mitigation через flag flipping.
+
+Graceful shutdown обязательно. SIGTERM handling. Zero-downtime deployments.
+
+Chaos engineering для verification. Verify resilience through controlled failure injection.
+
+Resilience4j — стандарт в Java. Hystrix deprecated.
+
+Correct annotation ordering matters. CircuitBreaker outermost, TimeLimiter innermost.
+
+Layered approach — Timeout plus Retry plus CB plus Bulkhead plus Rate Limit plus Fallback. Combined provides robust resilience.
+
+Дальше — блок testing. Unit testing detailed с JUnit, Mockito, AssertJ.
