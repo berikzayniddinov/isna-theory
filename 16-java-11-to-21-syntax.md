@@ -1,491 +1,129 @@
-# 16. Java 11 → 21: язык и синтаксис
+# 16. Java 11 к 21: язык и синтаксис
 
-Что появилось в языке между Java 11 (LTS) и Java 21 (LTS). Основа для миграционных вопросов на собесе.
+## Контекст миграции и что изменилось в языке
 
----
+Между Java 11 и Java 21 прошло пять лет и три больших LTS релиза. За это время язык прошёл через существенные изменения — часть заимствовано из Kotlin и Scala, часть от собственного движения к более функциональному стилю, часть просто устранение накопившегося boilerplate. Для senior разработчика знание этих изменений важно по двум причинам. Первая — регулярный вопрос на собеседовании при обсуждении опыта работы с современным Java. Вторая — практическая миграция реальных проектов, которая в КНП идёт волнами через параллельные ветки master и master-21 для разных модулей.
 
-## 1. Хронология LTS-релизов
+Хронологически основные вехи выглядят так. Java 8 в 2014 году принёс лямбды, Stream API, Optional, новую библиотеку работы с датами java.time — это был революционный релиз, определивший функциональный стиль современной Java. Java 11 в 2018 стала первым LTS релизом после Java 8 и добавила ключевое слово var для вывода типа локальных переменных, встроенный HttpClient и другие улучшения. Java 17 в 2021 году принёс records, sealed classes, pattern matching для instanceof, text blocks — это радикальное расширение выразительности языка. Java 21 в 2023 стала следующим LTS релизом и завершила несколько долгих проектов — virtual threads из Project Loom, pattern matching для switch, record patterns, sequenced collections. Между Java 11 и 21 три больших LTS скачка, каждый со значительными изменениями.
 
-- **Java 8** (2014) — lambda, Stream, Optional, java.time.
-- **Java 11** (2018) — `var` для локальных переменных, HttpClient, single-file source.
-- **Java 17** (2021) — records, sealed classes, pattern matching for instanceof, text blocks.
-- **Java 21** (2023) — virtual threads, pattern matching for switch, record patterns, sequenced collections.
+## Вывод типа локальных переменных через var
 
-Между Java 11 и Java 21 — три больших LTS-скачка. Разберём главные новшества.
+Одна из самых заметных новинок Java 10, ставшая массово доступной в Java 11, — ключевое слово var для локальных переменных. Идея простая: вместо явного указания типа компилятор выводит его из инициализатора. Вместо длинного объявления Map со всеми generics-параметрами достаточно написать var и присваивание — тип определится автоматически.
 
----
+Практическая ценность заключается в сокращении визуального шума. Когда пишешь HashMap с ключом String и значением List из Fno, ты дублируешь длинную сигнатуру типа в двух местах — при объявлении переменной и при вызове конструктора. Var убирает эту дупликацию, оставляя только конкретную реализацию справа от знака равенства. Читаемость от этого выигрывает в случаях когда тип очевиден из контекста, но может проиграть если инициализатор выражен неочевидным способом (вроде результата вызова сложного метода без явного возвращаемого типа).
 
-## 2. `var` — вывод типа локальных переменных (Java 10, доступен в 11)
+Ограничения var важны для понимания где его использование корректно. Работает только для локальных переменных внутри методов — нельзя использовать для полей класса или параметров методов. Требует явного инициализатора, потому что без правой части выведение типа невозможно. Не может использоваться с null инициализатором — тип неоднозначен. Не подходит для параметров лямбд, которые и так объявляются без типа. Все эти ограничения не случайны — они защищают от ситуаций где вывод типа стал бы источником неоднозначности или ошибок.
 
-```java
-// до
-Map<String, List<Fno>> fnosByStatus = new HashMap<>();
-List<String> names = getNames();
+Практическое правило использования var — применяй когда тип очевиден из правой части выражения, особенно при вызове конструкторов с полным набором generics. Не злоупотребляй в ситуациях где reader кода вынужден идти в определение метода чтобы понять с чем работает переменная. Читаемость всегда важнее краткости на несколько символов.
 
-// с var
-var fnosByStatus = new HashMap<String, List<Fno>>();
-var names = getNames();
-```
+## Text blocks для многострочных строк
 
-Ограничения:
-- Только для **локальных** переменных (не поля, не параметры).
-- Нужен инициализатор (`var x;` — ошибка).
-- Не для lambda-параметров (без типа) — они и так без типа.
-- Не для `null` (без типа неоднозначно).
+До Java 15 работа с многострочными строками в Java была утомительной — приходилось конкатенировать через плюс и явно вставлять escape-последовательности для перевода строки. SQL запросы, JSON шаблоны, HTML фрагменты, XML — всё требовало множества плюсов и escape-символов, что делало код плохо читаемым и хрупким при копировании между IDE и другими инструментами.
 
-**Правило**: используй когда тип очевиден из RHS (`var list = new ArrayList<String>()`). Не злоупотребляй — читаемость страдает если тип неясен.
+Text blocks решают эту проблему через тройные кавычки. Строка внутри тройных кавычек может включать переводы строк напрямую, escape-символы становятся редко нужными, отступ автоматически нормализуется относительно закрывающих тройных кавычек. Разработчик пишет SQL или JSON естественным образом с сохранением форматирования, компилятор сам разбирается с whitespace.
 
----
+Механика нормализации отступов работает так. Компилятор находит минимальный отступ среди непустых строк в блоке, включая позицию закрывающих кавычек. Этот минимальный отступ вычитается из каждой строки. Результат — строка с текстом, где сохраняются относительные отступы между строками контента, но нет абсолютного отступа от начала блока. Это позволяет писать text blocks с любым уровнем вложенности кода без влияния на итоговое значение строки.
 
-## 3. Text blocks (Java 15+)
+Использование text blocks в КНП широко распространено для SQL запросов через @Query аннотации, для JSON шаблонов в тестах, для XML фрагментов в SOAP интеграциях. Существенно улучшает читаемость по сравнению со старым стилем конкатенации.
 
-Многострочные строки без escape.
+## Records как классы для хранения данных
 
-```java
-// до
-String json = "{\n" +
-              "  \"name\": \"Fno\",\n" +
-              "  \"reg\": \"12345\"\n" +
-              "}";
+Одна из самых полезных фич Java 16, стабилизированная в 17 — records. Это специальная форма классов предназначенная для хранения неизменяемых данных без boilerplate. Одна строка объявления с именем класса и списком полей заменяет десятки строк традиционного класса с приватными финальными полями, конструктором, аксессорами, реализациями equals, hashCode и toString.
 
-// с text blocks
-String json = """
-              {
-                "name": "Fno",
-                "reg": "12345"
-              }
-              """;
-```
+Что даёт record автоматически. Все поля становятся приватными и финальными — сущность неизменяема после создания. Генерируется канонический конструктор с параметрами в порядке объявления полей. Генерируются аксессоры для каждого поля с именами совпадающими с именами полей — обратите внимание что не regNum как getRegNum, а просто regNum без get-префикса. Автоматически генерируются equals и hashCode на основе всех полей, что гарантирует value semantics. Генерируется toString с представлением всех полей — полезно для логирования и отладки. Всё это по одной строке кода.
 
-- Тройные кавычки.
-- Отступ — по минимальному отступу непустых строк (не считая закрывающих `"""`).
-- Escape работают, но реже нужны.
-- `\` в конце строки — «продолжение без \n».
+Records поддерживают расширение через compact constructor. Разработчик может определить конструктор с телом валидации без явных параметров и присваиваний полям. Компилятор автоматически добавляет присваивания в конце. Это стандартный способ добавления валидации в records — проверка что regNum не пустой, что даты в правильном порядке, что суммы неотрицательные. Все проверки перед созданием immutable объекта.
 
-Удобно для SQL, HTML, JSON.
+Records также могут иметь статические фабричные методы и обычные методы экземпляра. Ограничения включают невозможность наследования от других классов (records уже наследуются от специального Record суперкласса), запрет мутабельности полей, невозможность объявления дополнительных полей экземпляра сверх тех что в записи. Все эти ограничения обеспечивают предсказуемость семантики records как чистых носителей данных.
 
----
+Практическое использование records в КНП — DTO для API responses, value objects в бизнес-логике, tuples для возврата нескольких значений из методов, ключи в HashMap. Что records не заменяют — JPA сущности, потому что JPA требует no-arg конструктор и часто мутабельные поля для отложенной инициализации. Для Entity классов остаётся классический подход.
 
-## 4. Records (Java 16+)
+## Sealed классы для ограничения иерархий
 
-**Immutable data carrier** — класс только для хранения данных.
+Sealed classes и sealed interfaces добавились в Java 17 и решают проблему неконтролируемого наследования. Обычный класс может быть расширен любым другим классом в classpath, включая классы из третьих библиотек. Обычный интерфейс может быть реализован произвольным количеством классов. Иногда это желательно, но часто наоборот — разработчик хочет чётко определённый набор наследников для моделирования конкретной иерархии.
 
-```java
-// до — 40 строк boilerplate
-public class FnoDto {
-    private final String regNum;
-    private final FnoStatus status;
-    private final LocalDateTime createdAt;
+Sealed класс явно указывает какие подклассы разрешены через ключевое слово permits. Компилятор проверяет что никаких других подклассов не существует. Иерархия становится закрытой — модификация требует явного изменения объявления родителя. Это очень полезно для моделирования алгебраических типов данных, представляющих конечный набор вариантов бизнес-концепции.
 
-    public FnoDto(String regNum, FnoStatus status, LocalDateTime createdAt) {
-        this.regNum = regNum;
-        this.status = status;
-        this.createdAt = createdAt;
-    }
+Пример из событийной модели домена. Есть sealed interface FnoEvent описывающий все возможные события над формой налоговой отчётности. Разрешёнными реализациями являются FnoSubmitted, FnoRejected, FnoApproved. Никакие другие классы не могут реализовать FnoEvent. Это даёт две важные гарантии — компилятор точно знает все возможные варианты типа при работе с FnoEvent, и добавление нового события требует явного изменения родительского sealed interface, что заставляет пересмотреть все места обработки.
 
-    public String regNum() { return regNum; }
-    public FnoStatus status() { return status; }
-    public LocalDateTime createdAt() { return createdAt; }
+Подклассы sealed класса должны быть помечены одним из трёх модификаторов, продолжающих или ослабляющих ограничение. Final означает что дальнейшее наследование невозможно. Sealed означает что подкласс сам ограничивает своих наследников. Non-sealed означает что подкласс открывает наследование для любых классов. Выбор зависит от того насколько глубоко должна распространяться закрытость иерархии.
 
-    @Override public boolean equals(Object o) { ... }
-    @Override public int hashCode() { ... }
-    @Override public String toString() { ... }
-}
+Применение sealed classes раскрывает свою силу в комбинации с pattern matching для switch, обсуждаемым ниже. Компилятор знает все возможные подтипы sealed класса и может проверить exhaustive обработку в switch выражении — если разработчик забыл обработать один из подтипов, компиляция падает. Это делает refactoring значительно безопаснее.
 
-// после — 1 строка
-public record FnoDto(String regNum, FnoStatus status, LocalDateTime createdAt) {}
-```
+## Pattern matching для instanceof
 
-Что даётся автоматически:
-- Финальные поля.
-- Конструктор `FnoDto(String, FnoStatus, LocalDateTime)`.
-- Accessor'ы `regNum()`, `status()`, `createdAt()` (без `get`!).
-- `equals`, `hashCode`, `toString` по всем полям.
+Классическая идиома проверки типа с последующим приведением требует двух шагов — instanceof для проверки и явный cast для получения объекта нужного типа. Разработчик пишет одно и то же имя переменной три раза, что многословно и позволяет ошибки.
 
-### 4.1 Custom конструктор
-
-```java
-public record FnoDto(String regNum, FnoStatus status) {
-    // compact constructor — валидация
-    public FnoDto {
-        if (regNum == null || regNum.isBlank()) {
-            throw new IllegalArgumentException("regNum required");
-        }
-    }
-}
-```
-
-### 4.2 Static factory
-
-```java
-public record FnoDto(String regNum, FnoStatus status) {
-    public static FnoDto of(String regNum) {
-        return new FnoDto(regNum, FnoStatus.NEW);
-    }
-}
-```
-
-### 4.3 Ограничения
-
-- Не extends (наследование).
-- Все поля final.
-- Не удобны для сущностей (JPA обычно требует no-arg ctor + мутабельность).
-
-**Использование**: DTO, value objects, tuples, ключи Map.
-
----
-
-## 5. Sealed classes (Java 17+)
-
-Ограничивают кто может наследоваться.
-
-```java
-public sealed interface FnoEvent
-    permits FnoSubmitted, FnoRejected, FnoApproved {
-}
-
-public record FnoSubmitted(Long id, LocalDateTime at) implements FnoEvent {}
-public record FnoRejected(Long id, String reason) implements FnoEvent {}
-public record FnoApproved(Long id, String approver) implements FnoEvent {}
-```
-
-Гарантия: **только эти три класса** могут реализовывать `FnoEvent`. Компилятор знает — можно писать **exhaustive switch** без default (см. §7).
-
-Подтипы должны быть:
-- `final` (нельзя дальше наследовать),
-- `sealed` (продолжают ограничение),
-- `non-sealed` (открывают наследование).
-
-Применение: моделирование алгебраических типов данных (ADT) как в Kotlin/Scala.
-
----
-
-## 6. Pattern matching for `instanceof` (Java 16+)
-
-```java
-// до
-if (obj instanceof String) {
-    String s = (String) obj;
-    System.out.println(s.length());
-}
-
-// после
-if (obj instanceof String s) {
-    System.out.println(s.length());
-}
-```
-
-Переменная `s` доступна в теле if-а. Не нужна ручная кастовка.
-
-Работает в условиях:
-```java
-if (obj instanceof String s && !s.isEmpty()) {
-    System.out.println(s);
-}
-```
-
----
-
-## 7. Pattern matching for `switch` (Java 21)
-
-Комбо records + sealed + switch = мощная штука.
-
-```java
-// как раньше
-String describe(Object obj) {
-    if (obj instanceof Integer i) return "int " + i;
-    else if (obj instanceof String s) return "string " + s;
-    else if (obj == null) return "null";
-    else return "other";
-}
-
-// с pattern matching
-String describe(Object obj) {
-    return switch (obj) {
-        case Integer i -> "int " + i;
-        case String s -> "string " + s;
-        case null -> "null";
-        default -> "other";
-    };
-}
-```
-
-С sealed — exhaustive без default:
-```java
-String handle(FnoEvent e) {
-    return switch (e) {                              // компилятор знает все подтипы
-        case FnoSubmitted s -> "submitted " + s.id();
-        case FnoRejected r -> "rejected " + r.reason();
-        case FnoApproved a -> "approved by " + a.approver();
-        // default не нужен!
-    };
-}
-```
-
-### 7.1 Record patterns (Java 21)
-
-Деструктуризация:
-```java
-switch (event) {
-    case FnoSubmitted(Long id, var at) -> log("submitted " + id + " at " + at);
-    case FnoRejected(Long id, String reason) -> log("rejected " + id + ": " + reason);
-    default -> {}
-}
-```
-
-### 7.2 Guards (when)
-
-```java
-switch (fno) {
-    case Fno f when f.status() == NEW -> processNew(f);
-    case Fno f when f.status() == REJECTED -> reprocess(f);
-    default -> {}
-}
-```
-
----
-
-## 8. Switch expressions (Java 14+)
-
-Не только statement, но выражение:
-
-```java
-// до
-String label;
-switch (status) {
-    case NEW: label = "новый"; break;
-    case REJECTED: label = "отклонён"; break;
-    default: label = "-";
-}
-
-// после
-String label = switch (status) {
-    case NEW -> "новый";
-    case REJECTED -> "отклонён";
-    default -> "-";
-};
-```
-
-- Стрелка `->` вместо `:` — нет fallthrough.
-- Множественные значения: `case NEW, DRAFT -> "черновик"`.
-- Блок: `case X -> { ... yield "value"; }`.
-
----
-
-## 9. Enhanced Enum (не новое, но часто в паре)
-
-`enum` уже был мощным, но теперь в комбо со switch expressions выглядит красиво:
-
-```java
-enum FnoStatus {
-    NEW {
-        @Override public boolean isTerminal() { return false; }
-    },
-    SUBMITTED {
-        @Override public boolean isTerminal() { return false; }
-    },
-    APPROVED {
-        @Override public boolean isTerminal() { return true; }
-    };
-
-    public abstract boolean isTerminal();
-}
-```
-
-Или через switch expression:
-```java
-enum FnoStatus {
-    NEW, SUBMITTED, APPROVED, REJECTED;
-
-    public boolean isTerminal() {
-        return switch (this) {
-            case APPROVED, REJECTED -> true;
-            case NEW, SUBMITTED -> false;
-        };
-    }
-}
-```
-
----
-
-## 10. `_` — unnamed variable (Java 21 preview, финал в 22)
-
-```java
-try {
-    // ...
-} catch (Exception _) {                       // не важно имя
-    log("error");
-}
-
-for (var _ : list) {                          // просто итерация без переменной
-    count++;
-}
-
-record Point(int x, int y) {}
-if (obj instanceof Point(int x, _)) {         // деструктуризация с игнором
-    System.out.println(x);
-}
-```
-
-Только в preview на 21. В 22+ — обычная фича.
-
----
-
-## 11. Другие мелкие изменения
-
-### 11.1 `String::indent`, `String::stripIndent` (Java 12+)
-```java
-"    hello".indent(-2);          // "  hello\n"
-```
-
-### 11.2 `String::formatted`
-```java
-"Hello, %s! Age: %d".formatted("Berik", 32);
-```
-
-### 11.3 `List.of`, `Map.of` (Java 9+, но не всегда помнят)
-```java
-List<String> list = List.of("a", "b", "c");  // immutable
-Map<String, Integer> map = Map.of("a", 1, "b", 2);
-```
-
-### 11.4 Stream.toList() (Java 16+)
-```java
-// раньше
-list.stream().filter(...).collect(Collectors.toList());
-
-// теперь
-list.stream().filter(...).toList();          // короче, immutable
-```
-
-### 11.5 `Files.readString`, `Files.writeString` (Java 11+)
-```java
-String content = Files.readString(Path.of("file.txt"));
-Files.writeString(Path.of("out.txt"), content);
-```
-
-### 11.6 `Optional.orElseThrow()` без аргументов (Java 10+)
-```java
-Fno f = repo.findById(id).orElseThrow();     // NoSuchElementException
-```
-
-### 11.7 `Optional.isEmpty()` (Java 11+)
-```java
-if (opt.isEmpty()) { ... }                   // раньше !opt.isPresent()
-```
-
-### 11.8 Enhanced NullPointerException (Java 14+)
-```java
-// до: "NullPointerException at line 42"
-// после: "Cannot invoke 'String.length()' because 'foo.bar' is null"
-```
-
-Включено по умолчанию с Java 15.
-
----
-
-## 12. Что удалили
-
-### 12.1 SecurityManager (deprecated в 17)
-
-Старый механизм авторизации. Заменяется другим — но для микросервисов практически не используется.
-
-### 12.2 CMS GC (removed в 14)
-
-Concurrent Mark-Sweep удалён; используй G1 или ZGC.
-
-### 12.3 Nashorn JS engine (removed в 15)
-
-Скриптовый движок JavaScript в JVM.
-
-### 12.4 Applet API (removed в 17)
-
-RIP applets.
-
-### 12.5 Некоторые методы `Thread` (deprecated for removal)
-
-- `Thread.suspend()`, `Thread.resume()`, `Thread.stop()` — давно deprecated.
-- В 21 — deprecated for removal.
-
----
-
-## 13. Полный сравнительный пример
-
-Одна и та же логика на Java 11 и Java 21.
-
-**Java 11:**
-```java
-public class OrderProcessor {
-
-    public String describeOrder(Object o) {
-        if (o == null) {
-            return "no order";
-        }
-        if (o instanceof Order) {
-            Order order = (Order) o;
-            if (order.getStatus() == Status.NEW) {
-                return "new order " + order.getId();
-            } else if (order.getStatus() == Status.PAID) {
-                return "paid order " + order.getId();
-            } else {
-                return "other";
-            }
-        }
-        return "not an order";
-    }
-}
-```
-
-**Java 21:**
-```java
-public sealed interface OrderResult permits NewOrder, PaidOrder, OtherOrder {}
-public record NewOrder(Long id) implements OrderResult {}
-public record PaidOrder(Long id, BigDecimal amount) implements OrderResult {}
-public record OtherOrder(Long id) implements OrderResult {}
-
-public class OrderProcessor {
-
-    public String describeOrder(Object o) {
-        return switch (o) {
-            case null -> "no order";
-            case NewOrder(var id) -> "new order " + id;
-            case PaidOrder(var id, var amt) -> "paid order " + id + " for " + amt;
-            case OrderResult result -> "other order";
-            default -> "not an order";
-        };
-    }
-}
-```
-
-Разница огромна — читаемость, безопасность типов, экспрессивность.
-
----
-
-## 14. Собесные вопросы
-
-1. **Что такое `var`? Где нельзя использовать?** — Вывод типа локальной переменной; не в полях/параметрах/без инициализатора.
-2. **Что такое record?** — Immutable data carrier; авто-конструктор, accessors, equals/hashCode/toString.
-3. **Разница record и обычного класса?** — record final, поля final, не наследуется от других классов.
-4. **Что такое sealed class?** — Разрешает наследование только явно перечисленным классам.
-5. **Что такое pattern matching в instanceof?** — Автоматически кастит переменную: `if (obj instanceof String s)`.
-6. **Pattern matching в switch — что даёт?** — Тип + деструктуризация + guards; exhaustive для sealed.
-7. **Разница switch statement и switch expression?** — Expression возвращает значение через `->` или `yield`.
-8. **Text blocks — зачем?** — Многострочные строки без escape.
-9. **Что такое record pattern?** — Деструктуризация record в switch/instanceof.
-10. **Enhanced NullPointerException?** — Сообщение указывает конкретное поле в null-цепочке.
-11. **Что такое unnamed variable `_`?** — Игнорирование переменной (preview в 21, финал в 22).
-12. **Stream.toList() vs Collectors.toList()?** — Первый immutable, короче, из Java 16.
-
----
-
-## Итог
-
-Между Java 11 и 21 язык стал:
-- **Меньше boilerplate** — record, var.
-- **Более выразительный** — pattern matching, switch expressions, text blocks.
-- **Более безопасный** — sealed + exhaustive switch, enhanced NPE, record patterns.
-- **Ближе к функциональному** — деструктуризация, immutable-first.
-
-Всё это доступно если ты на 21 — миграция как раз для этого.
-
-Следующий — `17-java-11-to-21-jvm.md`.
+Pattern matching для instanceof, добавленный в Java 16, объединяет проверку и приведение в одну операцию. После instanceof можно объявить переменную нужного типа прямо в условии — если условие истинно, переменная в теле if уже имеет нужный тип и содержит значение объекта. Никаких явных cast, никакого дублирования имени.
+
+Механика распространения переменной работает через flow scoping. Компилятор анализирует поток выполнения и определяет области кода где переменная гарантированно инициализирована и имеет корректный тип. Переменная доступна в теле if если условие истинно, в теле else если false, в дальнейшем коде если из if происходит return или throw. Это делает синтаксис естественным и позволяет комбинировать с логическими операторами через AND — можно проверить тип и одновременно вызвать метод у переменной как будто она уже имеет правильный тип.
+
+Практический эффект — код становится существенно короче и безопаснее. Меньше символов, меньше возможностей для опечаток в приведениях типов, меньше шума мешающего понять бизнес-логику. Особенно заметно в цепочках проверок разных типов через if-else-if.
+
+## Pattern matching для switch
+
+Java 21 завершила многолетний проект по расширению pattern matching на switch операторы и выражения. Это самая мощная новая языковая фича со времён Java 8 lambdas, кардинально меняющая способ работы с типизированными данными.
+
+Классический switch поддерживал только сравнение с константами примитивных типов, enum, String. Новый switch может делать pattern matching по типам, работать с sealed hierarchies, деструктурировать records, использовать guards для дополнительных условий. Компилятор проверяет exhaustive обработку когда работаешь с sealed типом — если забыл обработать один из вариантов, компиляция падает.
+
+Синтаксис case теперь может содержать не только константу, но и type pattern с объявлением переменной, аналогичный instanceof. При совпадении типа переменная становится доступна в правой части case со значением приведённого объекта. Дополнительные условия задаются через when clause после type pattern — это позволяет добавить произвольную проверку к type matching.
+
+Record patterns добавляют возможность деструктурировать records прямо в case. Вместо получения ссылки на record и последующего вызова аксессоров, можно указать шаблон разбирающий record на компоненты в одной строке. Это делает код существенно короче и выразительнее для работы с иерархиями records.
+
+Обработка null стала first-class citizen. Теперь можно указать case null для явной обработки null значения. Это устраняет типичный источник багов когда switch на null падал с NullPointerException при попытке получить hashCode.
+
+Полная комбинация features — sealed hierarchies плюс records плюс pattern matching для switch плюс guards — даёт мощный инструмент для работы с алгебраическими типами данных. Стиль близкий к Scala и Kotlin, но выразительный внутри Java. Код становится более декларативным и менее подверженным ошибкам благодаря проверке exhaustive обработки на этапе компиляции.
+
+## Switch как выражение
+
+Дополнительно к pattern matching switch стал expression в Java 14. Раньше switch был только statement — выполнял код, но не возвращал значение. Присваивание переменной результата требовало явного объявления, входа в switch, присваивания в каждом case с обязательным break, обработки default.
+
+Switch expression возвращает значение через новый arrow syntax. После case указывается стрелка вместо двоеточия и выражение, значение которого становится результатом switch. Fallthrough между case недопустим при arrow syntax, что устраняет типичный источник багов забытого break. Множественные значения группируются перечислением через запятую. Для сложной логики требующей выполнения нескольких statements используется блок с ключевым словом yield для возврата значения.
+
+Комбинация switch expression с pattern matching и sealed types даёт декларативный стиль работы с типами. Функция принимает объект sealed типа и возвращает результат зависящий от конкретного подтипа — вся логика умещается в одно switch expression, компилятор проверяет обработку всех вариантов, код читается сверху вниз без прыжков контроля выполнения.
+
+## Другие полезные добавления в стандартной библиотеке
+
+Помимо крупных языковых фич между Java 11 и 21 добавилось множество полезных методов в стандартной библиотеке. String получил strip как Unicode-aware версию trim, работающую правильно с не-ASCII whitespace. Метод isBlank проверяет что строка пустая или содержит только whitespace. Метод lines возвращает Stream строк, что удобно для обработки многострочного текста. Метод repeat повторяет строку заданное количество раз. Метод formatted как альтернатива String.format с более естественным вызовом на самой строке.
+
+Optional получил метод isEmpty дополняющий isPresent для более читаемых проверок. Метод orElseThrow без аргументов бросает NoSuchElementException — короче чем указывать supplier для типичного случая. Метод ifPresentOrElse выполняет разные действия для present и empty случаев без вложенных проверок. Метод stream превращает Optional в Stream из нуля или одного элемента, что полезно при работе с коллекциями Optional.
+
+Stream получил метод toList в Java 16 как удобную альтернативу collect с Collectors.toList. Результат immutable list — попытка модификации бросит UnsupportedOperationException. Это отличие от Collectors.toList который возвращает mutable ArrayList и является источником проблем при миграции кода использующего последующие модификации собранного списка. Правило простое — если нужна immutable коллекция используй toList, если нужна mutable явно указывай Collectors.toCollection с ArrayList::new.
+
+Метод mapMulti добавлен как более эффективная альтернатива flatMap для случаев когда каждый элемент даёт ноль или один результат. Не создаёт промежуточные Stream объекты, работает через consumer callback. Полезен для случаев когда логика фильтрации совмещается с трансформацией.
+
+Files получил методы readString и writeString упрощающие работу с текстовыми файлами — не нужно возиться с InputStream, Reader, BufferedReader для базовых сценариев. Работа с временными зонами через java.time продолжила расширяться дополнительными convenience методами.
+
+Java 21 добавила SequencedCollection интерфейс для коллекций с известным порядком элементов. LinkedHashMap, LinkedHashSet, List теперь имеют методы getFirst, getLast, addFirst, addLast, reversed возвращающий обратное view. До этого приходилось использовать iterator или преобразовывать в другую структуру для доступа к первому и последнему элементу.
+
+## Enhanced NullPointerException
+
+Одно из наиболее приятных улучшений для практической отладки — enhanced NullPointerException, включённый по умолчанию с Java 15. Раньше при NullPointerException разработчик получал только имя класса и номер строки, что для сложных выражений вроде цепочки вызовов было почти бесполезно. Приходилось расставлять debug logs или использовать debugger чтобы понять какое именно значение в цепочке оказалось null.
+
+Enhanced NPE в сообщении об ошибке точно указывает какая переменная или какое возвращаемое значение оказалось null. Вместо абстрактного NullPointerException at line 42 получаешь Cannot invoke String.length because return value of user.getAddress is null. Диагностика проблемы становится очевидной — сразу видно что метод getAddress вернул null, значит нужно проверить конкретный объект user или добавить обработку отсутствующего адреса.
+
+Экономия времени на debugging существенная. Раньше при получении NPE в production приходилось анализировать код, воспроизводить ситуацию, добавлять логирование. Теперь достаточно посмотреть на сообщение exception чтобы понять точное место проблемы.
+
+## Что было удалено между Java 11 и 21
+
+Помимо добавлений между версиями Java происходят и удаления устаревшего функционала. Concurrent Mark-Sweep garbage collector был удалён в Java 14 — устаревшая замена которой стал G1. Nashorn JavaScript engine удалён в Java 15 — движок исполнения JavaScript внутри JVM, использовавшийся редко и создававший избыточный maintenance overhead. Applet API удалён в Java 17 после многих лет deprecated состояния — технология полностью устарела. SecurityManager помечен deprecated в Java 17 с планами удаления — старый механизм авторизации, практически не используемый в микросервисных приложениях.
+
+Методы Thread suspend, resume, stop давно deprecated из-за неустранимых race conditions, в Java 21 помечены deprecated for removal — то есть в будущих версиях будут удалены полностью. Разработчикам необходимо мигрировать на interruption и volatile flags для остановки threads.
+
+Object finalize deprecated с планами удаления — устаревший механизм финализации перед garbage collection, ненадёжный и создающий проблемы с performance. Замена — try-with-resources для ресурсов или Cleaner для более сложных случаев.
+
+## Практическое сравнение стилей
+
+Один и тот же код, написанный в стилях Java 11 и Java 21, различается кардинально. На Java 11 обработка объекта с проверкой типа требует явного instanceof, приведения, вложенных if для разных типов, обработки статусов через enum. Многословный код с множеством вложенных условий, необходимостью держать в голове state.
+
+На Java 21 та же логика выражается через sealed hierarchy определяющую все возможные варианты, records для конкретных вариантов с автоматической деструктуризацией, switch expression с pattern matching, guards для дополнительных условий. Всё умещается в одно выражение возвращающее результат. Компилятор проверяет exhaustive обработку. Код читается декларативно.
+
+Разница в объёме кода составляет обычно в два-три раза меньше на Java 21. Разница в понятности и безопасности ещё больше — типы явно видны, все варианты обрабатываются гарантированно, невозможно забыть какой-то случай. Это то ради чего стоит мигрировать существующий код на новую версию языка.
+
+## Итоги
+
+Между Java 11 и 21 язык прошёл через существенную эволюцию. Меньше boilerplate благодаря records и var. Более выразительный синтаксис через pattern matching, switch expressions, text blocks. Более безопасный код через sealed hierarchies с exhaustive проверкой, enhanced NPE упрощающий отладку, record patterns для типизированной деструктуризации. Ближе к функциональному стилю с деструктуризацией и immutable-first подходом.
+
+Для КНП контекста миграция идёт постепенно через отдельные master-21 ветки для модулей. Использование новых языковых фич даёт немедленную выгоду в читаемости и безопасности кода. Records для DTO уже стандартный подход. Pattern matching для switch активно используется в сложной domain logic. Text blocks во всех местах где раньше были SQL или JSON конкатенации.
+
+Дальше обсуждается что изменилось под капотом JVM между Java 11 и 21 — сборщики мусора, container awareness, механизмы ускорения старта, JIT улучшения. Это уровень системного администрирования и настройки production приложений.

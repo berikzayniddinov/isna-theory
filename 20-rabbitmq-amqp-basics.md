@@ -1,415 +1,141 @@
-# 20. RabbitMQ: AMQP основы
+# 20. RabbitMQ и основы AMQP
 
-RabbitMQ — message broker. Задача — понять модель AMQP: exchange, queue, binding, routing.
+## Зачем нужен message broker
 
----
+Прямое синхронное общение между сервисами через HTTP имеет фундаментальные ограничения проявляющиеся при росте системы. Сервис A вызывает сервис B через HTTP, ждёт ответа, использует результат. Если B недоступен, вызов падает — вместе с ним падает и логика A. Если B медленный, A вынужден ждать всё время обработки — thread занят, TPS страдает. Если пик нагрузки на A транслируется на B, а B не может масштабироваться так же быстро, происходит перегрузка. Изменение интерфейса B требует координированного изменения A потому что связь тесная и прямая.
 
-## 1. Зачем нужен message broker
+Message broker решает эти проблемы через введение промежуточного слоя. Сервис A публикует сообщение в брокер и продолжает свою работу не дожидаясь обработки. Брокер хранит сообщение до тех пор пока B не сможет его забрать. B обрабатывает сообщения в своём темпе, независимо от pace публикации со стороны A. Пиковые нагрузки поглощаются очередью — если A временно генерирует больше сообщений чем B может обработать, они накапливаются и обрабатываются позже.
 
-### 1.1 Проблема синхронного общения
+Развязка становится реальной. A не знает существует ли B вообще — публикует сообщение в очередь и это всё. Может появиться сервис C который тоже подписывается на эту же очередь. Может B временно отключиться на deployment без влияния на A. Может B заменить на совершенно другую реализацию — A ничего не заметит.
 
-Сервис A вызывает B через HTTP синхронно. Проблемы:
-- B недоступен → A падает.
-- B медленный → A ждёт.
-- Пиковая нагрузка на A → B перегружен.
-- Тесная связь.
+Гарантии доставки более сильные чем HTTP. При правильной настройке сообщение не теряется даже если broker перезапустится или B недоступен продолжительное время. HTTP таких гарантий не даёт — если ответ не получен, отправитель не знает выполнена ли операция. Fan-out паттерны становятся тривиальными — одно событие может быть доставлено многим подписчикам без явного координации между ними.
 
-### 1.2 Что даёт broker
+Хорошая аналогия — почта против личной доставки. Прямая передача требует чтобы обе стороны присутствовали одновременно, готовы к взаимодействию. Почтовое отделение принимает письмо когда отправитель может, доставляет когда получатель готов, хранит если нужно, гарантирует доставку. Разные компоненты становятся независимыми во времени.
 
-- **Асинхронность** — A положил сообщение, забыл, B заберёт когда сможет.
-- **Буферизация** — пик нагрузки поглощается очередью.
-- **Развязка** — A не знает про B (только про очередь).
-- **Гарантии доставки** — сообщение не потеряется даже если B недоступен.
-- **Fan-out** — одно событие → много подписчиков.
+## Что такое AMQP
 
-Аналогия: A — курьер, B — получатель. Раньше: курьер ждёт пока получатель откроет. Теперь: положил в почтовый ящик, ушёл, получатель заберёт когда сможет.
+Advanced Message Queuing Protocol — открытый стандарт для передачи сообщений созданный как замена проприетарным протоколам различных вендоров. Спецификация определяет модель компонентов, формат сообщений, командный протокол взаимодействия клиента с брокером. Наличие открытого стандарта означает что клиенты и брокеры от разных вендоров могут взаимодействовать.
 
----
+RabbitMQ является наиболее популярной реализацией AMQP хотя не единственной. Apache QPid, ActiveMQ Artemis также поддерживают AMQP. RabbitMQ написан на Erlang что даёт ему хорошие характеристики устойчивости и распределённой работы — Erlang изначально проектировался для телекоммуникационных систем требующих высокой доступности. Помимо AMQP RabbitMQ поддерживает MQTT для IoT сценариев, STOMP для простого текстового взаимодействия, но базовая модель остаётся AMQP 0.9.1.
 
-## 2. Что такое AMQP
+Ключевые концепции AMQP включают несколько сущностей взаимодействующих между собой. Producer публикует сообщения — приложение отправляющее данные. Consumer читает сообщения — приложение получающее данные. Broker собственно сам RabbitMQ — сервис принимающий, хранящий, доставляющий сообщения. Exchange — маршрутизатор внутри брокера, принимает сообщения от producer и решает в какие очереди их положить. Queue — очередь хранящая сообщения до чтения consumer. Binding — правило связывающее exchange и queue, определяющее какие сообщения из exchange попадают в queue. Routing key — метаданные сообщения используемые exchange для маршрутизации. Virtual host — логическое разделение брокера, аналог namespace, позволяет одному физическому брокеру обслуживать несколько независимых логических инсталляций.
 
-**AMQP (Advanced Message Queuing Protocol)** — открытый стандарт для messaging (не только Rabbit; есть QPid, ActiveMQ Artemis).
+## Основная модель работы
 
-RabbitMQ — самая популярная реализация. Написан на Erlang. Умеет и другие протоколы (MQTT, STOMP), но базовая модель — AMQP 0.9.1.
+Поток сообщения через систему проходит несколько этапов. Producer формирует сообщение с payload и метаданными включая routing key. Отправляет сообщение в exchange указывая его имя. Exchange смотрит на bindings связанные с ним — правила говорящие какие сообщения куда должны идти. Для каждого matching binding создаётся копия сообщения и помещается в associated queue. Consumer подключается к queue, получает сообщения по мере их поступления, обрабатывает, подтверждает обработку через ack.
 
-### 2.1 Ключевые концепты
+Важно понять что producer не знает какие queue существуют. Он публикует в exchange и это всё. Топология — какие exchange, какие queue, какие bindings — конфигурируется отдельно от кода producer. Это делает систему гибкой — новые consumers могут быть добавлены без изменений в producer.
 
-- **Producer** — публикует сообщения.
-- **Consumer** — читает сообщения.
-- **Broker** — сам RabbitMQ.
-- **Exchange** — «маршрутизатор». Принимает сообщения от producer, решает куда положить.
-- **Queue** — очередь. Хранит сообщения до чтения consumer'ом.
-- **Binding** — правило «этот exchange → эта queue по такому-то routing key».
-- **Routing key** — метаданные сообщения, exchange использует для маршрутизации.
-- **Virtual host (vhost)** — логическое разделение brokerа (аналог namespace).
+Тип exchange определяет как маршрутизация работает. Существует несколько стандартных типов покрывающих типичные сценарии. Direct exchange маршрутизирует по точному совпадению routing key с binding key. Топик exchange поддерживает pattern matching с wildcards. Fanout exchange игнорирует routing key и отправляет копию в каждую bound queue. Headers exchange маршрутизирует по совпадению атрибутов сообщения вместо routing key.
 
----
+Direct exchange проще всего. Producer публикует сообщение с routing key равным условно order.created. Есть queue orders_queue связанная с exchange через binding key order.created. Сообщение попадает в orders_queue. Если binding был бы order.updated, сообщение не попало бы в queue. Это классическая маршрутизация где routing key явно определяет назначение.
 
-## 3. Основная модель
+Topic exchange более гибкий. Поддерживает wildcards в binding key — звёздочка соответствует одному слову, решётка соответствует любому количеству слов включая ноль. Producer публикует с routing key notification.email.critical. Binding key notification.email.# ловит все email нотификации любой критичности. Binding key notification.#.critical ловит все critical нотификации любого типа. Это позволяет гибкие иерархии маршрутизации без изменения кода producer.
 
-```
-                     ┌──────────────┐
-Producer  ──publish──►│   Exchange   │
-   (routing key)     └──────┬───────┘
-                            │
-                    ┌───────┴───────┐
-                    │  binding by   │
-                    │  routing key  │
-                    │               │
-                    ▼               ▼
-                ┌───────┐      ┌───────┐
-                │Queue 1│      │Queue 2│
-                └───┬───┘      └───┬───┘
-                    │              │
-                    ▼              ▼
-               Consumer 1    Consumer 2
-```
+Fanout exchange для broadcast. Один producer публикует, все подписчики получают копию. Классический pub-sub scenario. Часто используется для событий когда несколько разных сервисов должны быть уведомлены — audit, analytics, notification и другие могут одновременно реагировать на одно бизнес событие.
 
-Producer НЕ пишет в очередь напрямую. Пишет в exchange + routing key. Exchange по своим bindings решает в какие очереди положить.
+Headers exchange редко используется на практике. Позволяет маршрутизацию по arbitrary заголовкам сообщения вместо routing key. Более гибкий но менее производительный чем другие типы. Обычно вместо него используется topic с творческим routing key.
 
----
+## Queue как хранилище
 
-## 4. Типы Exchange
+Очередь непосредственно хранит сообщения до момента их доставки consumer. Основные свойства queue определяют её характеристики.
 
-### 4.1 Direct
+Durable queue переживает перезапуск брокера. Метаданные queue сохраняются на диск при создании. Non-durable queue исчезает при перезапуске broker. Для production используются durable queue практически всегда.
 
-Routing по точному совпадению routing key.
+Persistent messages сохраняются на диск в дополнение к memory. Non-persistent живут только в memory и теряются при перезапуске broker. Сочетание durable queue и persistent messages даёт максимальные гарантии сохранности но снижает производительность из-за disk I/O.
 
-```
-Exchange (type=direct)
-    │
-    ├── binding "orders.new"    → Queue A
-    ├── binding "orders.paid"   → Queue B
-    └── binding "orders.new"    → Queue C
-```
+Exclusive queue доступна только соединению которое её создало и удаляется при закрытии соединения. Используется для temporary queues специфических для клиента. Auto-delete queue удаляется когда последний consumer отключается — полезно для temporary consumers.
 
-Publish с routing="orders.new" → Queue A + Queue C.
-Publish с routing="orders.paid" → Queue B.
+Дополнительные аргументы конфигурируют специфические поведения. Message TTL задаёт время жизни сообщений в очереди — старые сообщения автоматически удаляются. Queue TTL задаёт время жизни самой очереди без активности. Max length ограничивает количество сообщений в очереди — при переполнении старые сбрасываются или новые reject. Dead letter exchange задаёт куда направляются сообщения rejected или expired — важный механизм для error handling.
 
-Использование: точный routing, work queues.
+Priority queue поддерживает приоритеты сообщений в диапазоне обычно 0-10. Сообщения с высоким приоритетом обрабатываются раньше. Это влияет на производительность и обычно используется когда есть чёткая необходимость приоритизации отдельных типов сообщений.
 
-### 4.2 Topic
+## Publisher confirms и надёжность
 
-Routing по pattern-matching с wildcards.
+При обычной публикации producer отправляет сообщение и продолжает работу без подтверждения что брокер его получил. Если broker перезапустился или связь потеряна в момент публикации, сообщение может быть потеряно. Publisher confirms решают эту проблему.
 
-- `*` — одно слово.
-- `#` — ноль или более слов.
+При включении confirms брокер отправляет подтверждение publisher после того как сообщение получено и persist на диск. Producer знает что сообщение сохранено надёжно. Если ack не получен в разумное время, producer может повторить публикацию.
 
-```
-Exchange (type=topic)
-    │
-    ├── binding "orders.*.new"      → Queue A
-    ├── binding "orders.kz.#"       → Queue B
-    └── binding "#.new"             → Queue C
-```
+Различаются basic ack — сообщение принято broker и nack — сообщение отвергнуто broker по какой-то причине. Обработка nack требует специфической логики — retry, alerting, routing в dead letter queue в зависимости от сценария.
 
-Publish `orders.kz.new`:
-- matches `orders.*.new` → A
-- matches `orders.kz.#` → B
-- matches `#.new` → C
+Транзакции через AMQP исторически поддерживались но существенно медленнее чем publisher confirms. Практически везде рекомендуется использовать confirms вместо transactions для баланса производительности и надёжности.
 
-Publish `orders.kz.paid`:
-- matches `orders.kz.#` → B
+Обеспечение end-to-end гарантий требует publisher confirms плюс правильно настроенных durable queue и persistent messages. Только сочетание всех трёх даёт гарантии что сообщение не потеряется в системе.
 
-Использование: pub-sub по темам.
+## Consumer prefetch и acknowledgments
 
-### 4.3 Fanout
+Consumer подключается к queue и получает сообщения по мере их появления. Управление ack и prefetch определяет надёжность и производительность consumption.
 
-Игнорирует routing key. Все bindings получают всё.
+Prefetch задаёт сколько сообщений broker отправляет consumer до получения ack. При prefetch 1 consumer получает одно сообщение, обрабатывает, отправляет ack, получает следующее. При prefetch 10 consumer может держать 10 unacked сообщений в работе одновременно. Больше prefetch даёт лучшую производительность за счёт параллельной обработки но меньше fairness при распределении между несколькими consumers.
 
-```
-Exchange (type=fanout)
-    │
-    ├── binding → Queue A
-    ├── binding → Queue B
-    └── binding → Queue C
-```
+Acknowledgment модели определяют когда сообщение считается обработанным. Auto ack — broker считает доставленным как только отправит consumer, независимо от успеха обработки. Опасно потому что теряет сообщения при падении consumer до обработки. Manual ack — consumer явно подтверждает после успешной обработки. Стандартный подход для надёжных систем.
 
-Каждое сообщение → во все три очереди.
+При manual ack consumer может nack сообщение возвращая его обратно в queue или отправляя в dead letter exchange. Возврат в queue useful при временных проблемах — можно повторить обработку. DLQ useful при постоянных ошибках — сообщение изолируется для manual analysis.
 
-Использование: broadcast (уведомления, инвалидация кэша).
+Requeue параметр при nack определяет вернётся сообщение обратно в очередь или пойдёт в DLQ. При requeue true сообщение вернётся сразу же — если проблема systematic, будет infinite loop. Retry с backoff обычно реализуется через выделенный delay queue с TTL пересылающим в основную queue после задержки.
 
-### 4.4 Headers
+## Dead letter exchange и retry pattern
 
-Routing по заголовкам сообщения (не по routing key). Редко используется.
+Dead letter exchange является ключевым механизмом error handling в RabbitMQ. Сообщения попадающие в DLX происходят когда rejected consumer, expired по TTL, dropped из-за overflow max length. DLX сам является обычным exchange, поэтому dead lettered сообщения могут маршрутизироваться в DLQ где ожидают manual обработки.
 
-### 4.5 Default exchange
+Классический retry pattern использует несколько queues с TTL. Основная queue куда идут все сообщения. Retry queue с TTL 30 секунд и DLX указывающим обратно на основную queue. При ошибке обработки consumer nack сообщение в retry queue. Через 30 секунд TTL expires, сообщение через DLX возвращается в основную queue. Retry counter в заголовках сообщения увеличивается. После N попыток сообщение окончательно отправляется в failure queue для manual analysis.
 
-У каждой очереди автоматически есть binding в **default exchange** (direct, `""`) с routing key = имя очереди. Позволяет писать «в очередь напрямую»:
+Более продвинутые retry policies могут использовать exponential backoff — каждый следующий retry задерживается на больший интервал. Реализуется через несколько retry queues с разными TTL — 30 секунд, 5 минут, 30 минут, 4 часа. Consumer выбирает следующую retry queue основываясь на текущем retry count.
 
-```
-publish(exchange="", routingKey="my-queue", body="...")
-```
+Dead letter обработка сообщений после исчерпания retries — важный процесс. Может быть автоматическая замена и повтор, alert oncall инженерам, ручной анализ и решение через управляющий интерфейс. Игнорировать DLQ опасно потому что там могут копиться сообщения представляющие потерянные операции.
 
-Кратко для простых случаев, но плохой стиль — теряется гибкость.
+## Топология в контексте КНП
 
----
+В КНП RabbitMQ используется для асинхронной коммуникации между микросервисами. Основные сценарии — уведомления пользователей, синхронизация состояния между сервисами, отправка данных в SOAP шину, обработка форм налоговой отчётности асинхронно от HTTP запроса создавшего задание.
 
-## 5. Queue — свойства
+Notification service подписан на несколько exchange от разных сервисов. Форма подана — событие в exchange. Уведомление сгенерировано — сообщение в отдельную queue notification service. Уведомление отправлено — событие в другой exchange для audit. Многоуровневая обработка через несколько exchange даёт гибкость и observability.
 
-Основные атрибуты:
+Sync services между модулями КНП реализуются через RabbitMQ. Модуль А публикует событие изменения данных. Модуль В подписан на этот exchange и обновляет свои local копии. Это позволяет модулям иметь свои optimized data models без необходимости синхронного вызова источника при каждом использовании данных.
 
-- **Durable** — при рестарте broker'а очередь остаётся.
-- **Exclusive** — только текущее соединение, удаляется при disconnect.
-- **Auto-delete** — удаляется когда последний consumer отписывается.
-- **Arguments** — дополнительные (TTL, DLX, max-length, quorum).
+Dead letter handling критически важен потому что потеря сообщений в налоговой системе неприемлема. Каждая критическая queue имеет свою DLQ настроенную с alerting. Регулярный анализ dead letters помогает выявлять systematic проблемы.
 
-### 5.1 Durable + persistent
+Publisher confirms используются в критических potocol interactions. Например при отправке формы отчётности в АРМ через шину — сообщение должно быть гарантированно доставлено. Producer публикует, ждёт confirm, только после confirm отвечает клиенту что форма принята. При отсутствии confirm происходит retry с идемпотентным identifier.
 
-Чтобы сообщения выживали рестарт broker'а:
-1. Queue durable=true.
-2. Сообщение publish с `deliveryMode=2` (persistent).
+Prefetch настраивается с учётом типа обработки. Для fast processing сообщений prefetch может быть 50-100. Для slow processing вроде отправки email или SOAP calls prefetch снижается до 5-10 чтобы не блокировать много сообщений на одном consumer. Мониторинг queue depth и consumer utilization помогает настроить оптимальные значения.
 
-Без обоих — сообщения теряются.
+## Мониторинг и диагностика
 
-### 5.2 Quorum queues vs Classic
+RabbitMQ management UI предоставляет визуальный интерфейс для мониторинга — количество сообщений в очередях, connections, channels, exchange, bindings, rates публикации и consumption. Полезен для ad-hoc диагностики.
 
-- **Classic** — старые, single-node или mirror-based HA.
-- **Quorum** — на Raft, репликация между узлами, сильнее гарантии, чуть медленнее.
+Метрики через Prometheus плагин интегрируются в общий стек observability. Grafana dashboards показывают тренды — queue depth over time, throughput, connection count. Alerts настраиваются на превышение пороговых значений — queue growing без ограничения указывает на проблему с consumer.
 
-Для новых проектов — quorum. Для legacy — classic.
+Логи RabbitMQ содержат информацию о соединениях, ошибках, критических событиях. Обычно направляются в централизованное логирование ELK или подобное для анализа.
 
----
+Классические проблемы диагностируются через комбинацию инструментов. Queue растёт — consumer не справляется или упал, проверить логи consumer и метрики. Сообщения не доставляются — проверить bindings, routing key, exchange type. Consumer не получает сообщения — проверить prefetch, ack settings, connection status. Высокое latency — проверить disk I/O на broker, network, memory.
 
-## 6. Connection и Channel
+Erlang runtime особенности могут проявляться в специфических сценариях. High memory usage — возможно есть queue без potrebiteľov накапливающая сообщения. High CPU — большое количество соединений или сложная маршрутизация. Erlang mailbox overflow — brokers в кластере не справляются с cross-node трафиком. Обычно решается через reconfiguration.
 
-- **Connection** — TCP-соединение с broker'ом. Тяжёлое, одно на приложение.
-- **Channel** — легковесный «мультиплекс» внутри connection. Producer/consumer работает через channel.
+## Кластеризация и высокая доступность
 
-```java
-Connection conn = factory.newConnection();
-Channel ch = conn.createChannel();
-ch.basicPublish(exchange, routingKey, props, body);
-```
+RabbitMQ поддерживает кластеризацию для высокой доступности. Несколько узлов образуют кластер, metadata реплицируется между всеми узлами. Queue по умолчанию живёт на одном узле — если узел падает, queue недоступна.
 
-Правило: один Connection на приложение, много Channel'ов (по одному на поток).
+Mirrored queues исторически использовались для репликации queue между узлами. Каждое сообщение реплицируется на master и slaves. При падении master один из slaves становится новым master. Обеспечивает высокую доступность но с overhead репликации.
 
----
+Quorum queues заменили mirrored queues как рекомендуемая опция начиная с версии 3.8. Используют Raft consensus для репликации, более надёжные, лучшая производительность в failure сценариях. Требуют минимум 3 узла для правильной работы.
 
-## 7. Publisher acknowledgments и mandatory
+Streams как новая функциональность 3.9+ представляют append-only логи, похожие на Kafka. Подходят для больших volumes сообщений которые нужно читать многократно с разных позиций.
 
-### 7.1 Publisher confirms
+Federation и Shovel как решения для connecting разных broker или кластеров через WAN. Federation передаёт сообщения из exchange одного broker в exchange другого. Shovel настраивает fixed transfer из queue в queue или exchange. Полезны для географически распределённых систем или migration сценариев.
 
-По умолчанию `basicPublish` — fire-and-forget. Не знаешь дошло ли до brokerа.
+## Итоги
 
-С confirms — broker подтверждает получение:
-```java
-ch.confirmSelect();
-ch.basicPublish(...);
-ch.waitForConfirms();     // блокирует пока не подтвердит
-```
+Message broker решает фундаментальные проблемы синхронного взаимодействия — временную связанность сервисов, каскадные отказы, невозможность буферизации пиков. RabbitMQ является одной из наиболее популярных реализаций AMQP протокола, предоставляя мощную и гибкую модель.
 
-### 7.2 Mandatory + returns
+AMQP модель включает producer, exchange, queue, binding, consumer. Producer публикует в exchange не зная про конкретные queues. Exchange маршрутизирует по типу — direct для точного совпадения routing key, topic для pattern matching, fanout для broadcast, headers для маршрутизации по заголовкам. Queue хранит сообщения до доставки consumer. Consumer забирает сообщения и подтверждает обработку через ack.
 
-`mandatory=true` — если сообщение не сматчилось ни на одну очередь → broker вернёт producer'у (иначе просто выбросится).
+Надёжность обеспечивается сочетанием durable queue, persistent messages, publisher confirms. Все три элемента необходимы для end-to-end гарантий сохранности. Publisher confirms получают ack от broker после persist сообщения. Manual ack от consumer подтверждает успешную обработку.
 
-```java
-ch.addReturnListener(rl -> log.warn("Unroutable: {}", rl.getReplyText()));
-ch.basicPublish(exchange, routingKey, true, false, props, body);
-//                                     mandatory
-```
+Prefetch управляет parallelism consumer и fairness распределения. Больше prefetch даёт лучшую производительность отдельного consumer но менее равномерное распределение при нескольких consumers.
 
----
+Dead letter exchange реализует error handling — сообщения rejected consumer, expired по TTL, dropped из-за overflow маршрутизируются в DLQ для manual или automated обработки. Retry patterns через комбинацию TTL и DLX реализуют exponential backoff.
 
-## 8. Consumer
+В КНП RabbitMQ используется для нотификаций пользователей, синхронизации между модулями, интеграции с SOAP шиной, асинхронной обработки форм отчётности. Publisher confirms обязательны для критических сценариев. Dead letter обработка требует внимания потому что потеря сообщений неприемлема в налоговой системе.
 
-### 8.1 Push vs Pull
+Кластеризация через quorum queues обеспечивает высокую доступность. Streams как новая функциональность для больших volume append-only сценариев. Federation и Shovel для географически распределённых систем.
 
-**Push** (basicConsume) — broker сам шлёт сообщения когда есть, consumer callback вызывается.
-**Pull** (basicGet) — consumer сам полит очередь. Плохо, медленно.
-
-Всегда используй push.
-
-### 8.2 Prefetch (QoS)
-
-Сколько сообщений broker может отправить consumer'у без ack:
-```java
-ch.basicQos(10);   // не больше 10 в работе одновременно
-```
-
-Без prefetch broker отправит всё сразу → пусть consumer «залипнет» с 10000 in-flight. Правило: `prefetch=1` для медленных задач, `prefetch=50-100` для быстрых.
-
-### 8.3 Ack modes
-
-- **auto-ack** — сообщение считается доставленным сразу как отправлено consumer'у. Если consumer упадёт — сообщение потеряно.
-- **manual ack** — consumer явно подтверждает.
-
-```java
-ch.basicConsume(queue, false /* autoAck=false */, (tag, delivery) -> {
-    try {
-        process(delivery.getBody());
-        ch.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
-    } catch (Exception e) {
-        ch.basicNack(delivery.getEnvelope().getDeliveryTag(), false, true);
-        // false = один тэг; true = requeue (вернуть в очередь)
-    }
-}, tag -> {});
-```
-
-Всегда используй manual ack — единственный способ надёжной доставки.
-
-### 8.4 Reject / Nack
-
-- `basicReject` — отвергнуть одно сообщение.
-- `basicNack` — то же, но можно диапазон тэгов + requeue flag.
-- `requeue=true` — вернуть в очередь (может лоопить бесконечно!).
-- `requeue=false` — выбросить (или в DLX, см. следующий файл).
-
----
-
-## 9. Virtual hosts
-
-**Vhost** — логическая изоляция внутри brokerа. Разные vhosts — разные exchanges, queues, users, permissions.
-
-Аналог: одна БД PostgreSQL vs много схем.
-
-```
-rabbitmq://user:pass@host:5672/knp          ← vhost "knp"
-rabbitmq://user:pass@host:5672/fno          ← vhost "fno"
-```
-
-В ИСНА обычно один vhost `/` — множество очередей внутри. Иногда — отдельные для разных подсистем.
-
----
-
-## 10. Пример: событийная модель ИСНА
-
-Сценарий: пользователь подал ФНО в КНП. Надо отправить в АРМ (tax-rep) на приёмку.
-
-### 10.1 Модель
-
-```
-knp-integration (producer)
-       │
-       │  publish (exchange="knp.events", routingKey="fno.submitted",
-       │           body=JSON{fnoId=123, regNum=...})
-       ▼
-   ┌──────────────────┐
-   │ Exchange         │
-   │ knp.events       │
-   │ (type=topic)     │
-   └────┬──────────┬──┘
-        │          │
-   binding      binding
-   "fno.*"      "audit.#"
-        │          │
-        ▼          ▼
-   ┌──────────┐ ┌──────────┐
-   │ fno.queue│ │audit.queue│
-   └────┬─────┘ └────┬──────┘
-        │            │
-        ▼            ▼
-    tax-rep      audit-svc
-   consumer     consumer
-```
-
-### 10.2 Producer
-
-```java
-@Autowired RabbitTemplate rabbit;
-
-void publishFnoSubmitted(Long id) {
-    rabbit.convertAndSend(
-        "knp.events",              // exchange
-        "fno.submitted",            // routing key
-        new FnoSubmittedEvent(id));
-}
-```
-
-### 10.3 Consumer
-
-```java
-@RabbitListener(queues = "fno.queue")
-void receive(FnoSubmittedEvent event) {
-    processFno(event.getFnoId());
-    // Spring auto-ack при success; на exception — nack (requeue или DLX)
-}
-```
-
-### 10.4 Что даёт
-
-- KNP не знает про tax-rep напрямую (только про exchange).
-- tax-rep упал → сообщения копятся, при рестарте — обработает.
-- Добавили audit-svc — просто новая queue + binding, KNP не меняем.
-
----
-
-## 11. Топология в ИСНА
-
-В ИСНА RabbitMQ — центральная шина.
-
-Основные очереди (примерно):
-- `knp.approvals` — из KNP в tax-rep для приёмки ФНО/ФО.
-- `notifications` — уведомления.
-- `charges` — разноска (пример memory `knp-raznoska-charge-posting-diag`).
-- `eaes` — реестры ЕАЭС (memory `knp-eaes-*`).
-- `sync.*` — межсистемная синхронизация (memory `knp-fno-outer-sync-esb-dead-route`, `knp-fo-sync-notification-bugs`).
-
-Обычно с DLX (dead-letter exchange) для проблемных сообщений — см. следующий файл.
-
----
-
-## 12. Management UI и CLI
-
-### 12.1 Management UI
-
-Web-морда на порту 15672.
-- Overview, connections, channels.
-- Exchanges, queues.
-- Publish/consume вручную для дебага.
-- Просмотр сообщений в очереди.
-
-Реальный пример: смотреть где застряли approvals — количество в очереди, скорость обработки.
-
-### 12.2 CLI
-
-```bash
-rabbitmqctl list_queues name messages consumers
-rabbitmqctl list_exchanges
-rabbitmqctl list_bindings
-rabbitmqctl list_connections
-rabbitmqctl purge_queue my.queue
-rabbitmqctl add_vhost knp
-rabbitmqctl set_permissions -p knp user ".*" ".*" ".*"
-```
-
-### 12.3 HTTP API
-
-Аналог CLI через REST:
-```bash
-curl -u guest:guest http://localhost:15672/api/queues
-curl -u guest:guest http://localhost:15672/api/exchanges
-```
-
----
-
-## 13. Собесные вопросы
-
-1. **Зачем нужен message broker?** — Асинхронность, буферизация, развязка, гарантии.
-2. **Что такое AMQP?** — Стандарт messaging; Rabbit — реализация.
-3. **Основные концепты AMQP?** — Producer/Consumer/Broker/Exchange/Queue/Binding/RoutingKey.
-4. **4 типа exchange?** — Direct (по точному key), Topic (wildcards), Fanout (все), Headers (по заголовкам).
-5. **Разница direct и topic?** — Direct = точное совпадение; topic = pattern с * и #.
-6. **Что такое default exchange?** — Direct exchange "" с автоматическим binding на каждую очередь по имени.
-7. **Что делает mandatory флаг?** — Если сообщение никуда не сматчилось — вернуть producer'у.
-8. **Что такое publisher confirms?** — Broker подтверждает получение сообщения.
-9. **Разница auto-ack и manual ack?** — Auto — сразу; manual — consumer явно подтверждает после обработки. Без manual — потеря при падении consumer'а.
-10. **Что такое prefetch (QoS)?** — Сколько сообщений broker может отправить consumer'у без ack.
-11. **Разница quorum и classic queues?** — Quorum на Raft, replicated, надёжнее; classic — legacy.
-12. **Что такое vhost?** — Логическая изоляция (аналог namespace).
-13. **Разница connection и channel?** — Connection = TCP; channel = мультиплекс внутри connection, дешёвый.
-
----
-
-## Итог
-
-- **AMQP** = producer → exchange → (binding) → queue → consumer.
-- **Exchange types**: direct, topic, fanout, headers.
-- **Queue** durable + message persistent = переживают рестарт.
-- **Manual ack** + **prefetch** — обязательно для надёжности.
-- **Publisher confirms** + **mandatory** — гарантия producer'а.
-- **Vhost** — изоляция.
-- **Connection + Channel** — один TCP, много каналов.
-- **Management UI** — must для дебага.
-
-Следующий — `21-rabbitmq-delivery-guarantees.md`.
+Понимание всех этих элементов позволяет проектировать надёжные системы обмена сообщениями учитывающие специфику конкретного бизнес сценария. RabbitMQ является мощным инструментом но требует правильной настройки для достижения его потенциала.

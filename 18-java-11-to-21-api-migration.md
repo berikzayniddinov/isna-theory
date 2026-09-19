@@ -1,367 +1,123 @@
-# 18. Java 11 → 21: API и миграция
+# 18. Java 11 к 21: API и практика миграции
 
-Что добавилось в стандартной библиотеке, что удалено, какие грабли при миграции.
+## Стандартная библиотека расширяется
 
----
+Между версиями Java 11 и 21 стандартная библиотека получила множество полезных дополнений, каждое из которых решает специфический раздражающий момент из повседневной работы. Эти изменения менее заметны чем языковые фичи вроде records и pattern matching, но кумулятивный эффект от их использования делает современный Java код существенно чище и понятнее. Разберём наиболее практически важные добавления.
 
-## 1. Новые API
+Встроенный HttpClient добавленный в Java 11 стал полноценной заменой для многих сценариев где раньше приходилось использовать сторонние библиотеки вроде Apache HttpClient или OkHttp. Стандартный клиент поддерживает HTTP/2 из коробки, работает как в синхронном режиме через send так и в асинхронном через sendAsync возвращающий CompletableFuture. Настройка через builder pattern с указанием версии протокола, timeout, follow redirects. Для простых HTTP вызовов встроенного клиента достаточно и не требуется добавлять внешние зависимости.
 
-### 1.1 `HttpClient` (Java 11, но улучшения)
+Практическое использование HttpClient — простые REST вызовы, интеграции с внешними API, health checks других сервисов. Для более сложных сценариев с connection pool, retry policies, специфическими требованиями к cookie management сторонние библиотеки остаются лучшим выбором. Но для большинства случаев в микросервисной архитектуре где взаимодействие с внешними API через Feign или WebClient, встроенного HttpClient достаточно для вспомогательных задач.
 
-С Java 11 в JDK есть **встроенный HTTP-клиент**. Не нужен Apache HttpClient / OkHttp для простых задач.
+String получил ряд удобных методов упрощающих типичные операции. Метод strip является Unicode-aware версией trim — правильно работает со всеми whitespace символами не только ASCII. Метод isBlank проверяет что строка пустая или содержит только whitespace, что чище чем комбинация isEmpty и явной проверки через regex. Метод lines возвращает Stream из строк разделённых переводами, удобно для обработки multi-line текстов. Метод repeat повторяет строку заданное количество раз без явных циклов. Метод formatted как альтернатива String.format с более удобным синтаксисом вызова непосредственно на строке.
 
-```java
-HttpClient client = HttpClient.newBuilder()
-    .version(HttpClient.Version.HTTP_2)
-    .connectTimeout(Duration.ofSeconds(5))
-    .build();
+Optional получил isEmpty дополняющий isPresent — иногда явная проверка на пустоту читается лучше чем отрицание непустоты. Метод orElseThrow без аргументов бросает NoSuchElementException как разумный default. Метод ifPresentOrElse обрабатывает оба варианта в одном месте без вложенных проверок. Метод stream превращает Optional в Stream из нуля или одного элемента, что удобно комбинируется с другими Stream операциями.
 
-HttpRequest req = HttpRequest.newBuilder()
-    .uri(URI.create("https://api.example.com/users/1"))
-    .header("Accept", "application/json")
-    .GET()
-    .build();
+Метод toList на Stream добавленный в Java 16 стал наиболее используемой альтернативой Collectors.toList. Возвращает immutable список — попытка модификации бросает UnsupportedOperationException. Это семантическое отличие от Collectors.toList который возвращает mutable ArrayList и становится источником проблем при миграции существующего кода использующего последующую модификацию собранного списка. Правило простое — если код собирает список для дальнейшей передачи как результат используй toList, если действительно нужна модификация используй Collectors.toCollection с явным ArrayList::new.
 
-// синхронно
-HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+Метод mapMulti на Stream появившийся в Java 16 является более эффективной альтернативой flatMap для случаев когда каждый элемент даёт ноль или один результат. Не создаёт промежуточные Stream объекты, работает через callback consumer. Полезен для комбинирования фильтрации и трансформации в одной операции без промежуточных сущностей.
 
-// асинхронно
-CompletableFuture<HttpResponse<String>> future =
-    client.sendAsync(req, HttpResponse.BodyHandlers.ofString());
-```
+Files получил методы readString и writeString упрощающие работу с текстовыми файлами. Больше не нужно возиться с BufferedReader и StringBuilder для базовых операций. Работа с временными зонами через java.time продолжала обогащаться convenience методами для типичных операций.
 
-Плюсы: HTTP/2 out of the box, reactive-friendly, без внешних зависимостей.
+Java 21 представила интерфейс SequencedCollection для коллекций с известным порядком элементов. LinkedHashMap, LinkedHashSet, List теперь имеют методы getFirst и getLast для прямого доступа без iterator. Методы addFirst и addLast для добавления в начало и конец. Метод reversed возвращает view коллекции в обратном порядке. До этого приходилось использовать iterator или преобразовывать в другую структуру для получения первого и последнего элемента.
 
-### 1.2 String методы (Java 11-15)
+## Модульная система Java 9
 
-```java
-"  hello  ".strip();               // "hello" (Unicode-aware, лучше trim())
-"".isBlank();                       // true (пустые/whitespace)
-"a\nb\nc".lines()                   // Stream<String>: "a", "b", "c"
-    .forEach(System.out::println);
-"ab".repeat(3);                     // "ababab"
+Java 9 представила модульную систему Jigsaw как способ явного определения структуры зависимостей между компонентами. Модуль объявляется через специальный файл module-info в корне пакета с явным указанием какие пакеты экспортируются наружу, от каких модулей зависит текущий, какие пакеты открыты для reflection.
 
-// text block indent
-"line1\nline2".indent(4);           // с 4 пробелами перед каждой строкой
+Идея модулей была амбициозной — навести порядок в classpath который до этого был неструктурированной кучей всех JAR доступных приложению. Модули должны были обеспечить strong encapsulation где internal классы недоступны извне модуля, чёткие зависимости где каждое использование другого пакета документируется, и надёжную инициализацию где все зависимости резолвятся при старте.
 
-// String::formatted (Java 15)
-"Hello, %s!".formatted("World");    // альтернатива String.format
-```
+Практическая адаптация модулей в enterprise Java оказалась ограниченной. Многие популярные библиотеки не адаптировались под модули или сделали это неполностью. Migration существующих приложений на модули требовала значительных усилий. Компромиссы вроде automatic modules и unnamed module размыли изначальную чистоту концепции. В результате большинство enterprise приложений включая КНП продолжают использовать classpath-based подход без модулей.
 
-### 1.3 Optional (Java 9-11)
+Тем не менее модули важны для JDK внутренне — стандартные классы теперь разбиты на модули вроде java.base, java.sql, java.net.http. Это позволило удалить многие устаревшие API из стандартного дистрибутива, ограничить доступ к internal классам JDK, создать более компактные custom runtime через jlink.
 
-```java
-opt.isEmpty();                      // Java 11
-opt.orElseThrow();                  // без аргументов = NoSuchElementException
-opt.ifPresentOrElse(v -> ..., () -> ...);
-opt.or(() -> Optional.of("default"));
-opt.stream();                       // Stream<T> из Optional (0 или 1 элемент)
-```
+Классические грабли связанные с модулями касаются reflection в JDK internal классы. Java 9 по умолчанию запретила такой reflection что сломало многие библиотеки использующие приватные API JDK. Jackson, Lombok, Hibernate и другие популярные библиотеки нуждаются в специальных параметрах JVM add-opens для доступа к нужным пакетам. Эти параметры обычно указываются в конфигурации JVM, добавляя определённую сложность в развёртывание.
 
-### 1.4 Collectors.toList() → Stream.toList() (Java 16)
+Начиная с Java 17 требования к таким параметрам стали строже, а с Java 21 некоторые старые библиотеки без add-opens просто не работают. Это важно учитывать при миграции — необходимо проверить что все зависимости совместимы с новой версией Java или добавить нужные параметры JVM.
 
-```java
-// раньше
-list.stream().filter(...).collect(Collectors.toList());
+## Главная головная боль — javax к jakarta
 
-// теперь
-list.stream().filter(...).toList();
-```
+Наиболее масштабное и трудоёмкое изменение в Java экосистеме между версиями 11 и 21 — переезд Java EE спецификаций из Oracle под управление Eclipse Foundation. Формально это административное решение, но практически оно привело к переименованию всех пакетов из javax в jakarta.
 
-Разница:
-- `toList()` даёт **immutable** список.
-- `Collectors.toList()` даёт `ArrayList` (mutable).
+История такова. Java EE как набор спецификаций для enterprise приложений разрабатывалась Oracle. В 2017 году Oracle передала спецификации в Eclipse Foundation, где они получили новое название Jakarta EE. Юридические ограничения не позволяли использовать имя javax в новых версиях, что привело к переименованию всех пакетов на jakarta. Технически это касается всех enterprise API — persistence, servlet, validation, transaction, annotation, mail, messaging и других.
 
-**Кавет**: если раньше писал `Collectors.toList()` и потом `.add()` — при миграции упадёт `UnsupportedOperationException`.
+Практический масштаб переименования огромен. Аннотация javax.persistence.Entity становится jakarta.persistence.Entity. Класс javax.servlet.http.HttpServletRequest становится jakarta.servlet.http.HttpServletRequest. Аннотация javax.validation.constraints.NotNull становится jakarta.validation.constraints.NotNull. Аннотация javax.annotation.PostConstruct становится jakarta.annotation.PostConstruct. И так для всех enterprise API — сотни классов и аннотаций.
 
-### 1.5 Stream.mapMulti (Java 16)
+Spring Boot 3.0 полностью перешёл на jakarta. Spring Boot 2.x остался на javax. Это означает что миграция приложения с Boot 2 на Boot 3 неизбежно требует замены всех javax импортов на jakarta. Для сервиса с сотнями Entity классов и REST контроллеров это тысячи изменений. Плюс могут потребоваться обновления сторонних библиотек — не все версии совместимы с новыми пакетами.
 
-Более эффективная альтернатива `flatMap` для случаев когда каждый элемент даёт 0-1 результат.
+Практически миграция выполняется несколькими способами. Ручная замена через IDE global find and replace работает для маленьких проектов. Автоматизированные инструменты вроде OpenRewrite имеют готовые рецепты для javax к jakarta миграции — они обрабатывают импорты, аннотации, полные квалифицированные имена, обновляют build файлы. Некоторые IDE вроде IntelliJ IDEA имеют встроенную поддержку миграции. Независимо от подхода после автоматической замены обязательна ручная проверка потому что automated tools не идеальны.
 
-```java
-Stream.of(1, 2, 3, 4, 5)
-    .<Integer>mapMulti((e, consumer) -> {
-        if (e % 2 == 0) consumer.accept(e * 10);
-    })
-    .toList();   // [20, 40]
-```
+## Другие удаления и депрекации
 
-### 1.6 Files (Java 11-12)
+Помимо javax к jakarta переезда между Java 11 и 21 произошли другие изменения касающиеся стандартной библиотеки. SecurityManager помечен deprecated в Java 17 — старый механизм авторизации редко используемый в микросервисной архитектуре. Планируется полное удаление в будущих версиях.
 
-```java
-String content = Files.readString(Path.of("file.txt"));
-Files.writeString(Path.of("out.txt"), "content");
-```
+Java Applet API полностью удалён в Java 17 после многих лет неиспользования. Технология апплетов работала в браузерах через Java Web Start, но браузеры давно отказались от плагинов. Полное удаление освободило значительный код в JDK и упростило развитие остальных частей.
 
-### 1.7 var в lambda-параметрах (Java 11)
+Методы Thread suspend, resume, stop давно были deprecated из-за unfixable race conditions. В Java 21 они получили статус deprecated for removal что означает планируется полное удаление в будущих версиях. Разработчикам необходимо мигрировать на interruption model для остановки threads.
 
-```java
-list.stream()
-    .map((var e) -> e.toUpperCase())     // теперь можно
-    .toList();
-```
+Метод Object finalize также deprecated с планами удаления. Механизм финализации перед garbage collection был известен как ненадёжный и создающий проблемы с производительностью. Замена — try-with-resources для ресурсов или Cleaner для более сложных случаев.
 
-Смысл: аннотации на параметрах:
-```java
-list.stream()
-    .filter((@NonNull var e) -> !e.isEmpty())
-    .toList();
-```
+Nashorn JavaScript engine удалён в Java 15 — движок исполнения JavaScript внутри JVM использовался редко. CORBA API удалён в Java 11 — technology для distributed objects практически не применяется в современной архитектуре. JAXB и JAX-WS — API для работы с XML — удалены из стандартного дистрибутива Java 11, теперь требуют явного подключения как зависимости через Maven или Gradle.
 
-### 1.8 `Predicate.not` (Java 11)
+## Реальные грабли миграции в КНП
 
-```java
-list.stream()
-    .filter(Predicate.not(String::isBlank))
-    .toList();
-```
+Опыт миграции нескольких модулей КНП с Java 11 на 21 показал определённые закономерности проблем. Понимание этих граблей помогает избегать их в будущих миграциях.
 
-Читабельнее чем `s -> !s.isBlank()`.
+Hibernate 6 стал существенно строже в проверке доступа к lazy полям. LazyInitializationException начал возникать в местах где Hibernate 5 молчаливо работал. Это не проблема Java 21 самой по себе — это семантическое изменение Hibernate 6 которое пришло вместе с миграцией на Spring Boot 3. Комбинированный эффект — метод помеченный @Transactional вызывается через this что минует прокси, транзакция не создаётся, сессия не открывается, обращение к lazy полю сразу даёт LazyInit. Реальный кейс taxreport21-java21-runtime-regressions показал этот сценарий, fix был в замене getById на findById и вынесении transactional методов в отдельные beans.
 
-### 1.9 Instant / LocalDateTime мелочи
+Skew версий транзитивных зависимостей проявился в spring-security jose и core оказавшихся разных версий. Один компонент цепочки зависимостей подтянул одну версию, другой компонент другую версию, результат — NoSuchMethodError в OAuth flow при попытке вызвать метод отсутствующий в загруженной версии класса. Решение — явное закрепление версий через BOM или dependency management, что убирает возможность разночтения.
 
-```java
-LocalDate.now().datesUntil(LocalDate.now().plusDays(7))  // Java 9
-    .toList();                                            // Stream<LocalDate>
+Hazelcast с версии 3 на версию 5 претерпел кардинальные изменения API. Client конфигурация, embedded режим, конфигурационные файлы — всё переработано. Реальный кейс knp-form-hz5-actuator-cache-nosuchmethod показал специфическую проблему — Spring Boot 2.2 Actuator вызывал метод getNativeCache на Hazelcast Cache, который в версии 5 был удалён из API. Fix — exclude соответствующих auto-configurations из Spring Boot конфигурации. Общий урок — миграция инфраструктурных библиотек требует тщательной проверки всех интеграционных точек.
 
-Duration.ofDays(1).toMillisPart();                        // Java 9
-```
+JAXB для работы с XML был удалён из стандартного JDK начиная с Java 11. Приложения использующие XML маршалинг должны явно добавить jakarta.xml.bind-api как compile зависимость и jaxb-runtime как runtime. Плюс jakarta переименование добавляет ещё один слой изменений в кодовой базе. Для приложений с активным использованием XML это существенная работа.
 
-### 1.10 Random (Java 17)
+Consul миграция с Ribbon на Spring Cloud LoadBalancer при переходе на Java 21 показала важность семантических различий между внешне похожими API. Ribbon был case-insensitive при поиске сервисов, что позволяло писать isnaKnpUser в коде когда сервис зарегистрирован как isnaknpuser. Spring Cloud LoadBalancer строгий, не находит сервис при разном case. Все места где code использовал разный case были обнаружены только регрессионным тестированием. Урок — миграция библиотек внешне похожих по API может иметь важные семантические различия.
 
-Иерархия улучшена: `RandomGenerator` interface, `RandomGeneratorFactory`.
-```java
-RandomGenerator rng = RandomGenerator.of("L64X128MixRandom");
-rng.nextInt(100);
-```
+Consul yml настройки требовали внимания при миграции — реальный кейс taxrep-master21-yml-reconcile-gaps показал что настройка query-passing равная true критически важна и должна быть явно проверена во всех модулях. Дефолтное поведение включает инстансы в статусе critical в результаты discovery что приводит к попыткам подключения к мёртвым сервисам.
 
-### 1.11 SequencedCollection (Java 21)
+ShedLock для координации scheduled jobs между репликами показал важность синхронизации версий между разными версиями образов. Реальный кейс knp-fno21-shedlock-stale-image-dup-regnum произошёл когда старый образ Java 21 fno был задеплоен до мержа fix для ShedLock. Джоба лупилась параллельно с Java 11 инстансами через ShedLock, что приводило к дублированию регистрационных номеров. Урок — миграция requires не только изменения sourceCompatibility параметра, но и тщательной синхронизации всех сопутствующих версий и retest scheduled jobs.
 
-Новый интерфейс — «коллекция с известным порядком». `LinkedHashMap`, `LinkedHashSet`, `List` теперь имеют:
-```java
-list.getFirst(); list.getLast();
-list.addFirst(x); list.addLast(x);
-list.reversed();                    // reversed view
+Isna-knp-gateway остался на Java 11 потому что Zuul как основа не поддерживает Java 21 нормально. Некоторые компоненты legacy стека принципиально не могут быть мигрированы без замены базовой технологии. Такие случаи требуют явного решения — либо инвестирование в замену Zuul на современную альтернативу, либо оставление модуля на старой версии Java со всеми связанными ограничениями.
 
-map.firstEntry(); map.lastEntry();
-```
+Sync-сервисы показали особенности связанные с interaction между Hibernate 6 strict LazyInit и другими проблемами. Реальный кейс knp-fo-sync-notification-bugs выявил шесть багов в NotificationSyncService часть из которых связана именно с новой строгостью Hibernate. Общий урок — при миграции комплексные интеграционные тесты обязательны, unit тесты не покрывают все сценарии проявления таких проблем.
 
----
+## Стратегия миграции из практики КНП
 
-## 2. Java 9+ модули (Jigsaw)
+Опыт миграции модулей КНП сформировал определённую методологию перехода которая работает надёжно. Первое — параллельная линия master-21 существует отдельно от основного master. Не merge между ветками, а либо cherry-pick конкретных изменений либо повторная реализация функциональности в новом контексте. Это позволяет модулям на разных версиях Java эволюционировать независимо без взаимных блокировок.
 
-Java 9 ввела **модульную систему**. Ключевые понятия:
+Второе — миграция происходит постепенно, один модуль за другим. Массовая одновременная миграция всех модулей создаёт слишком большую поверхность потенциальных проблем, невозможно эффективно диагностировать когда что сломалось. Пошаговый подход даёт возможность выявить и исправить проблемы каждого модуля в изоляции.
 
-### 2.1 Модуль
+Третье — каждый мигрированный модуль проходит смок-тесты в отдельном Java 21 контуре. В КНП это выделенные namespaces knp21, fo21, fno21, tax-report21 куда деплоятся мигрированные версии для интеграционного тестирования до продуктивного разворачивания. Это даёт возможность обнаружить проблемы взаимодействия с другими компонентами системы в контролируемой среде.
 
-`module-info.java`:
-```java
-module kz.gov.kgd.isna.knp {
-    requires spring.core;
-    requires spring.boot;
-    exports kz.gov.kgd.isna.knp.api;
-    // не exports kz.gov.kgd.isna.knp.internal — приватно
-}
-```
+Четвёртое — параллельно с миграцией Java обновляются сопутствующие зависимости. Hibernate 6 приходит вместе с Spring Boot 3, что заставляет проверять все JPA код на совместимость. Hazelcast 5 если используется требует пересмотра интеграций. Клиенты Kafka, RabbitMQ, других инфраструктурных компонентов обновляются до совместимых версий. Проверка через gradle dependencies или mvn dependency:tree на каждой стадии помогает избегать неожиданных transitive зависимостей.
 
-- **`requires`** — от чего зависит.
-- **`exports`** — какие пакеты доступны наружу.
-- **`opens`** — доступ для reflection.
-- **`provides ... with ...`** — service loader.
+Пятое — annotation processors требуют внимания. Lombok, MapStruct должны быть совместимы с новой версией Java. Обычно достаточно обновить versions до последних, но иногда требуются breaking changes в конфигурации. Специфические processors для аудита, метрик, security могут требовать более серьёзных изменений.
 
-### 2.2 Практика
+Шестое — JAXB, JAX-WS и другие XML-связанные библиотеки нужно явно добавлять как зависимости. Автоматически не подтягиваются больше. Плюс jakarta переименование в импортах.
 
-**В прод-микросервисах модули обычно НЕ используются**. Слишком сложно, ломает много библиотек, работать с classpath проще.
+Седьмое — глобальный поиск и замена javax к jakarta работает через IDE или OpenRewrite. После автоматической замены обязательный ручной review каждого изменения. Некоторые случаи требуют дополнительных решений — обновления зависимостей, изменения конфигурации, ручных правок.
 
-В ИСНА — модулей нет; classpath-based.
+Восьмое — тестирование прод-нагрузки на локальном или staging окружении, не только unit тесты. Реальные проблемы часто возникают только под концentrated load — connection pool exhaustion, race conditions, memory pressure. Nagruzka тесты помогают выявить их до продуктивного разворачивания.
 
-### 2.3 Классические грабли
+## Инструменты миграции
 
-**Illegal reflective access** — Java 9+ по умолчанию запрещает reflection в JDK internal классы. Многие библиотеки (Jackson, Lombok, Hibernate) обходят.
+OpenRewrite является наиболее мощным инструментом автоматизированной миграции Java кода. Содержит рецепты для типичных сценариев — javax к jakarta переход, Spring Boot 2 к 3 миграция, обновление синтаксиса под новые языковые фичи, замена deprecated API на актуальные. Настраивается через build plugin, запускается как отдельный gradle task или maven goal, применяет изменения к коду с возможностью preview перед принятием.
 
-Флаги для их работы (обычно в JVM args):
-```
---add-opens java.base/java.lang=ALL-UNNAMED
---add-opens java.base/java.util=ALL-UNNAMED
-```
+jdeps как инструмент JDK для анализа зависимостей приложения от JDK API. Помогает найти использование удалённых или депрекированных API — критично перед миграцией на новую версию Java. Параметр jdk-internals показывает использование internal классов JDK что требует особого внимания при миграции.
 
-С Java 17+ — эти опции обязательны, если библиотека их требует. С Java 21 — некоторые старые библиотеки без `--add-opens` не работают.
+Error Prone как компилятор-плагин от Google находит проблемные паттерны на этапе компиляции. Не специфичен для миграции но помогает обнаруживать общие проблемы кода которые могут проявиться при переходе на новую версию. Может интегрироваться в CI pipeline для автоматической проверки каждого коммита.
 
----
+## Итоги
 
-## 3. Что удалено / deprecated
+Стандартная библиотека Java между 11 и 21 существенно расширилась множеством полезных дополнений. Встроенный HttpClient покрывает многие потребности без сторонних библиотек. String, Optional, Stream, Files получили дополнительные convenience методы. SequencedCollection в Java 21 делает работу с упорядоченными коллекциями значительно удобнее.
 
-### 3.1 javax → jakarta (Java EE → Jakarta EE)
+Модульная система Java 9 внутренне важна для JDK но не получила широкого распространения в enterprise приложениях. Reflection в JDK internal классы требует явных add-opens параметров для многих сторонних библиотек.
 
-**САМАЯ БОЛЬШАЯ ГОЛОВНАЯ БОЛЬ** миграции.
+Переезд javax к jakarta является наиболее масштабным и трудоёмким изменением. Все пакеты enterprise API переименованы, что требует миграции всех импортов при переходе на Spring Boot 3. Инструменты вроде OpenRewrite автоматизируют большую часть работы но требуют финального ручного review.
 
-Java EE переехала под Eclipse Foundation → пакет `javax.*` переименован в `jakarta.*`.
+Реальные грабли миграции в КНП связаны не столько с Java 21 самой по себе сколько с параллельно обновляемыми зависимостями — Hibernate 6 стал строже, Spring Security имеет skew версий, Hazelcast 5 полностью переработал API, JAXB требует явного подключения, Ribbon к Spring Cloud LoadBalancer имеет семантические различия.
 
-Примеры:
-- `javax.persistence.Entity` → `jakarta.persistence.Entity`
-- `javax.servlet.http.HttpServletRequest` → `jakarta.servlet.http.HttpServletRequest`
-- `javax.validation.constraints.NotNull` → `jakarta.validation.constraints.NotNull`
-- `javax.annotation.PostConstruct` → `jakarta.annotation.PostConstruct`
-- `javax.transaction.Transactional` → `jakarta.transaction.Transactional`
+Практическая стратегия миграции включает параллельные ветки для разных версий Java, постепенное продвижение по модулям, изолированные Java 21 контуры для интеграционного тестирования, координированное обновление сопутствующих библиотек, обязательный retest scheduled jobs, тщательное тестирование под нагрузкой перед продуктивным разворачиванием.
 
-**Spring Boot 3.0+ полностью на jakarta**. Boot 2.x — javax.
+Инструменты OpenRewrite для автоматизации миграции, jdeps для анализа зависимостей от JDK API, Error Prone для обнаружения проблемных паттернов существенно упрощают работу но не заменяют человеческий review критических изменений.
 
-При миграции: нужно везде правки импортов + возможно обновление сторонних зависимостей.
-
-### 3.2 SecurityManager
-
-Deprecated в Java 17, готовится к удалению. Для микросервисов практически не используется — просто помнить.
-
-### 3.3 Applets, Web Start
-
-RIP полностью.
-
-### 3.4 Thread.stop/suspend/resume
-
-Deprecated for removal в Java 21.
-
-### 3.5 Finalization
-
-`Object.finalize()` deprecated. Использовать `try-with-resources` или `Cleaner`.
-
-### 3.6 Nashorn JS
-
-Удалён Java 15.
-
----
-
-## 4. Реальные грабли миграции ИСНА (11 → 21)
-
-Из memory и опыта.
-
-### 4.1 Hibernate 6 стал строже
-
-С JPA 3.0 (jakarta) + Hibernate 6 (Spring Boot 3):
-- LazyInit ловится там где раньше молчал.
-- `getById` deprecated → `getReferenceById`.
-- Некоторые dialects deprecated.
-
-Реальный кейс — memory `taxreport21-java21-runtime-regressions` (LazyInit через getById).
-
-### 4.2 Spring Security jose/core skew
-
-`OAuth NoSuchMethodError` — конфликт версий spring-security-jose vs core.
-
-Memory `taxreport21-java21-runtime-regressions`. Решение: явно закрепить версии через BOM.
-
-### 4.3 Hazelcast 3 → 5
-
-Полная переработка API. Клиенты, embedded, конфиг.
-
-Memory `knp-form-hz5-actuator-cache-nosuchmethod`: Boot 2.2 actuator звал `getNativeCache` на Hazelcast Cache — метод удалён в 5. Фикс — exclude auto-config.
-
-### 4.4 JAXB (XML)
-
-С Java 11 `javax.xml.bind.*` удалён из JDK. Нужно добавить как зависимость:
-```gradle
-implementation 'jakarta.xml.bind:jakarta.xml.bind-api'
-runtimeOnly 'org.glassfish.jaxb:jaxb-runtime'
-```
-
-Плюс jakarta-переименование.
-
-### 4.5 CORBA
-
-Удалён Java 11.
-
-### 4.6 Consul LB миграция
-
-Memory `knp-fo-consul-lb-mr1223-latent-mine`: Ribbon → Spring Cloud LoadBalancer при миграции на Java 21 → case-sensitivity разная → `isnaKnpUser` не резолвится → 500.
-
-### 4.7 Consul yml-reconcile
-
-Memory `taxrep-master21-yml-reconcile-gaps`: при миграции недотянуты настройки Hib6 + `query-passing: true` в Consul → сервисы не находят passing-инстансы.
-
-### 4.8 ShedLock
-
-Memory `knp-fno21-shedlock-stale-image-dup-regnum`: перед мержем ShedLock в master-21 задеплоился старый образ Java 21 fno → джоба лупилась параллельно с Java 11 → дубли регномеров.
-
-Урок: миграция Java = не только `sourceCompatibility=21`, но синхронизация всех сопутствующих версий, ретестирование scheduled-джоб.
-
-### 4.9 gateway на Java 11
-
-Memory `knp-gateway-no-java21`: `isna-knp-gateway` остался на Java 11 (Zuul не поддерживает Java 21 нормально). Не включать в миграцию.
-
-### 4.10 Sync-сервисы
-
-Memory `knp-fo-sync-notification-bugs`: 6 багов в NotificationSyncService, часть — Hibernate 6 стал строже к LazyInit.
-
----
-
-## 5. Стратегия миграции
-
-Из ИСНА-опыта:
-
-1. **Master-21 линия параллельно с master**. Не merge, а cherry-pick или ре-разработка (memory `taxrep-master21-not-behind-master-content`).
-2. **Постепенно, не всё сразу**. Один модуль за другим.
-3. **Смок-тесты после каждого сервиса** (Java 21 контур `knp21`, `fo21`, `fno21`, `tax-report21`).
-4. **Проверить сопутствующие: Hibernate 6, Boot 3, Hazelcast 5**.
-5. **Внимание к транзитивным зависимостям**: `./gradlew dependencies`.
-6. **Внимание к автогенерации кода**: Lombok, MapStruct должны быть совместимы (обновить процессоры).
-7. **JAXB, JAX-WS** — не забыть добавить как зависимости.
-8. **javax → jakarta** — глобальный поиск-замена + review.
-9. **Тестировать прод-нагрузку** локально — не только unit.
-
----
-
-## 6. Инструменты миграции
-
-### 6.1 jdeps
-
-Проверяет какие JDK API используются, помогает найти:
-- Removed API.
-- Internal API.
-
-```
-jdeps --jdk-internals app.jar
-```
-
-### 6.2 OpenRewrite
-
-Автоматическая рефакторинг-система. Рецепты для javax→jakarta, Boot 2→3, Java 11→17→21.
-
-```gradle
-plugins {
-    id 'org.openrewrite.rewrite' version '6.6.0'
-}
-rewrite {
-    activeRecipe('org.openrewrite.java.migrate.UpgradeToJava21')
-}
-```
-
-### 6.3 Error Prone
-
-Компилятор-плагин от Google, находит проблемные паттерны на compile-time.
-
----
-
-## 7. Собесные вопросы
-
-1. **Что нового в стандартной библиотеке между 11 и 21?** — HttpClient, `String.strip/isBlank/lines/repeat`, `Optional.isEmpty/orElseThrow`, `Files.readString`, `Stream.toList`, `Stream.mapMulti`, `Predicate.not`, SequencedCollection.
-2. **Разница `String::strip` и `String::trim`?** — strip Unicode-aware (правильно работает с не-ASCII whitespace).
-3. **Разница `Stream.toList()` и `Collectors.toList()`?** — toList immutable, короче; Collectors.toList mutable ArrayList.
-4. **Что такое модули Java 9?** — Модульная система (`module-info.java`), явные exports/requires; в микросервисах редко используется.
-5. **Что такое `--add-opens`?** — Разрешить reflection в internal-пакеты JDK.
-6. **javax → jakarta — что это?** — Java EE переехала в Eclipse, пакеты `javax.*` переименованы в `jakarta.*`. Boot 3.0+ на jakarta.
-7. **Что удалено между 11 и 21?** — CMS GC, Nashorn, Applets, javax.xml.bind (JAXB), CORBA, SecurityManager (deprecated).
-8. **Как мигрировать проект с Boot 2 (javax) на Boot 3 (jakarta)?** — OpenRewrite / глобальная замена импортов + review + обновление зависимостей.
-9. **Что такое SequencedCollection?** — Интерфейс Java 21, коллекции с известным порядком (getFirst, getLast, reversed).
-10. **HttpClient JDK vs Apache HttpClient?** — JDK для простых, HTTP/2, reactive; Apache для сложных сценариев (connection pool, retry, cookie management).
-
----
-
-## Итог
-
-- **Новое API**: HttpClient, String improvements, `toList()`, `mapMulti`, SequencedCollection.
-- **Модули** есть с 9, но не используются массово.
-- **javax → jakarta** — главная головная боль Boot 3 миграции.
-- **Реальные грабли ИСНА**: Hibernate 6 строже, Spring Security skew, Hazelcast 5 API, Ribbon→SC LB.
-- **Стратегия**: параллельная линия master-21, постепенно, много смок-тестов.
-- **Инструменты**: jdeps, OpenRewrite.
-
-Следующий — `19-java-21-virtual-threads.md`.
+Дальше обсуждается флагманская фича Java 21 — virtual threads из Project Loom. Это фундаментальное изменение способа написания concurrent Java кода которое потенциально революционизирует как строятся сервисы обрабатывающие много concurrent запросов.
