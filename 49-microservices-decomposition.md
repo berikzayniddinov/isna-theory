@@ -1,229 +1,157 @@
-# 49. Паттерны декомпозиции и коммуникации
+# 49. Микросервисы: decomposition, DDD, communication patterns
 
-Как правильно разделить систему на микросервисы. Как они общаются.
+## Зачем нужен systematic подход к decomposition
 
----
+Разработчик которому дали задачу «сделать микросервисы» обычно начинает делить систему очевидным способом. UI сервис. Business logic сервис. Data сервис. Или по entity — User service, Order service, Product service. Каждая CRUD-сущность превращается в отдельный микросервис. Результат — distributed monolith в лучшем случае. В худшем — chaotic набор сервисов requiring constant coordination.
 
-## 1. Проблема: где границы сервисов
+Разница между разработчиком «делящим на микросервисы» и «понимающим decomposition» проявляется через несколько лет operations. Первый заканчивает с 50 микросервисами tightly coupled — изменение business flow requires changes across 10 services deployed together. Второй знает про Domain-Driven Design bounded contexts — natural boundaries следуют business language differences. Знает что Product в Sales context отличается от Product в Warehouse context — это два разных aggregates в two разных services, не one shared entity forced в service boundary. Знает что sync HTTP chains anti-pattern — async events через bounded contexts правильный подход для inter-service communication.
 
-Плохое решение — по **техническим слоям**:
+В этом файле разберём decomposition through systematic lens. Проблема decomposition — где границы. DDD как methodology для finding boundaries. Bounded contexts key concept. Aggregates и их role. Decomposition strategies detailed. Database per service implications. Communication patterns comprehensively. API Gateway pattern. BFF for different clients. Strangler for legacy migration. Sidecar plus Ambassador patterns. Anti-corruption Layer для integration с legacy. API versioning стратегии. Service discovery. Configuration management. Distributed tracing. Best practices real-world proven.
+
+## Проблема: где границы сервисов
+
+Плохое решение по техническим слоям:
 ```
 UI-service, business-logic-service, data-service
 ```
-Каждый запрос идёт через все три → распределённый монолит, chained calls, latency.
 
-Правильное — по **бизнес-возможностям / доменам**:
+Каждый запрос идёт через все три — distributed monolith, chained sync calls, cumulative latency. Change в UI feature requires coordinated deploy across all layers. Boundaries совершенно неправильные — они following architectural pattern не business reality.
+
+Правильное — по business capabilities или domains:
 ```
 Orders, Payments, Inventory, Shipping, Notifications
 ```
-Каждый сервис = **complete vertical slice** (UI-hooks + business logic + own DB).
 
----
+Каждый сервис = complete vertical slice (UI hooks + business logic + own DB). Independent evolution. Business feature change contained within one или few services.
 
-## 2. DDD — Domain-Driven Design
+Vertical vs horizontal decomposition. Horizontal splits by technical layer. Vertical splits by business capability. Микросервисы should be vertical. Layers within microservice могут exist (controller, service, repository) но crossing service boundary should be business-driven.
 
-Методология, помогающая найти границы.
+## DDD как methodology
 
-Автор — Eric Evans (книга «Domain-Driven Design», 2003). Модна снова с приходом микросервисов.
+Domain-Driven Design разработан Eric Evans в 2003 году. Стал критически важен снова с приходом микросервисов. Provides systematic approach к finding meaningful boundaries.
 
-### 2.1 Ключевые понятия
+Ключевые concepts.
 
-- **Domain** — область бизнеса (e-commerce, банкинг, налоги).
-- **Subdomain** — часть домена (Orders, Inventory, Payment внутри e-commerce).
-- **Bounded Context** — граница языка/модели. Внутри — одна модель, снаружи — другая.
-- **Ubiquitous Language** — общий язык между разработчиками и бизнесом внутри одного контекста.
+Domain — область бизнеса. E-commerce, banking, taxes. High-level scope of business problem being solved.
 
-### 2.2 Bounded Context
+Subdomain — часть domain. Внутри e-commerce — orders, inventory, payments, shipping, marketing. Разбиение большого domain на manageable pieces.
 
-Ключевая идея.
+Bounded Context — граница языка и модели. Внутри — одна модель, снаружи — другая. Ключевая concept.
 
-Одна сущность может значить **разное** в разных контекстах:
-- В **Sales** контексте `Product` = имя, цена, картинка, описание.
-- В **Warehouse** контексте `Product` = SKU, вес, размер, местоположение.
-- В **Accounting** контексте `Product` = стоимость, налоговая ставка, cost center.
+Ubiquitous Language — общий язык между разработчиками и бизнесом внутри одного контекста. Terms mean same thing internally. Between contexts могут differ.
 
-Пытаться сделать один `Product` со всеми полями — **God object**. Правильно — **три отдельных класса Product** в трёх сервисах.
+Bounded Context — critical concept для understanding.
 
-Bounded context = **естественная граница микросервиса**.
+Одна сущность может значить разное в разных контекстах:
+- В Sales контексте Product = имя, цена, картинка, описание.
+- В Warehouse контексте Product = SKU, вес, размер, местоположение.
+- В Accounting контексте Product = стоимость, налоговая ставка, cost center.
 
-### 2.3 Aggregate
+Пытаться сделать один Product со всеми полями — God object. Grows uncontrollably. Different teams need different aspects. Changes ripple everywhere.
 
-**Aggregate** — консистентный кластер объектов, обрабатываемых как единое целое.
+Правильно — три отдельных класса Product в трёх сервисах. Каждый bounded context has own model reflecting local needs. Communication между contexts через explicit contracts, не shared entities.
 
-Пример: `Order` + `OrderItems`. Всегда сохраняются вместе, всегда валидируются вместе.
+Bounded context = естественная граница микросервиса. Not always one-to-one — bounded context sometimes contains multiple microservices если internal complexity warrants. But service boundary should never cross bounded context — creates coupling.
 
-Правила:
-- Один **aggregate root** — сущность, через которую доступ ко всему остальному.
-- Транзакция = один aggregate.
-- Между aggregates — только по ID (references), не по object references.
+Aggregate — консистентный кластер объектов обрабатываемых как единое целое.
 
-### 2.4 В ИСНА
+Пример. Order plus OrderItems. Always saved together, validated together, considered as one atomic unit. Business rules apply к whole aggregate.
 
-Bounded contexts (грубо):
-- **КНП** — Kabinet Nalogoplatelshika (пользовательский portal).
-- **ФНО** — формы налоговой отчётности.
-- **ФО** — формы отчётности.
-- **АРМ (tax-rep)** — рабочее место инспектора.
-- **ЕАЭС** — ЕАЭС-контур.
-- **NZ** — уведомления.
+Правила aggregates. Один aggregate root — сущность, через которую доступ ко всему остальному. Транзакция = один aggregate — сохранение atomic на уровне aggregate. Между aggregates — только по ID (references), не по object references — prevents transactional coupling.
 
-Внутри каждого — свой язык, своя модель, свои микросервисы.
+Aggregate size guidance. Small aggregates preferred. Contain only what needs to change together atomically. Large aggregates — lock contention, complex validation, hard-to-reason concurrent modifications.
 
----
+В КНП bounded contexts (примерно):
+- КНП — Kabinet Nalogoplatelshika (пользовательский portal).
+- ФНО — формы налоговой отчётности.
+- ФО — формы отчётности.
+- АРМ (tax-rep) — рабочее место инспектора.
+- ЕАЭС — ЕАЭС-контур.
+- NZ — уведомления.
 
-## 3. Декомпозиция стратегии
+Внутри каждого — свой язык, своя модель, свои микросервисы. Разбиение исторически happened based on business domains. Fits DDD naturally.
 
-### 3.1 By business capability
+## Стратегии decomposition
 
-Каждый сервис = отдельная бизнес-функция.
+By business capability. Каждый сервис = отдельная бизнес-функция. Мышление в терминах what business does not how technically implemented.
 
-Пример e-commerce:
-- Order Management.
-- Product Catalog.
-- Inventory.
-- Pricing.
-- Payment.
-- Shipping.
-- Customer Management.
-- Notifications.
-- Recommendations.
+Пример e-commerce. Order Management. Product Catalog. Inventory. Pricing. Payment. Shipping. Customer Management. Notifications. Recommendations. Каждая capability owned by team. Independent evolution.
 
-### 3.2 By subdomain (DDD-based)
+By subdomain (DDD-based). Более осмысленное разделение. Uses DDD subdomain analysis. Bounded contexts drive boundaries. More rigorous than raw capability listing.
 
-Похоже, но через bounded contexts. Более осмысленное разделение.
+By actor / user type. Разделение по типу пользователя. admin-service, customer-service, partner-service. Sometimes appropriate когда different user types have completely different workflows. Often less clean than capability-based.
 
-### 3.3 By actor / user type
+By volatility. Часто меняющиеся куски — отдельные (гибкий deploy). Стабильные — можно вместе. Optimization strategy — decompose parts requiring frequent iteration.
 
-Например: `admin-service`, `customer-service`, `partner-service`.
+Anti-patterns decomposition.
 
-### 3.4 By volatility
+По слоям (UI/BL/Data) — distributed monolith. Every user action requires calls across all layers. Not independent evolution.
 
-- Часто меняющиеся куски — отдельные (гибкий deploy).
-- Стабильные — можно вместе.
+CRUD-per-entity — micro-микросервисы для каждой таблицы. Chain of sync calls для business operations. High coordination overhead.
 
-### 3.5 Anti-patterns
+Технически или географически — по региону, DC. Не business-driven. Doesn't reflect actual system evolution needs.
 
-- **По слоям** (UI/BL/Data).
-- **CRUD-per-entity** (микро-микросервисы для каждой таблицы).
-- **Технически / географически** (не по бизнесу).
+## Database per service
 
----
+Правило микросервисов. Каждый сервис — своя schema (минимум). Идеально — своя БД. Нельзя читать/писать в чужую БД напрямую. Только через API или events.
 
-## 4. Database per service
+Проблема shared data. Customer info нужен в Orders, Payments, Shipping. Как handling без violating database-per-service?
 
-Обсуждали в `48-monolith-vs-microservices.md`. Ключевое:
+Решения.
 
-- Каждый сервис — **своя схема** (минимум).
-- Идеально — **своя БД**.
-- Нельзя читать/писать в чужую БД напрямую.
-- Только через API/events.
+API calls — синхронно спросить customer-service при each need. Проблема — coupling plus latency. Каждый order display requires call к customer-service. Load pattern amplified.
 
-### 4.1 Проблема: shared data
+Data duplication — каждый сервис держит свою копию нужных полей customer. Update через events (CustomerUpdated event → all subscribers update local copies). Slight data staleness acceptable. Autonomous services.
 
-Customer info нужен в Orders, Payments, Shipping.
+CDC (Change Data Capture) — Debezium читает WAL customer-service → пишет в Kafka → другие сервисы обновляют кэш. Automated propagation без explicit event publishing.
 
-Решения:
-- **API calls** — синхронно спросить customer-service. Проблема: coupling + latency.
-- **Data duplication** — каждый сервис держит свою копию нужных полей customer. Обновление через events.
-- **CDC** (Change Data Capture) — Debezium читает WAL customer-service → пишет в Kafka → другие сервисы обновляют кэш.
+Правило. Чуть-чуть дублирования — норма для микросервисов. Not violation DRY (Don't Repeat Yourself) — dublication for independence. Trade autonomy для minor storage overhead.
 
-**Правило**: **чуть-чуть дублирования** — норма для микросервисов.
+## Communication patterns comprehensively
 
----
+Sync via REST/HTTP — стандарт. JSON payloads. Всем понятно.
 
-## 5. Communication patterns
+Плюсы. Простота. Legacy compatibility. Universal tooling.
 
-### 5.1 Sync — REST / HTTP
+Минусы. Tight coupling — caller ждёт callee. Cascade failures. Latency (network plus serialization). Blocking threads waiting for response.
 
-**Стандарт** для request-response.
+Использование. Query data. Immediate response requests. Между UI-backend и микросервисами (outer edge).
 
-Плюсы:
-- Простота.
-- Всем понятно.
-- Легко debug.
+Sync via gRPC. Google RPC. HTTP/2 based. Protobuf serialization.
 
-Минусы:
-- Tight coupling (caller ждёт callee).
-- Cascade failures.
-- Latency (network + serialization).
+Плюсы. Быстрее REST (binary plus HTTP/2 multiplexing). Типобезопасно (schema). Streaming support (bidirectional streams). Auto-generated clients для multiple languages.
 
-Использование:
-- Query data.
-- Immediate response requests.
-- Между UI-backend и микросервисами.
+Минусы. Сложнее debug (binary format). Не работает из browser'а напрямую (нужен gRPC-Web proxy). Требует shared schemas managed carefully.
 
-### 5.2 Sync — gRPC
+Использование. Internal service-to-service где performance critical. High-throughput internal APIs. Streaming scenarios.
 
-Google RPC. Основан на HTTP/2 + Protobuf.
+Sync via GraphQL. Для UI backend — гибкие запросы. Клиент говорит какие поля нужны.
 
-Плюсы:
-- Быстрее REST (binary + HTTP/2 multiplexing).
-- Типобезопасно (schema).
-- Streaming.
+Плюсы. Клиент управляет data shape. Меньше over/under fetching. Single endpoint.
 
-Минусы:
-- Сложнее debug (binary).
-- Не работает из browser'а напрямую.
-- Требует shared schemas.
+Минусы. Сложность backend implementation. N+1 проблема без DataLoader. Кэширование сложнее REST.
 
-Использование: internal service-to-service, high-throughput.
+Использование. BFF (Backend for Frontend) для сложных UI. Rich mobile applications с многими different views over same data.
 
-### 5.3 Sync — GraphQL
+Async via Message broker (Rabbit/Kafka/SQS/NATS). Producer шлёт event → broker → Consumer(s).
 
-Для UI backend — гибкие запросы. Клиент говорит какие поля нужны.
+Плюсы. Decoupling — producer не знает о consumer. Buffering — пик нагрузки поглощается. Multiple consumers — pub-sub natural. Retry plus durability built into broker.
 
-Плюсы:
-- Клиент управляет data shape.
-- Меньше over/under fetching.
+Минусы. Eventual consistency. Сложнее debug (async traces). Требует broker infrastructure.
 
-Минусы:
-- Сложность backend.
-- N+1 проблема (нужен DataLoader).
-- Кэширование сложнее REST.
+Использование. Предпочтительно между backend сервисами. Events для state propagation. Fire-and-forget notifications.
 
-Использование: **BFF** (Backend for Frontend) для сложных UI.
+Async via Event streaming (Kafka). Event log — можно replay. Multiple consumers each со своим offset.
 
-### 5.4 Async — Message broker
+Плюсы. Event sourcing enable. Analytics pipelines. Multiple consumers each со своим processing.
 
-Rabbit / Kafka / SQS / NATS.
+Использование. Event-sourced systems. Analytics workloads. Historical event replay для new consumers.
 
-Producer шлёт event → broker → Consumer(s).
+Правило (Sam Newman, Chris Richardson). Sync REST только для outer edge (UI → gateway → services). Async events между backend services. gRPC internal high-throughput. Minimize sync chains (A → B → C → D → E — плохо).
 
-Плюсы:
-- **Decoupling** — producer не знает о consumer.
-- **Buffering** — пик нагрузки поглощается.
-- **Multiple consumers** — pub-sub.
-- **Retry / durability**.
+## API Gateway pattern
 
-Минусы:
-- Eventual consistency.
-- Сложнее debug (async trace).
-- Требует broker infrastructure.
-
-Использование: **предпочтительно между backend сервисами**. Events для state propagation.
-
-### 5.5 Async — Event streaming
-
-Kafka. **Event log** — можно replay.
-
-Плюсы:
-- Event sourcing.
-- Analytics.
-- Multiple consumers, каждый со своим offset.
-
-### 5.6 Правило (Sam Newman, Chris Richardson)
-
-- Sync REST только для **outer edge** (UI → gateway → services).
-- Async events между **backend services**.
-- gRPC internal high-throughput.
-- Minimize sync chains (A → B → C → D → E — плохо).
-
----
-
-## 6. API Gateway pattern
-
-**Единая точка входа** для внешних клиентов.
-
+Единая точка входа для внешних клиентов:
 ```
 Клиенты  ─────► [API Gateway]  ─────►  services
                        │
@@ -235,289 +163,255 @@ Kafka. **Event log** — можно replay.
                        └─ response aggregation
 ```
 
-### 6.1 Зачем
+Зачем.
 
-- Скрыть внутреннюю топологию.
-- Централизованная auth.
-- Rate limiting.
-- Cross-cutting concerns (logging, tracing).
-- Aggregation (собрать данные из нескольких сервисов в один response).
+Скрыть внутреннюю топологию. Клиенты не знают which services существуют. Refactoring services transparent для клиентов.
 
-### 6.2 Реализации
+Централизованная auth. Один place для authenticating requests. Services trust gateway's authentication.
 
-- **Kong** — популярный open-source.
-- **Envoy** — modern, service mesh backbone.
-- **Spring Cloud Gateway** — на Spring.
-- **Zuul 1 / 2** (Netflix) — legacy.
-- **AWS API Gateway** — managed.
-- **nginx** — простой gateway.
+Rate limiting. Уровень gateway easier to configure than in each service.
 
-**В ИСНА**: `isna-knp-gateway` = **Zuul 1** (Java 11, memory `knp-gateway-no-java21`).
+Cross-cutting concerns. Logging, tracing, metrics — implemented once в gateway.
 
-### 6.3 Кавет
+Aggregation. Собрать данные из нескольких сервисов в один response. UI request satisfied one API call вместо multiple.
 
-Gateway = **single point of failure** для внешнего трафика. HA обязательна.
+Реализации. Kong — популярный open-source. Envoy — modern, service mesh backbone. Spring Cloud Gateway — на Spring. Zuul 1 / 2 (Netflix) — legacy. AWS API Gateway — managed. nginx — простой gateway.
 
-Не превращать в бизнес-логику. Только routing/cross-cutting.
+В КНП — isna-knp-gateway = Zuul 1 (Java 11, memory knp-gateway-no-java21). Legacy tech. Migration planned но complex.
 
----
+Caveat. Gateway = single point of failure для внешнего трафика. HA обязательна — multiple instances, load balanced.
 
-## 7. BFF — Backend For Frontend
+Не превращать в бизнес-логику. Только routing и cross-cutting concerns. Business logic в services. Gateway thin.
 
-Отдельный API Gateway для **каждого типа клиента**:
+## BFF: Backend For Frontend
+
+Отдельный API Gateway для каждого типа клиента:
 - BFF for Web.
 - BFF for Mobile.
 - BFF for Partners.
 
-```
-Web UI       →  BFF-Web    ─┐
-Mobile app   →  BFF-Mobile ─┼──►  Services
-Partners     →  BFF-API    ─┘
-```
+Каждый BFF оптимизирует API под свой клиент. Aggregate запросы appropriately для that client type. Разные data shapes.
 
-Каждый BFF:
-- Оптимизирует API под свой клиент.
-- Aggregate запросы.
-- Разные data shapes.
+Плюсы. Клиент-специфичная оптимизация. Меньше over/under fetching. Frontend команды владеют своим BFF.
 
-Плюсы:
-- Клиент-специфичная оптимизация.
-- Меньше over/under fetching.
-- Frontend команды владеют своим BFF.
+Минусы. Дублирование логики между BFFs. Больше сервисов to manage.
 
-Минусы:
-- Дублирование логики.
-- Больше сервисов.
+Использование. Когда клиенты сильно отличаются (rich desktop web vs mobile with limited data). Simple API sufficient — one gateway достаточно.
 
-Использование: когда клиенты сильно отличаются.
+## Strangler Fig pattern
 
----
+Уже упомянут в файле 48. Здесь глубже. Название от strangler fig — растение обвивающее дерево и постепенно его убивающее.
 
-## 8. Strangler Fig pattern
+Шаг 0. Legacy monolith serving traffic.
 
-Уже упомянул в `48-monolith-vs-microservices.md`. Здесь глубже.
-
-Название от **strangler fig** — растение, обвивающее дерево и постепенно его убивающее.
-
-### 8.1 Схема
-
-Шаг 0: Legacy monolith.
-```
-Client → Monolith
-```
-
-Шаг 1: API Gateway перед монолитом.
+Шаг 1. API Gateway перед monolith:
 ```
 Client → Gateway → Monolith
 ```
 
-Шаг 2: Выделяем **Feature A** в новый microservice.
+Шаг 2. Выделяем Feature A в новый microservice:
 ```
 Client → Gateway → { Feature A → New Service }
                   { Everything else → Monolith }
 ```
 
-Шаг 3-N: постепенно другие features.
+Шаг 3-N. Постепенно другие features migrate.
 
-Шаг Final: Monolith пустой → удаляем.
+Final. Monolith пустой — удаляем.
 
-### 8.2 Практические советы
+Практические советы.
 
-- Начинай с **stable** features (не под активной разработкой).
-- Или наоборот — **самые проблемные** (получаешь value быстро).
-- **Не переписывай 1-в-1** — используй возможность улучшить.
-- **Data migration** — сложный шаг, может занять больше кода.
-- **Rollback** должен работать в каждый момент.
+Начинай с stable features (не под активной разработкой). Or наоборот — самые проблемные (получаешь value быстро от improvements).
 
----
+Не переписывай 1-в-1. Migration opportunity для improving architecture, cleaning tech debt.
 
-## 9. Sidecar pattern
+Data migration — сложный шаг. Часто занимает больше кода чем service logic itself. Plan carefully.
 
-**Sidecar** — контейнер, добавляемый в pod рядом с основным.
+Rollback должен работать в каждый момент. Gateway routing allows quick reversal — flip traffic обратно к monolith при issues.
 
-Пример: **service mesh** (Istio, Linkerd) добавляет **Envoy** proxy как sidecar. Envoy перехватывает весь traffic → добавляет mTLS, retry, circuit breaker, metrics.
+Timeline realistic. Significant migrations take 2-5 years. Overnight rewrites for large monoliths не realistic.
 
-Плюсы:
-- Cross-cutting concerns вне приложения.
-- Language-agnostic.
-- Централизованное управление.
+## Sidecar pattern
 
-Минусы:
-- Overhead (extra процесс).
-- Дополнительная complexity.
+Sidecar — контейнер добавляемый в pod рядом с основным. Shares network, IPC, volumes с main container.
 
----
+Пример service mesh (Istio, Linkerd) добавляет Envoy proxy как sidecar. Envoy перехватывает весь traffic — добавляет mTLS, retry, circuit breaker, metrics.
 
-## 10. Ambassador pattern
+Плюсы. Cross-cutting concerns вне приложения. Language-agnostic — same sidecar works с Java, Python, Go services. Централизованное управление через platform.
 
-Похож на sidecar, но для **outbound** communication.
+Минусы. Overhead (extra процесс per pod). Дополнительная complexity troubleshooting.
 
-Ambassador proxy обрабатывает исходящие вызовы: retry, load balancing, service discovery.
+Полезно когда consistent infrastructure concerns нужны across polyglot services. Enterprise Kubernetes deployments часто используют service mesh sidecars.
 
-Клиент вызывает `localhost:9999`, ambassador разбирается.
+## Ambassador pattern
 
-Часто = sidecar Envoy в service mesh.
+Похож на sidecar но для outbound communication.
 
----
+Ambassador proxy обрабатывает исходящие вызовы — retry, load balancing, service discovery.
 
-## 11. Anti-corruption Layer (ACL)
+Клиент вызывает localhost:9999, ambassador разбирается со сложностью outbound routing.
 
-Изолирует **новый чистый bounded context** от **legacy**.
+Часто = sidecar Envoy в service mesh. Terminology overlaps — implementation similar, concept differentiated by direction.
 
+## Anti-Corruption Layer
+
+ACL изолирует новый чистый bounded context от legacy:
 ```
 [Clean new service] → [ACL] → [Ugly legacy]
                          │
                          └─ переводит терминологию legacy в новую
 ```
 
-Если бы новый сервис напрямую вызывал legacy — заразился бы legacy-концепциями.
+Если бы новый сервис напрямую вызывал legacy — заразился бы legacy-концепциями. Ugly names, weird semantics, historical baggage would leak в clean new codebase.
 
-ACL — переводчик. Новый сервис знает только clean model.
+ACL — переводчик. Новый сервис знает только clean model. ACL adapts к legacy API. Isolation preserved.
 
----
+Common pattern при Strangler migration. Legacy monolith not disappearing overnight. New services need to communicate с it. ACL wraps legacy interactions cleanly.
 
-## 12. API versioning
+## API versioning
 
-Как менять API без ломки клиентов.
+Как менять API без ломки клиентов. Multiple approaches.
 
-### 12.1 URI versioning
-
+URI versioning:
 ```
 /v1/orders
 /v2/orders
 ```
 
-Простой, видимый.
+Простой, видимый в logs, easy to route.
 
-### 12.2 Header versioning
-
+Header versioning:
 ```
 Accept: application/vnd.myapi.v2+json
 ```
 
-Чище URL, но менее видимо.
+Чище URL. Content negotiation через HTTP semantics. Less visible в quick log inspection.
 
-### 12.3 Query param
-
+Query param:
 ```
 /orders?version=2
 ```
 
-Гибко, но некрасиво.
+Гибко, но не clean. Some argue anti-pattern.
 
-### 12.4 Backward compatibility правила
+Backward compatibility rules.
 
-- **Adding** поля — safe (клиенты игнорируют).
-- **Removing** — breaking.
-- **Changing** тип / semantics — breaking.
-- **Renaming** — breaking.
+Adding fields — safe. Клиенты старой версии ignore new fields.
 
-Правило: **добавлять, не удалять**. Deprecated пометки, удаление через major version.
+Removing fields — breaking. Old clients expect these.
 
-### 12.5 Consumer-driven contracts
+Changing type или semantics — breaking. Same field name с different meaning особенно opsсно.
 
-**Spring Cloud Contract**, **Pact** — producer генерирует stubs, consumer использует. Гарантия что producer не сломал contract.
+Renaming — breaking. Same as remove plus add.
 
----
+Правило. Добавлять, не удалять. Deprecated пометки для fields going away. Удаление через major version bump. Long deprecation windows.
 
-## 13. Service discovery
+Consumer-driven contracts. Spring Cloud Contract, Pact — producer генерирует stubs, consumer использует. Гарантия что producer не сломал contract expected clients.
 
-Как сервисы находят друг друга.
+## Service discovery
 
-- **Client-side** — Consul, Eureka. Клиент сам выбирает инстанс.
-- **Server-side** — LB (K8s Service, nginx). Клиент шлёт на VIP.
+Как сервисы находят друг друга. Two main approaches.
 
-См. файлы `11-consul-detailed.md`, `31-load-balancer.md`.
+Client-side — Consul, Eureka. Клиент сам знает про all instances, выбирает один по algorithm. Каждый service instance registers на startup. Clients query registry, cache locally. Load balancing decided at client. See file 11 for Consul details.
 
----
+Server-side — LB (K8s Service, nginx). Клиент шлёт на VIP (Virtual IP). LB behind picks actual instance. Simpler для clients. Central LB может become bottleneck. See file 31 for load balancer details.
 
-## 14. Configuration management
+## Configuration management
 
-- **Config files** (application.yml) — базово.
-- **Env variables** — для 12-factor apps.
-- **Spring Cloud Config** — централизованный сервер.
-- **Consul KV / etcd**.
-- **Kubernetes ConfigMap / Secret**.
-- **HashiCorp Vault** — секреты.
+Config files (application.yml) — базово. Static config compiled с service.
 
-Правило: код одинаковый для всех env, отличается только configuration.
+Env variables — 12-factor apps style. Config injected via environment. Different values per deployment без rebuild.
 
----
+Spring Cloud Config — централизованный сервер. Git-backed configuration. Refresh при updates. See file 36 for details.
 
-## 15. Distributed tracing
+Consul KV / etcd — distributed KV stores. Dynamic configuration. Watched через listeners для immediate updates.
 
-Уже обсуждали в `36-spring-cloud.md`. Один запрос идёт через N сервисов — как отследить?
+Kubernetes ConfigMap / Secret — K8s-native. Mounted as files или env vars в pods. Managed через K8s API.
 
-**TraceId + SpanId** — прокидываются через все сервисы (HTTP headers, Kafka headers, MDC).
+HashiCorp Vault — secrets management. Encrypted at rest. Access controlled через policies. Rotation supported.
 
-Экспорт в **Zipkin / Jaeger / OpenTelemetry** — визуализация.
+Правило. Код одинаковый для всех environments. Configuration изменяется. Enables reproducible deployments.
 
----
+## Distributed tracing
 
-## 16. Централизованный logging
+Уже обсуждали в файле 36. Один запрос идёт через N сервисов — как отследить?
 
-Обсуждали в `38-logging.md`. Каждый сервис → JSON logs → Filebeat → **ELK**.
+TraceId plus SpanId прокидываются через все сервисы (HTTP headers, Kafka headers, MDC). Каждый service creates spans для work done. Parent-child relationships between spans form trace tree.
 
-Correlation ID для поиска цепочки.
+Экспорт в Zipkin / Jaeger / OpenTelemetry — visualization tools. Full request path visible. Timing breakdown per service. Errors correlated с specific spans.
 
----
+Sampling для reducing overhead. 100% tracing expensive для high-volume services. 10% sampling captures patterns без overwhelming infrastructure.
 
-## 17. Distributed data patterns (краткое напоминание)
+## Централизованное logging
 
-Разберём подробно в `50-saga-pattern.md`.
+Обсуждали в файле 38. Каждый сервис → JSON logs → Filebeat → ELK.
 
-- **Saga** — distributed tx через compensation.
-- **Outbox** — atomic DB commit + publish (следующий файл 51).
-- **CQRS** — split read/write.
-- **Event Sourcing** — хранить events.
-- **CDC** — Change Data Capture (Debezium).
+Correlation ID (traceId) в logs enables tracing plus logs correlation. Search by traceId shows all logs of specific request across services.
 
----
+Structured JSON format преферентен для machine parsing. Easier to query in Kibana. Less error-prone than regex parsing text logs.
 
-## 18. Best practices
+## Distributed data patterns — brief
 
-1. **Bounded context** для границ сервисов.
-2. **Database per service**.
-3. **Async events** > sync между backend.
-4. **API Gateway** для внешних клиентов.
-5. **Circuit Breakers + timeouts + retry** everywhere (см. `52-microservices-resilience.md`).
-6. **Distributed tracing** обязательно.
-7. **CI/CD per service** независимо.
-8. **Backward compatible** APIs.
-9. **Contract testing** (Pact/Spring Cloud Contract).
-10. **Idempotency** для всех write ops.
+Разберём подробно в файле 50.
 
----
+Saga — distributed tx через compensation. Долгие процессы crossing multiple services.
 
-## 19. Собесные вопросы
+Outbox — atomic DB commit + publish (файл 51). Reliable event publishing.
 
-1. **Что такое bounded context?** — Граница модели/языка; естественная граница микросервиса.
-2. **Что такое aggregate в DDD?** — Кластер объектов, транзакционно консистентный; один aggregate root.
-3. **Как декомпозировать монолит?** — По бизнес-возможностям / bounded context, не по слоям.
-4. **Что такое API Gateway?** — Единая точка входа для клиентов; routing, auth, rate limit.
-5. **Что такое BFF?** — Backend for Frontend; отдельный gateway на каждый тип клиента.
-6. **Sync vs Async communication?** — Sync (REST/gRPC) для immediate; async (events) для state propagation.
-7. **Что такое Strangler pattern?** — Постепенное вытеснение legacy микросервисами через gateway.
-8. **Что такое CQRS?** — Разделение read и write моделей.
-9. **Event sourcing?** — Хранить events, не state; audit + replay.
-10. **Что такое CDC?** — Change Data Capture — читать WAL БД → публиковать events (Debezium).
-11. **Service mesh — зачем?** — Sidecar proxy (Envoy) для cross-cutting concerns (mTLS, retry, metrics).
-12. **Как версионировать API?** — URI (/v1, /v2), header, query. Backward compatible additions only.
-13. **Что такое contract testing?** — Producer генерирует stubs; consumer тестируется против stubs; Pact/Spring Cloud Contract.
-14. **Database per service — почему?** — Изоляция schema, свобода эволюции; требует Saga/Outbox для consistency.
-15. **Как избежать shared data problem?** — API calls (coupling), data duplication (events), CDC.
+CQRS — split read/write. Different models для different access patterns.
 
----
+Event Sourcing — хранить events. Full history plus replay.
 
-## Итог
+CDC — Change Data Capture (Debezium). Database changes → events без explicit publishing.
 
-- **DDD + bounded context** = основа для границ.
-- **По бизнес-возможностям**, не по техническим слоям.
-- **Database per service** — правило.
-- **Async events** предпочтительно; sync только где нужно.
-- **API Gateway** для внешнего входа; **BFF** для разных клиентов.
-- **Strangler** для миграции монолита.
-- **Sidecar / Ambassador / ACL** — architectural patterns.
-- **Contract testing** + **distributed tracing** обязательны.
+## Best practices
 
-Следующий — `50-saga-pattern.md`.
+Bounded context для границ сервисов. DDD analysis provides principled boundaries.
+
+Database per service. Autonomy плюс independent evolution.
+
+Async events преферентно между backend. Sync только через API Gateway для outer edge.
+
+API Gateway для внешних клиентов. Cross-cutting concerns centralized.
+
+Circuit Breakers, timeouts, retry everywhere. See file 52 for resilience patterns.
+
+Distributed tracing обязательно. Without it — impossible troubleshoot distributed systems.
+
+CI/CD per service независимо. Team autonomy. Fast iteration.
+
+Backward compatible APIs. Deprecation cycles. Never break clients without notice.
+
+Contract testing (Pact или Spring Cloud Contract). Catches breaking changes early.
+
+Idempotency для всех write ops. Retry-safe operations. Handle duplicates gracefully.
+
+## Итоги
+
+Decomposition решает проблему где границы сервисов. Wrong boundaries → distributed monolith. Right boundaries → autonomous services.
+
+DDD provides methodology. Bounded contexts natural boundaries. Ubiquitous language plus aggregates guide design decisions.
+
+Decomposition strategies. By business capability. By subdomain (DDD-based). By actor. By volatility. Not by technical layers or per-entity.
+
+Database per service — autonomy imperative. Shared data managed через API calls, duplication, или CDC.
+
+Communication. Sync REST outer edge. gRPC high-performance internal. GraphQL rich UI. Async events preferred между backend services.
+
+API Gateway centralizes cross-cutting concerns. Hides internal topology. BFF variant для different client types.
+
+Strangler pattern для gradual migration legacy к microservices. Incremental replacement.
+
+Sidecar/Ambassador patterns для infrastructure concerns via co-located proxies. Service mesh through sidecars.
+
+Anti-Corruption Layer isolates new services от legacy semantics.
+
+API versioning через URI, headers, или query params. Backward compatibility rules. Contract testing enforces stability.
+
+Configuration through env vars, config servers, K8s ConfigMap, or Vault. Code identical across envs.
+
+Distributed tracing plus centralized logging обязательны. Without observability — cannot operate distributed systems.
+
+Best practices — bounded contexts, database per service, async events, API Gateway, resilience patterns, contract testing, idempotency. Все mutually reinforcing.
+
+Дальше — Saga pattern deeply для distributed transactions across services.
