@@ -1,34 +1,22 @@
-# 27. Spring Security + OAuth2 + Keycloak в проде
+# 27. Spring Security плюс OAuth2 плюс Keycloak в production
 
-Как правильно настроить Spring Security как OAuth2 Resource Server с Keycloak. Прод-грейд.
+## Роли Spring Boot приложения в OAuth2
 
----
+Микросервис на Spring Boot может играть разные роли в OAuth2 инфраструктуре. Понимание этих ролей определяет выбор dependencies и конфигурации.
 
-## 1. Роли Spring Boot приложения в OAuth2
+OAuth2 Resource Server это наиболее частая роль. Приложение принимает Bearer токены от вызывающих клиентов, проверяет их валидность, извлекает authorities для authorization. Не занимается процессом получения tokens — это ответственность authorization server. Большинство backend микросервисов в КНП именно Resource Server — принимают tokens и обслуживают API запросы.
 
-Spring Boot микросервис может быть:
+OAuth2 Client роль для приложений которые сами инициируют OAuth2 flow — например BFF backend for frontend получающий tokens для UI, или backend integration получающий tokens для вызова downstream сервисов через Client Credentials.
 
-1. **OAuth2 Resource Server** — принимает Bearer-токены, проверяет, авторизует. **Самый частый случай** для API.
-2. **OAuth2 Client** — сам инициирует OAuth2 flow (для UI backend).
-3. **Login клиент** — обычная web-app с OIDC login.
+Login клиент это специализированная роль обычной web-app с server-side login через OIDC. Пользователь logs in через redirect на authorization server, приложение получает tokens, устанавливает session. Классический server-rendered UI application.
 
-Разные стартеры:
-```gradle
-// Resource Server (для API)
-implementation 'org.springframework.boot:spring-boot-starter-oauth2-resource-server'
+Соответствующие Spring Boot starters. spring-boot-starter-oauth2-resource-server для Resource Server функциональности — валидация JWT, извлечение authorities, integration с Spring Security. spring-boot-starter-oauth2-client для Client функциональности — инициация OAuth2 flows, управление tokens, интерцепция HTTP запросов для добавления Authorization header.
 
-// Client (для инициации flow / Login)
-implementation 'org.springframework.boot:spring-boot-starter-oauth2-client'
-```
+Приложение может играть несколько ролей одновременно. Backend integration может быть и Resource Server (принимает tokens от frontend) и Client (получает tokens для downstream calls). В этом случае подключаются оба starters.
 
-В ИСНА большинство микросервисов = **Resource Server**.
+## Настройка Resource Server с JWT
 
----
-
-## 2. Настройка Resource Server (JWT)
-
-### 2.1 Минимальная
-
+Минимальная конфигурация Resource Server требует одну строку в application.yml:
 ```yaml
 spring:
   security:
@@ -38,20 +26,11 @@ spring:
           issuer-uri: https://keycloak.isna/realms/knp
 ```
 
-Spring:
-1. Читает `.well-known/openid-configuration` от `issuer-uri`.
-2. Из discovery берёт `jwks_uri`.
-3. Настраивает `JwtDecoder` (NimbusJwtDecoder).
-4. Регистрирует `BearerTokenAuthenticationFilter` в цепочке.
+Spring автоматически выполняет несколько шагов при старте. Читает discovery document от issuer-uri через путь .well-known/openid-configuration. Из discovery берёт jwks_uri содержащий публичные ключи. Настраивает JwtDecoder использующий NimbusJwtDecoder из библиотеки Nimbus JWT. Регистрирует BearerTokenAuthenticationFilter в security filter chain для перехвата Authorization headers.
 
-Всё. Каждый входящий запрос:
-1. Извлекает `Authorization: Bearer ...`.
-2. Проверяет JWT (подпись, exp, iss, aud).
-3. Валиден → создаёт `JwtAuthenticationToken`, кладёт в SecurityContext.
-4. Не валиден → 401.
+Каждый входящий HTTP запрос обрабатывается следующим образом. Filter извлекает Authorization header, ищет Bearer prefix, извлекает token. JwtDecoder проверяет подпись через ключи из JWKS, валидирует стандартные claims включая expiration и issuer. При успехе создаётся JwtAuthenticationToken с extracted authorities, помещается в SecurityContext. При неудаче — 401 Unauthorized в response.
 
-### 2.2 Минимальная security config
-
+Минимальная SecurityFilterChain для Resource Server:
 ```java
 @Configuration
 @EnableWebSecurity
@@ -66,22 +45,20 @@ public class SecurityConfig {
                 .requestMatchers("/actuator/**").permitAll()
                 .anyRequest().authenticated())
             .oauth2ResourceServer(o -> o.jwt(Customizer.withDefaults()));
-
         return http.build();
     }
 }
 ```
 
-Готово! Все endpoints требуют валидный JWT.
+Этого достаточно для функционального Resource Server. Каждый endpoint кроме /actuator требует валидный JWT. Токен парсится, но по default только scope claim используется для authorities что обычно неподходяще для Keycloak.
 
----
+## Проблема Keycloak roles в JWT
 
-## 3. Проблема: Keycloak roles в JWT
-
-Keycloak кладёт роли специфично:
+Keycloak размещает роли в специфической структуре не понимаемой Spring по default:
 ```json
 {
-    "sub": "berik",
+    "sub": "b3f2a1c4-...",
+    "preferred_username": "berik",
     "realm_access": {
         "roles": ["admin", "user"]
     },
@@ -93,113 +70,99 @@ Keycloak кладёт роли специфично:
 }
 ```
 
-Spring по умолчанию читает `scope` claim → создаёт `SCOPE_read`, `SCOPE_write`. Keycloak-роли не подхватываются.
+Spring читает только claim scope преобразуя values в authorities с prefix SCOPE_. Keycloak роли из realm_access и resource_access полностью игнорируются. Endpoints с @PreAuthorize hasRole или hasAuthority на Keycloak роли не будут работать — Spring просто не видит эти роли как authorities.
 
-### 3.1 Кастомный JwtAuthenticationConverter
+Решение — custom JwtAuthenticationConverter преобразующий Keycloak-specific claims в стандартные Spring authorities. Converter получает Jwt объект (decoded token) и должен вернуть Collection GrantedAuthority.
 
+Реализация. Извлечь realm_access claim как Map. Из него извлечь roles как List. Каждую роль преобразовать в SimpleGrantedAuthority с prefix ROLE_ (для использования через hasRole). Извлечь resource_access как Map. Из него извлечь конкретного client (например isna-knp-integration) как Map. Из client access извлечь roles как List. Каждую роль преобразовать в SimpleGrantedAuthority без prefix (для использования через hasAuthority).
+
+Пример полного converter:
 ```java
 @Bean
 JwtAuthenticationConverter jwtAuthenticationConverter() {
     JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
     converter.setJwtGrantedAuthoritiesConverter(jwt -> {
-        Collection<GrantedAuthority> auths = new ArrayList<>();
-
-        // realm roles
+        Collection<GrantedAuthority> authorities = new ArrayList<>();
+        
         Map<String, Object> realmAccess = jwt.getClaim("realm_access");
         if (realmAccess != null) {
             List<String> roles = (List<String>) realmAccess.get("roles");
             if (roles != null) {
-                roles.forEach(r -> auths.add(new SimpleGrantedAuthority("ROLE_" + r)));
+                roles.forEach(r -> 
+                    authorities.add(new SimpleGrantedAuthority("ROLE_" + r)));
             }
         }
-
-        // client roles for this app
+        
         Map<String, Object> resourceAccess = jwt.getClaim("resource_access");
         if (resourceAccess != null) {
-            Map<String, Object> clientAccess = (Map<String, Object>) resourceAccess.get("isna-knp-integration");
+            Map<String, Object> clientAccess = 
+                (Map<String, Object>) resourceAccess.get("isna-knp-integration");
             if (clientAccess != null) {
                 List<String> roles = (List<String>) clientAccess.get("roles");
                 if (roles != null) {
-                    roles.forEach(r -> auths.add(new SimpleGrantedAuthority(r)));
+                    roles.forEach(r -> 
+                        authorities.add(new SimpleGrantedAuthority(r)));
                 }
             }
         }
-
-        return auths;
+        
+        return authorities;
     });
     return converter;
 }
 ```
 
-Теперь:
-- `realm_access.roles` = `["admin"]` → authority `ROLE_admin` (можно `hasRole("admin")`).
-- `resource_access.isna-knp-integration.roles` = `["CREATE_FNO"]` → authority `CREATE_FNO` (можно `hasAuthority("CREATE_FNO")`).
-
-### 3.2 Подключить converter
-
+Подключение converter к SecurityFilterChain:
 ```java
-@Bean
-SecurityFilterChain filter(HttpSecurity http, JwtAuthenticationConverter conv) throws Exception {
-    http
-        // ...
-        .oauth2ResourceServer(o -> o.jwt(jwt -> jwt.jwtAuthenticationConverter(conv)));
-    return http.build();
+http.oauth2ResourceServer(o -> 
+    o.jwt(jwt -> jwt.jwtAuthenticationConverter(conv)));
+```
+
+После этого работают проверки. hasRole("admin") проверяет наличие authority ROLE_admin из realm roles. hasAuthority("CREATE_FNO") проверяет наличие CREATE_FNO из client roles. Оба стиля работают одновременно позволяя гибкую авторизацию.
+
+## Использование в коде
+
+Аутентифицированные пользователи доступны в коде через несколько способов. Самый простой — @AuthenticationPrincipal в контроллере:
+```java
+@PostMapping
+@PreAuthorize("hasAuthority('CREATE_FNO')")
+public Fno create(@RequestBody FnoDto dto, @AuthenticationPrincipal Jwt jwt) {
+    String username = jwt.getSubject();
+    String email = jwt.getClaimAsString("email");
+    return svc.create(dto, username);
 }
 ```
 
----
+Автоматическая injection Jwt объекта содержащего все decoded claims. Методы getSubject, getClaimAsString, getClaimAsMap для типизированного доступа. Никакого manual парсинга.
 
-## 4. Использование
-
-### 4.1 В контроллере
-
+Из service слоя доступ через SecurityContextHolder:
 ```java
-@RestController
-@RequestMapping("/api/fno")
-class FnoController {
-
-    @PostMapping
-    @PreAuthorize("hasAuthority('CREATE_FNO')")
-    public Fno create(@RequestBody FnoDto dto, @AuthenticationPrincipal Jwt jwt) {
-        String username = jwt.getSubject();
-        return svc.create(dto, username);
-    }
-
-    @GetMapping("/{id}")
-    @PreAuthorize("hasRole('user')")
-    public Fno get(@PathVariable Long id) {
-        return svc.get(id);
-    }
-
-    @DeleteMapping("/{id}")
-    @PreAuthorize("hasRole('admin')")
-    public void delete(@PathVariable Long id) {
-        svc.delete(id);
-    }
-}
+Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+Jwt jwt = (Jwt) auth.getPrincipal();
+String userId = jwt.getSubject();
 ```
 
-### 4.2 В сервисе
+Полезно когда security context нужен не в контроллере а глубоко в бизнес-логике. Thread-local природа SecurityContext означает автоматическую доступность в текущем request thread.
 
+Method Security через @PreAuthorize даёт декларативную авторизацию:
 ```java
-@Service
-class MyService {
+@PreAuthorize("hasRole('user')")
+public Fno get(@PathVariable Long id) { ... }
 
-    void doWork() {
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        Jwt jwt = (Jwt) auth.getPrincipal();
-        String userId = jwt.getSubject();
-        String email = jwt.getClaimAsString("email");
-        // ...
-    }
-}
+@PreAuthorize("hasRole('admin')")
+public void delete(@PathVariable Long id) { ... }
+
+@PreAuthorize("hasAuthority('CREATE_FNO') and #dto.userId == authentication.name")
+public Fno create(@RequestBody FnoDto dto) { ... }
 ```
 
----
+Комбинации через and, or, not. Доступ к method arguments через #argName. Доступ к authentication через authentication SpEL variable. Мощный механизм для fine-grained authorization.
 
-## 5. Настройка проверок JWT
+## Дополнительные проверки JWT
 
-Дополнительно:
+Стандартные проверки выполняемые Spring — signature validity через public keys из JWKS, expiration через exp claim, not-before через nbf claim, issuer через iss claim (если задано в issuer-uri).
+
+Audience валидация проверяет что токен предназначен для этого resource server. Настройка через свойство:
 ```yaml
 spring:
   security:
@@ -208,10 +171,12 @@ spring:
         jwt:
           issuer-uri: https://keycloak.isna/realms/knp
           audiences:
-            - isna-knp-integration           # проверка aud
+            - isna-knp-integration
 ```
 
-Или программно:
+При настроенных audiences Spring проверяет что aud claim в токене содержит один из указанных значений. Иначе токен отклоняется.
+
+Программная настройка через custom JwtDecoder для complex сценариев:
 ```java
 @Bean
 JwtDecoder jwtDecoder(@Value("${issuer}") String issuer) {
@@ -224,23 +189,20 @@ JwtDecoder jwtDecoder(@Value("${issuer}") String issuer) {
 }
 ```
 
-`createDefault()` уже проверяет `exp`, `nbf`, `iss` (если задано).
+JwtValidators.createDefault включает проверки exp и nbf. Custom validators добавляются для audience, custom claims, business specific validation.
 
----
+## OAuth2 Client для вызовов между сервисами
 
-## 6. OAuth2 Client — вызовы других сервисов
+Микросервис isna-knp-integration должен вызвать isna-knp-user API. Для этого нужен valid access token, получаемый через Client Credentials flow.
 
-Микросервис `isna-knp-integration` хочет позвать `isna-knp-user`. Нужен токен.
-
-### 6.1 Client Credentials
-
+Конфигурация client registration:
 ```yaml
 spring:
   security:
     oauth2:
       client:
         registration:
-          isnaknpuser-client:
+          knp-service-client:
             client-id: isna-knp-integration-service
             client-secret: ${KEYCLOAK_SECRET}
             authorization-grant-type: client_credentials
@@ -250,32 +212,34 @@ spring:
             issuer-uri: https://keycloak.isna/realms/knp
 ```
 
-### 6.2 Использование через RestClient (Boot 3.2+)
-
+OAuth2AuthorizedClientManager это компонент управляющий tokens для клиентов. Автоматически получает новые tokens при истечении, кэширует до expiration:
 ```java
 @Bean
 OAuth2AuthorizedClientManager auth2ClientManager(
         ClientRegistrationRepository clientRegistrationRepository,
         OAuth2AuthorizedClientRepository authorizedClientRepository) {
-
-    OAuth2AuthorizedClientProvider authorizedClientProvider =
+    
+    OAuth2AuthorizedClientProvider provider =
         OAuth2AuthorizedClientProviderBuilder.builder()
             .clientCredentials()
             .build();
-
+    
     DefaultOAuth2AuthorizedClientManager manager =
         new DefaultOAuth2AuthorizedClientManager(
             clientRegistrationRepository, authorizedClientRepository);
-    manager.setAuthorizedClientProvider(authorizedClientProvider);
+    manager.setAuthorizedClientProvider(provider);
     return manager;
 }
+```
 
+Использование через RestClient с interceptor автоматически добавляющим Bearer token:
+```java
 @Bean
 RestClient restClient(OAuth2AuthorizedClientManager manager) {
     return RestClient.builder()
         .requestInterceptor((req, body, exec) -> {
             OAuth2AuthorizeRequest authReq = OAuth2AuthorizeRequest
-                .withClientRegistrationId("isnaknpuser-client")
+                .withClientRegistrationId("knp-service-client")
                 .principal("system")
                 .build();
             OAuth2AuthorizedClient client = manager.authorize(authReq);
@@ -286,58 +250,53 @@ RestClient restClient(OAuth2AuthorizedClientManager manager) {
 }
 ```
 
-Теперь `restClient` автоматом получает токен + добавляет в header.
+Каждый исходящий запрос через этот RestClient автоматически имеет Authorization header с valid access token. Обработка refresh скрыта в OAuth2AuthorizedClientManager.
 
-### 6.3 Feign + OAuth2
-
-Для Feign — RequestInterceptor:
+Feign integration через RequestInterceptor работает аналогично:
 ```java
 @Component
 class OAuth2FeignRequestInterceptor implements RequestInterceptor {
-
     @Autowired OAuth2AuthorizedClientManager manager;
-
+    
     public void apply(RequestTemplate template) {
         OAuth2AuthorizeRequest req = OAuth2AuthorizeRequest
-            .withClientRegistrationId("isnaknpuser-client")
+            .withClientRegistrationId("knp-service-client")
             .principal("system")
             .build();
         OAuth2AuthorizedClient client = manager.authorize(req);
-        template.header("Authorization", "Bearer " + client.getAccessToken().getTokenValue());
+        template.header("Authorization", 
+            "Bearer " + client.getAccessToken().getTokenValue());
     }
 }
 ```
 
-Регистрируется как `RequestInterceptor` в Feign config.
+## Пропагация user token
 
-### 6.4 Пропагация user token
+Иногда downstream сервис должен видеть оригинального пользователя не service account. Например для audit purposes или user-specific логики. Пропагация user token означает переиспользование JWT текущего пользователя в исходящих запросах.
 
-Если сервис вызывается от имени пользователя — переиспользовать его токен:
-
+Извлечение user token из SecurityContext:
 ```java
 Jwt jwt = (Jwt) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
 String userToken = jwt.getTokenValue();
-
-// добавить в исходящий запрос
 ```
 
-Пропагация — важно для аудита: downstream видит того же пользователя.
-
----
-
-## 7. Тестирование
-
-### 7.1 С mock JWT
-
+Использование в исходящем запросе:
 ```java
-@Test
-@WithMockJwt(subject = "berik", authorities = "CREATE_FNO")
-void authorized() {
-    // ...
-}
+restClient.get()
+    .uri("/api/other-service/data")
+    .header("Authorization", "Bearer " + userToken)
+    .retrieve();
 ```
 
-MockMvc:
+Такой подход даёт downstream сервису full контекст оригинального пользователя. Downstream может делать authorization checks на основе original user roles, логировать user id в audit, применять data filtering по user context.
+
+Trade-off — token size, network overhead, dependency на original session. Если session истёк, downstream call тоже неудачен. Альтернатива — service-to-service Client Credentials с явной передачей user context как параметр (custom header или body field).
+
+## Тестирование
+
+Spring Security Test предоставляет utilities для mocking JWT в тестах. Обычно основанные на аннотациях или fluent API.
+
+MockMvc с mock JWT:
 ```java
 mockMvc.perform(post("/api/fno")
     .with(jwt().authorities(new SimpleGrantedAuthority("CREATE_FNO")))
@@ -345,13 +304,23 @@ mockMvc.perform(post("/api/fno")
     .andExpect(status().isOk());
 ```
 
-### 7.2 Real Keycloak в тестах
+Fluent API .with(jwt()) устанавливает mock JWT authentication для запроса. Authorities передаются через builder methods. Можно установить specific claims если тест их проверяет.
 
-`Testcontainers` для Keycloak:
+Custom @WithMockJwt через meta annotation для более удобного использования:
+```java
+@Test
+@WithMockJwt(subject = "berik", authorities = "CREATE_FNO")
+void authorized() {
+    // тест выполняется с mock JWT
+}
+```
+
+Real Keycloak в интеграционных тестах через TestContainers. KeycloakContainer запускает Docker контейнер с preconfigured realm. Приложение тестируется с реальным authentication:
 ```java
 @Container
-static KeycloakContainer keycloak = new KeycloakContainer("quay.io/keycloak/keycloak:24.0")
-    .withRealmImportFile("test-realm.json");
+static KeycloakContainer keycloak = 
+    new KeycloakContainer("quay.io/keycloak/keycloak:24.0")
+        .withRealmImportFile("test-realm.json");
 
 @DynamicPropertySource
 static void props(DynamicPropertyRegistry r) {
@@ -360,59 +329,42 @@ static void props(DynamicPropertyRegistry r) {
 }
 ```
 
-Медленнее, но реалистичней.
+Медленнее unit tests но даёт real integration coverage. Хорошо для критических security paths где mock коверов может skip important edge cases.
 
----
+## Кэширование JWKS
 
-## 8. Кэширование JWKS
+Spring по default кэширует JWKS ключи в memory. При появлении JWT с новым kid не найденным в кэше — refreshes JWKS. Кэш живёт indefinitely пока не будет обновлён.
 
-Spring по умолчанию кэширует ключи в памяти. Если Keycloak ротирует ключ, а Spring запрашивал JWKS час назад — новые токены упадут.
+Проблема — если Keycloak делает key rotation, а Spring запрашивал JWKS давно, новые токены могут не валидироваться пока не произойдёт refresh. Возможен window ошибок 401 у пользователей.
 
-Настройка:
+Настройка explicit cache duration:
 ```java
 @Bean
 JwtDecoder jwtDecoder(@Value("${issuer}") String issuer) {
     return NimbusJwtDecoder.withIssuerLocation(issuer)
-        .cache(Duration.ofMinutes(5))         // сколько кэшировать
+        .cache(Duration.ofMinutes(5))
         .build();
 }
 ```
 
-Или использовать `restOperations` с retry на JWKS.
+5 минут баланс между свежестью данных и загрузкой на Keycloak. Слишком часто (например 1 минута) создаёт unnecessary load. Слишком редко (например часы) создаёт длинные windows при rotation.
 
----
+Alternative — restOperations с retry logic на JWKS для resilience при temporary Keycloak issues.
 
-## 9. Grafik ошибок
+## Классификация ошибок
 
-### 9.1 401 Unauthorized
+401 Unauthorized означает проблему с authentication. Возможные причины включают отсутствие токена — header Authorization не предоставлен. Токен истёк — exp claim в прошлом. Signature invalid — токен подписан не тем ключом или tampered. Issuer mismatch — iss claim не совпадает с ожидаемым. Audience mismatch — если проверка настроена, aud не содержит expected value.
 
-- Токен отсутствует.
-- Токен истёк.
-- Подпись не валидна (не тот ключ).
-- `iss` не совпадает.
-- `aud` не совпадает (если проверка включена).
+403 Forbidden означает что authentication successful но нет прав. Токен валиден но не содержит требуемые roles/authorities. hasRole("admin") на endpoint, а в токене нет ROLE_admin. Полезное разграничение — 401 «предъявите valid credentials», 403 «credentials valid но недостаточно прав».
 
-### 9.2 403 Forbidden
+NoSuchMethodError на claim access это известная проблема при skew версий Spring Security компонентов. Реальный кейс taxreport21-java21-runtime-regressions в КНП — spring-security-jose и spring-security-core оказались разных версий в classpath, при вызове методов возникал NoSuchMethodError потому что method signature изменилась между версиями. Fix — явно закрепить версии через Spring Boot BOM что гарантирует consistency всех Spring компонентов.
 
-- Токен валиден, но нет нужной роли/authority.
-- `hasRole("admin")` — а в JWT нет.
+JWKS unavailable ошибка при недоступности Keycloak. Все запросы падают с 401 потому что Spring не может валидировать подпись без публичных ключей. Health check Keycloak критически важен. Alerting на JWKS availability. Circuit breaker на JWKS fetch для fast fail при sustained downtime.
 
-### 9.3 «NoSuchMethodError» на toString / claim access
-
-Реальный ИСНА-кейс `taxreport21-java21-runtime-regressions`: spring-security-jose и spring-security-core разные версии → skew → NoSuchMethodError.
-
-Фикс: явно закрепить версии через Spring Boot BOM.
-
-### 9.4 JWKS не доступен
-
-Keycloak down / network issue → все запросы падают. Health-check Keycloak критичен.
-
-### 9.5 Разные issuer в токенах
-
-Если несколько realm — надо multi-tenant setup:
+Разные issuers в multi-tenant setup требуют специального подхода. По default Spring поддерживает один issuer. Multi-tenant через AuthenticationManagerResolver позволяющий routing запросов к разным JwtDecoders на основе токена:
 ```java
 @Bean
-AuthenticationManagerResolver<HttpServletRequest> authenticationManagerResolver() {
+AuthenticationManagerResolver<HttpServletRequest> resolver() {
     return request -> {
         String issuer = extractIssuerFromToken(request);
         return authManagerForIssuer(issuer);
@@ -420,12 +372,11 @@ AuthenticationManagerResolver<HttpServletRequest> authenticationManagerResolver(
 }
 ```
 
----
+Каждый tenant имеет свой Keycloak realm или даже отдельный Keycloak, Spring динамически выбирает правильный decoder на основе issuer claim в JWT.
 
-## 10. Метрики и логирование
+## Метрики и логирование
 
-### 10.1 Логировать auth-события
-
+Auth events logging помогает audit и debugging. Spring публикует events для authentication success, failure, logout. Регистрация listener позволяет реагировать:
 ```java
 @Component
 class AuthEventListener {
@@ -433,6 +384,7 @@ class AuthEventListener {
     void onAuthSuccess(AuthenticationSuccessEvent event) {
         log.info("Login success: {}", event.getAuthentication().getName());
     }
+    
     @EventListener
     void onAuthFailure(AbstractAuthenticationFailureEvent event) {
         log.warn("Login failed: {}", event.getException().getMessage());
@@ -440,19 +392,20 @@ class AuthEventListener {
 }
 ```
 
-### 10.2 Не логировать токены
+Structured logging с MDC context (correlation ID, user id) в auth events обеспечивает traceability. Alerting на unusual patterns — множественные failures от одного IP, login outside business hours для privileged accounts.
 
-Никогда не логируй `Authorization` header или `token`. Утечка = компромисс всех пользователей.
-
-Отфильтровать в logback:
+Critical rule — никогда не логировать tokens. Authorization header содержит sensitive material. Полный token в логах = complete compromise любого legitimate access. Стандартный logback pattern для маскирования:
 ```xml
 <pattern>%replace(%msg){'Bearer [A-Za-z0-9._-]+', 'Bearer ***'}%n</pattern>
 ```
 
----
+Regex заменяет любой Bearer token на маркер. Similar patterns для других sensitive data. Обязательный элемент production logging configuration.
 
-## 11. Полная прод-конфигурация
+Metrics через Actuator и Micrometer. Стандартные metrics включают request count, latencies, error rates разбитые по authenticated/unauthenticated. Custom metrics для auth-specific показателей — successful logins, failed logins, token refresh rate, JWKS cache hits/misses.
 
+## Полная production конфигурация
+
+Собранная воедино конфигурация Resource Server plus Client в микросервисе КНП:
 ```yaml
 spring:
   security:
@@ -460,6 +413,8 @@ spring:
       resourceserver:
         jwt:
           issuer-uri: ${KEYCLOAK_ISSUER:https://keycloak.isna/realms/knp}
+          audiences:
+            - isna-knp-integration
       client:
         registration:
           knp-service:
@@ -473,87 +428,77 @@ spring:
 logging:
   level:
     org.springframework.security: INFO
+  pattern:
+    console: "%d %-5level [%X{traceId:-},%X{spanId:-}] %logger - %replace(%msg){'Bearer [A-Za-z0-9._-]+', 'Bearer ***'}%n"
 ```
 
+Java конфигурация с всеми custom bindings:
 ```java
 @Configuration
 @EnableWebSecurity
 @EnableMethodSecurity
 public class SecurityConfig {
-
+    
     @Bean
-    SecurityFilterChain filter(HttpSecurity http, JwtAuthenticationConverter conv) throws Exception {
+    SecurityFilterChain filter(HttpSecurity http, 
+                               JwtAuthenticationConverter conv) throws Exception {
         http
             .csrf(csrf -> csrf.disable())
             .sessionManagement(sm -> sm.sessionCreationPolicy(STATELESS))
             .authorizeHttpRequests(auth -> auth
-                .requestMatchers("/actuator/health/**", "/actuator/info", "/actuator/prometheus").permitAll()
+                .requestMatchers("/actuator/health/**", 
+                                "/actuator/info", 
+                                "/actuator/prometheus").permitAll()
                 .requestMatchers("/api/public/**").permitAll()
                 .anyRequest().authenticated())
-            .oauth2ResourceServer(o -> o.jwt(jwt -> jwt.jwtAuthenticationConverter(conv)))
+            .oauth2ResourceServer(o -> 
+                o.jwt(jwt -> jwt.jwtAuthenticationConverter(conv)))
             .exceptionHandling(ex -> ex
                 .authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED))
                 .accessDeniedHandler((req, resp, e) -> resp.setStatus(403)))
             .headers(h -> h.frameOptions(f -> f.deny()));
-
         return http.build();
     }
-
+    
     @Bean
     JwtAuthenticationConverter jwtAuthenticationConverter() {
         JwtAuthenticationConverter c = new JwtAuthenticationConverter();
-        c.setJwtGrantedAuthoritiesConverter(new KeycloakRealmAndClientRolesConverter("isna-knp-integration"));
+        c.setJwtGrantedAuthoritiesConverter(
+            new KeycloakRealmAndClientRolesConverter("isna-knp-integration"));
         c.setPrincipalClaimName("preferred_username");
         return c;
     }
 }
 ```
 
----
+## Реальные кейсы КНП
 
-## 12. Реальные кейсы ИСНА
+Кейс taxreport21-java21-runtime-regressions — OAuth2 NoSuchMethodError при вызове JWT parsing methods. Root cause — skew версий spring-security-jose и spring-security-core в classpath. Fix — enforce version consistency через Spring Boot BOM. Ensure всех Spring dependencies собраны через BOM без manual version overrides.
 
-- `taxreport21-java21-runtime-regressions`: OAuth2 NoSuchMethodError = spring-security-jose vs core version skew. Фикс = BOM.
-- `knp-e2e-prod-taxrep21-smoke-local-run`: bearer-канал НЗ падает при миграции на Java 21 (spring-security несовместимость).
-- `knp-n07-sent-documents-invisible`: `KNP_PERM_CREATE_NZ_N07` — client-role в Keycloak, permission-гейт `fv.code IN permissionCodes`. Если не выдан юзеру → N07 не видна в отправленных.
+Кейс knp-e2e-prod-taxrep21-smoke-local-run — bearer канал НЗ падает при миграции на Java 21 из-за incompatibility Spring Security с новой версией Java. Не проблема самого OAuth2, а general Spring Security compatibility при major Java migrations. Fix — обновить Spring Security до совместимой версии, retest все auth paths.
 
----
+Кейс knp-n07-sent-documents-invisible — permission KNP_PERM_CREATE_NZ_N07 как client role в Keycloak, permission gate в коде fv.code IN permissionCodes. Если пользователю не назначена эта роль в Keycloak, N07 форма не показывается в отправленных документах. Урок — permission model должна быть end-to-end consistent между Keycloak configuration и application code, missing role в Keycloak даёт silent invisibility а не explicit error.
 
-## 13. Собесные вопросы
+## Итоги
 
-1. **Как настроить Spring Boot как Resource Server?** — `spring-boot-starter-oauth2-resource-server` + `spring.security.oauth2.resourceserver.jwt.issuer-uri`.
-2. **Как проверить JWT?** — Spring автоматически через discovery + JWKS.
-3. **Почему Keycloak-роли не работают в `hasRole`?** — Они в `realm_access.roles` / `resource_access.<client>.roles`, а не в `scope`; нужен кастомный `JwtAuthenticationConverter`.
-4. **Как выдать роль в токен?** — Realm Role или Client Role → добавляется маппером в JWT.
-5. **Как переиспользовать user token в downstream-запросе?** — Извлечь `jwt.getTokenValue()` из SecurityContext, добавить в исходящий header.
-6. **Как получить token для M2M?** — Client Credentials через `OAuth2AuthorizedClientManager`.
-7. **Как настроить audiences?** — `spring.security.oauth2.resourceserver.jwt.audiences` или `AudienceValidator`.
-8. **Что произойдёт если Keycloak недоступен?** — Все токены upstream не проверятся (JWKS упадёт) → 401 везде.
-9. **Как кэшировать JWKS?** — `NimbusJwtDecoder.withIssuerLocation(...).cache(Duration.ofMinutes(5))`.
-10. **Разница `hasRole("admin")` и `hasAuthority("admin")`?** — hasRole автопрефиксует ROLE_.
-11. **Как мокать JWT в тесте?** — `@WithMockJwt` или `.with(jwt())` в MockMvc.
-12. **Adapters Keycloak или Spring Security?** — Adapters deprecated, использовать Spring Security OAuth2 Resource Server.
+Spring Security OAuth2 Resource Server стандартный подход для микросервисов КНП после deprecation Keycloak adapters. Одна строка issuer-uri автоматически конфигурирует JWT validation через discovery и JWKS.
 
----
+Custom JwtAuthenticationConverter необходим для правильного парсинга Keycloak-specific структуры ролей в realm_access и resource_access. Стандартный Spring подход к authorities не понимает эту структуру без customization.
 
-## Итог
+Method Security через @PreAuthorize даёт fine-grained authorization на уровне отдельных methods. hasRole для realm roles, hasAuthority для permissions.
 
-- **Resource Server (JWT)** — типичный микросервис.
-- **Discovery + JWKS** — auto-конфиг.
-- **`JwtAuthenticationConverter`** — маппинг Keycloak-ролей на Spring authorities.
-- **`@PreAuthorize`** для тонкой авторизации методов.
-- **`OAuth2AuthorizedClientManager`** для Client Credentials M2M.
-- **Feign RequestInterceptor** для проброса токенов.
-- **Кэшировать JWKS** осознанно.
-- **Никогда не логировать токены**.
+OAuth2 Client функциональность через OAuth2AuthorizedClientManager для machine-to-machine calls между сервисами. RestClient и Feign integration через interceptors автоматически добавляют Bearer token в исходящие запросы.
 
----
+Пропагация user token в downstream calls когда нужен original user context. Trade-off между full context и dependency на original session.
 
-## Итог блока Spring Security / OAuth2 / Keycloak
+Audience валидация через audiences свойство или AudienceValidator. Multi-tenant поддержка через AuthenticationManagerResolver для разных issuers.
 
-- 24 — Spring Security основы (фильтры, UserDetails, Method Security).
-- 25 — OAuth2 / OIDC теория (роли, grants, JWT, PKCE, discovery).
-- 26 — Keycloak (realm, client, roles, mappers, endpoints).
-- 27 — Spring Security + Keycloak в проде (Resource Server, JwtAuthenticationConverter, M2M).
+Тестирование через MockMvc с jwt() fluent или @WithMockJwt для unit tests. TestContainers с KeycloakContainer для integration tests с real Keycloak.
 
-Следующий блок — PostgreSQL / HikariCP / highload / Load Balancer (файлы 28-31). Начинаю с `28-postgresql-internals.md`.
+Кэширование JWKS с explicit duration критично для баланса свежести и load. 5 минут разумный default.
+
+Ошибки 401 vs 403 разграничивают authentication и authorization проблемы. NoSuchMethodError указывает на version skew. JWKS unavailability ломает все токены — health check и alerting Keycloak critical.
+
+Никогда не логировать tokens — full compromise любого доступа. Regex маскирование в logback pattern стандартный элемент security configuration.
+
+Итог блока Spring Security и OAuth2 и Keycloak — файлы 24-27 покрыли Spring Security основы, OAuth2/OIDC теорию, Keycloak как IAM, integration в production. Дальше начинается блок PostgreSQL, HikariCP, highload с файла 28 postgresql-internals.

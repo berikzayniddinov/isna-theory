@@ -1,103 +1,69 @@
-# 29. PostgreSQL + Spring Boot: HikariCP, connection pool, timeouts
+# 29. PostgreSQL плюс Spring Boot: HikariCP, connection pool, timeouts
 
-Как Java-приложение работает с PG. Что такое пул соединений, его настройки, статусы, timeouts.
+## JDBC как основа
 
----
+JDBC (Java Database Connectivity) это стандартный API для работы с реляционными базами данных из Java. Определяет abstract interfaces которые реализуются database-specific драйверами.
 
-## 1. JDBC — как устроен
+Основные объекты JDBC. DataSource это фабрика соединений — logical представление database, инкапсулирующее URL и credentials. Connection представляет одно TCP соединение с базой плюс database session state. Statement и PreparedStatement для выполнения SQL — PreparedStatement предпочтителен для параметризованных queries. ResultSet это курсор для итерации по результатам SELECT.
 
-**JDBC** = Java Database Connectivity. Стандартный API для БД.
-
-Основные объекты:
-- **`DataSource`** — фабрика соединений.
-- **`Connection`** — TCP-соединение с БД + сессия.
-- **`Statement` / `PreparedStatement`** — SQL для выполнения.
-- **`ResultSet`** — курсор для чтения результатов.
-
-Цепочка:
+Типичный код работы с JDBC:
 ```java
 DataSource ds = getDataSource();
 try (Connection conn = ds.getConnection()) {
-    try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM fno WHERE id=?")) {
+    try (PreparedStatement ps = conn.prepareStatement(
+            "SELECT * FROM fno WHERE id = ?")) {
         ps.setLong(1, 123);
         try (ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
-                // ...
+                // обработка каждой строки
             }
         }
     }
 }
 ```
 
-Реальный **PostgreSQL JDBC driver** — `org.postgresql:postgresql`. Отвечает за:
-- TCP-соединение на порт 5432.
-- Wire-протокол PostgreSQL (FE/BE протокол).
-- Прeparation / execution SQL.
-- Type conversion (BIT → boolean, TIMESTAMP → LocalDateTime).
+try-with-resources гарантирует правильное освобождение ресурсов — Connection возвращается в pool, PreparedStatement и ResultSet closes. Пропуск освобождения ведёт к leak connections что deprecates pool eventually.
 
----
+PostgreSQL JDBC driver в дистрибутиве org.postgresql:postgresql отвечает за низкоуровневое взаимодействие с PostgreSQL. TCP соединение на порт 5432 с сервером. Реализация wire-протокола PostgreSQL для communication с backend. Обработка prepared statements — client-side или server-side. Type conversion между Java и PostgreSQL типами (LocalDateTime к timestamp, boolean к bit, UUID к uuid). Handling SSL negotiation если настроено.
 
-## 2. Зачем connection pool
+## Зачем connection pool
 
-### 2.1 Проблема без пула
+Без connection pool каждый database вызов включает создание нового TCP соединения. Overhead этого создания значителен и суммируется в latency для высоконагруженных приложений.
 
-```java
-Connection conn = DriverManager.getConnection(url, user, pw);
-// ...work...
-conn.close();
-```
+Компоненты overhead. TCP handshake занимает несколько миллисекунд (SYN, SYN-ACK, ACK). SSL handshake если используется добавляет 10-50 миллисекунд для key exchange и certificate verification. PostgreSQL authentication включая password check, backend process creation, session initialization занимает 20-50 миллисекунд. Итого 30-100 миллисекунд на каждое новое соединение.
 
-Каждый вызов = новое TCP-соединение + новый PG backend process:
-- TCP handshake ~ несколько мс.
-- SSL handshake (если) ~ 10-50 мс.
-- PG аутентификация + init ~ 20-50 мс.
-- **Итого: 30-100 мс на каждое соединение**. Для 1000 req/s = абсурд.
+При 1000 requests в секунду создание нового connection на каждый запрос означает 1000 handshakes в секунду что фактически невозможно. Плюс каждый backend process в PostgreSQL занимает 5-10 MB памяти — 1000 concurrent connections потребует 5-10 GB просто на process overhead. PostgreSQL max_connections по default 100 — быстро исчерпывается.
 
-Плюс:
-- Каждый backend PG = 5-10 MB памяти. 1000 open connections = 5-10 GB.
-- PG имеет `max_connections` (default 100), быстро исчерпается.
-
-### 2.2 Пул
-
-Пул держит **N готовых открытых соединений**. Приложение берёт, использует, возвращает.
-
+Connection pool решает эти проблемы держа предопределённое количество открытых соединений готовых к использованию:
 ```
 Приложение
     │
     │  getConnection()
     ▼
-┌─────── Pool ───────┐
-│  [free] [free]     │  ← готовые соединения
-│  [in-use] [free]   │
-└─────────┬──────────┘
-          │
-          ▼
-    PostgreSQL
+┌─────────── Pool ────────────┐
+│  [idle]   [idle]            │  ← готовые соединения
+│  [in-use] [idle]   [idle]   │
+└──────────┬──────────────────┘
+           │
+           ▼
+      PostgreSQL
 ```
 
-Плюсы:
-- Соединение переиспользуется → нет дорогого init.
-- Ограничение количества → PG не перегружен.
-- Latency drops from 30ms to <1ms per connection acquire.
+Приложение просит соединение из pool через getConnection. Pool возвращает existing idle connection мгновенно. Приложение использует connection для queries. При close (или конце try-with-resources) connection возвращается в pool, не закрывается физически.
 
----
+Плюсы поразительные. Соединение переиспользуется — нет дорогого init на каждый запрос. Latency getConnection падает с 30-100ms до subMillisecond. Количество PostgreSQL connections ограничено — pool size обычно 10-30, а не сотни. Ресурсы database и приложения используются эффективно.
 
-## 3. HikariCP — стандарт в Spring Boot
+## HikariCP стандарт
 
-**HikariCP** — самый быстрый JDBC-пул. Default в Spring Boot начиная с 2.0.
+HikariCP это самый быстрый JDBC connection pool. Default в Spring Boot начиная с версии 2.0 как рекомендуемый выбор.
 
-Особенности:
-- Легковесный.
-- Минимум блокировок внутри.
-- Хорошие defaults.
-- Богатые метрики.
+Характеристики. Легковесный — минимум features, максимум performance. Минимум блокировок внутри — использует lock-free structures где возможно. Хорошие defaults — работает out of box для большинства сценариев. Богатые metrics — интеграция с Micrometer для observability.
 
-Альтернативы: Tomcat JDBC Pool, Apache DBCP2 — устаревшие.
+Альтернативы включают Tomcat JDBC Pool и Apache DBCP2 но оба практически устарели. HikariCP превосходит их по производительности и функциональности. Нет причин использовать альтернативы кроме исторических.
 
----
+## Ключевые настройки
 
-## 4. Ключевые настройки
-
+Пример полной конфигурации HikariCP:
 ```yaml
 spring:
   datasource:
@@ -105,15 +71,15 @@ spring:
     username: knp
     password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
-
+    
     hikari:
       pool-name: knp-hikari
       maximum-pool-size: 20
       minimum-idle: 5
-      idle-timeout: 300000               # 5 мин
-      connection-timeout: 30000          # 30 сек
-      max-lifetime: 1800000              # 30 мин
-      keepalive-time: 300000             # 5 мин
+      idle-timeout: 300000
+      connection-timeout: 30000
+      max-lifetime: 1800000
+      keepalive-time: 300000
       validation-timeout: 5000
       leak-detection-threshold: 60000
       auto-commit: false
@@ -125,355 +91,210 @@ spring:
         useServerPrepStmts: true
 ```
 
-Разберём каждую.
+Разберём каждую настройку и её impact.
 
-### 4.1 `maximum-pool-size`
+maximum-pool-size ограничивает количество соединений в pool. Правило sizing pool_size = ((CPU_cores × 2) + effective_spindle_count) для database сервера. Для приложения обычно 10-30. Больше не значит быстрее — при 20-30+ contention внутри PostgreSQL начинает деградировать throughput вместо роста. Ставить 100+ обычно ошибка.
 
-Максимум соединений в пуле.
+Практический пример проблемы. PostgreSQL с max_connections равным 200. 10 подов приложения каждый с pool 30 равно 300 possible connections. При peak PostgreSQL начинает отказывать в новых соединениях с ошибкой too many connections. Решение либо уменьшить pool per pod, либо PgBouncer для мультиплексирования.
 
-**Правило**: `pool_size = ((CPU_cores × 2) + effective_spindle_count)` для БД. Для приложения — обычно 10-30.
+minimum-idle это сколько соединений всегда держать открытыми даже при отсутствии нагрузки. Default равно maximum. Установка равного maximum даёт стабильную latency без старта соединения при первом запросе после idle периода. Меньшее значение экономит ресурсы но первые запросы после idle могут быть медленнее.
 
-Больше НЕ значит быстрее:
-- Больше 20-30 → contention внутри PG.
-- Ставить 100+ = обычно ошибка.
+connection-timeout критически важный параметр. Задаёт максимум времени ожидания свободного connection из pool. Если pool полный и все in-use, getConnection блокируется до появления free connection или до timeout. По истечении timeout бросается SQLTransientConnectionException с сообщением Connection is not available.
 
-Пример: PG с `max_connections=200`. 10 подов приложения × 30 = 300 → PG отказывает в соединениях.
+Default 30 секунд разумен для большинства сценариев. Слишком большое значение означает что приложение висит долгое время при exhausted pool. Слишком маленькое создаёт false alarms при коротких пиках нагрузки. 30 секунд компромисс — достаточно чтобы переждать transient spike но не так долго что приложение становится неотзывчивым.
 
-**PgBouncer** решает эту проблему (см. §7).
+idle-timeout это через сколько миллисекунд простаивающие соединения (сверх minimum-idle) закрываются. По default 10 минут. Обычно 5-10 минут работает хорошо. Помогает освобождать resources когда нагрузка снижается.
 
-### 4.2 `minimum-idle`
+max-lifetime это максимальный возраст соединения. По достижении соединение закрывается и создаётся новое. Default 30 минут. Важно для нескольких целей. Избежание stale connections из-за network issues или firewall timeouts. Handling ситуации когда PostgreSQL перезапускается на replica — соединения к старому pod eventually обновляются. Distribution нагрузки при database scale up.
 
-Сколько соединений всегда держать открытыми (даже без нагрузки). По умолчанию = max.
+Правило max-lifetime меньше чем PostgreSQL idle_in_transaction_session_timeout минус несколько секунд. Также меньше firewall TCP idle timeout если применимо. Обычно 20-30 минут.
 
-Установить = max для стабильной latency (нет старта соединения при первом запросе).
-Установить меньше = экономия ресурсов, но первый запрос после idle-периода долгий.
+keepalive-time это Hikari 4.0+ возможность. Периодически проверяет idle connections через SELECT 1 для поддержания TCP alive. Полезно когда firewall закрывает idle connections. Default disabled (0). Установка 5 минут (300000) полезна если между app и database есть firewall который может убить idle TCP.
 
-### 4.3 `connection-timeout` ⭐
+validation-timeout это максимум на выполнение validation query (SELECT 1). Default 5 секунд. При slow database значения могут быть увеличены.
 
-**Максимум сколько приложение ждёт свободного соединения из пула**.
+leak-detection-threshold это критически важный параметр для troubleshooting. Если connection не возвращён в pool за N миллисекунд, HikariCP логирует warning со stack trace откуда connection был взят. Помогает находить утечки — методы забывающие close connection или обрабатывающие exceptions некорректно.
 
-Default: 30 сек.
-
-Если пул полный и все in-use → getConnection() блокируется. Через `connection-timeout` → бросается `SQLTransientConnectionException: HikariPool - Connection is not available, request timed out after 30000ms`.
-
-**Слишком большой** = приложение висит.
-**Слишком маленький** = false alarm при коротком пике.
-
-30 сек — разумно для дефолта.
-
-### 4.4 `idle-timeout`
-
-Через сколько миллисекунд простаивающее соединение (сверх `minimum-idle`) закрывается.
-
-Default: 10 мин. Обычно 5-10 мин ок.
-
-### 4.5 `max-lifetime` ⭐
-
-**Максимальный возраст соединения**. По достижении — закрывается и открывается новое.
-
-Default: 30 мин.
-
-**Зачем**: избежать проблем с "stale" соединениями (сеть, firewall, PG перезапуск на реплике). PG сам может убить долгоживущие.
-
-**Правило**: `max-lifetime` < `pg-idle-timeout` минус несколько секунд. И меньше firewall's TCP timeout.
-
-### 4.6 `keepalive-time` (Hikari 4.0+)
-
-Периодически проверяет idle соединения (`SELECT 1`), чтобы держать TCP живым.
-
-Default: disabled (0). Устанавливай в 5 минут если сеть закрывает idle-соединения (firewall).
-
-### 4.7 `validation-timeout`
-
-Максимум на выполнение validation query.
-
-### 4.8 `leak-detection-threshold` ⭐
-
-Если соединение не возвращено в пул за N мс → log warning со stack trace `откуда взяли`.
-
-Default: 0 (выключено). **Включай в проде** = 60000 (60 сек). Помогает найти утечки:
+Default 0 (disabled). Обязательно включай в production, обычно 60000 (60 секунд). Логи выглядят так:
 ```
-HikariCP - Connection leak detection triggered for ... on thread ..., stack trace follows
+HikariCP - Connection leak detection triggered for ProxyConnection@...
+    on thread http-nio-8080-exec-42, stack trace follows
     at ...FnoService.badMethod(FnoService.java:42)
 ```
 
-### 4.9 `auto-commit`
+Полезно даже когда нет known проблем — periodic warnings указывают на code paths с потенциальными issues.
 
-`true` (default) — каждый statement = отдельная tx.
-`false` — надо явно commit/rollback.
+auto-commit определяет default transaction behavior. true (default) означает каждый statement как отдельная transaction — implicit commit после каждого. false означает необходимость explicit commit или rollback. Spring @Transactional управляет вручную поэтому значение не критично при использовании Spring transactions.
 
-Spring `@Transactional` управляет вручную → значение не критично.
+transaction-isolation задаёт default isolation level для соединений. PostgreSQL обычно требует TRANSACTION_READ_COMMITTED. Реальный кейс из КНП memory knp-e2e-runner-hikari-isolation-poisoning — раннер использовал isolation равное -1 (opt-in), пул отравлялся при shared через PgBouncer. Всегда явно задавать явное значение чтобы избежать surprises.
 
-### 4.10 `transaction-isolation`
+## Статусы соединений в pool
 
-Уровень изоляции по умолчанию. Для PG обычно `TRANSACTION_READ_COMMITTED`.
+Каждое соединение в one из состояний. idle означает свободно, готово к использованию. active или in-use — выдано приложению, обрабатывает queries. awaiting означает приложение ждёт соединение из full pool. stale или evicted — превысило max-lifetime или idle-timeout, закрывается.
 
-**Реальный ИСНА-кейс** memory `knp-e2e-runner-hikari-isolation-poisoning`: раннер использовал `isolation=-1` (opt-in), пул отравлялся. Всегда явно задавай.
-
----
-
-## 5. Статусы соединений в пуле
-
-Каждое соединение в одном из состояний:
-
-- **idle** — свободно, ждёт использования.
-- **active / in-use** — выдано приложению, используется.
-- **awaiting** — приложение ждёт соединение (пул исчерпан).
-- **stale / evicted** — превысило `max-lifetime` или `idle-timeout`, закрывается.
-
-Метрики:
+HikariCP экспортирует metrics для каждого состояния через Micrometer. Стандартные метрики:
 ```
-hikaricp.connections.active
-hikaricp.connections.idle
-hikaricp.connections.pending    ← сколько ждёт
-hikaricp.connections.timeout    ← сколько раз таймаутнули
-hikaricp.connections.usage
-hikaricp.connections.acquire     ← latency getConnection
+hikaricp.connections.active         текущее in-use
+hikaricp.connections.idle           текущее idle
+hikaricp.connections.pending        сколько threads ждёт connection
+hikaricp.connections.timeout        сколько раз таймаут произошёл
+hikaricp.connections.usage          histogram времени использования
+hikaricp.connections.acquire        histogram latency getConnection
+hikaricp.connections.creation       histogram времени создания нового
 ```
 
-Экспорируются через Actuator + Micrometer → Prometheus.
+Метрики экспортируются через Actuator plus Micrometer в Prometheus что позволяет monitoring в Grafana. Обязательный компонент production observability.
 
-**Правило мониторинга**:
-- `pending > 0` часто → пул мал, увеличить.
-- `timeout > 0` → критично, что-то не так (утечка / долгие tx / БД тормозит).
-- `active / max_pool_size` близко к 1 → перегрузка.
+Правила мониторинга. Pending regularly больше 0 указывает на недостаточно большой pool — не хватает соединений для peak нагрузки. Timeout больше 0 критическая ситуация — либо утечка соединений либо долгие queries держат pool exhausted. Active приближающийся к maximum означает перегрузку — pool близок к исчерпанию.
 
----
+## Connection timeout, socket timeout, IO wait
 
-## 6. Что такое connection timeout, io wait
+Различные типы timeout часто путают, важно понимать различия.
 
-### 6.1 Connection timeout
+Connection timeout уже разобран — сколько приложение ждёт соединения из pool. Свойство pool level.
 
-Уже разобрано (§4.3) — сколько приложение ждёт **соединение из пула**.
-
-Отличать от **socket connect timeout** (соединение с БД на TCP уровне):
+Socket connect timeout это сколько ждать установления TCP соединения с database. Свойство driver level:
 ```yaml
 spring.datasource.hikari.data-source-properties:
-  socketTimeout: 30                  # секунды
-  connectTimeout: 10                 # для установления TCP
+  socketTimeout: 30           # secondsмаксимум на выполнение statement
+  connectTimeout: 10          # секунды для установления TCP
 ```
 
-Первый — очередь в пуле. Второй — сеть до БД.
+Socket timeout это максимум на выполнение statement. Если query занимает более 30 секунд driver прерывает соединение. Обязательно устанавливать иначе runaway query может повесить весь pool. Разумное значение зависит от expected query complexity — 30-60 seconds для transactional, длиннее для аналитических.
 
-### 6.2 Socket timeout
+IO wait это когда процессор waits for I/O операцию — disk, сеть. Для database запроса типичное. Приложение отправляет SQL по сети (1 мс). PostgreSQL работает над запросом (5-500 мс). Возвращает результат по сети (1 мс). Всё это время Java thread заблокирован ожидая I/O. CPU может быть свободен для других threads.
 
-Максимум на **выполнение statement**. Если запрос идёт >30 сек — driver прерывает.
+Мониторинг IO wait. Метрика hikari.connections.acquire.time показывает время получения connection из pool. jdbc.query.time (при использовании APM) показывает время самих queries. В OS через top команду процент wa показывает CPU waiting for I/O. В PostgreSQL pg_stat_activity.wait_event показывает что каждый backend ждёт.
 
-Установи! Иначе злой запрос повесит весь пул.
+Высокий IO wait в JVM означает много блокирующих I/O операций. Возможные решения. Batch операции для уменьшения количества round-trips. Reactive или Virtual Threads чтобы не блокировать thread на I/O. Cache для избежания I/O. Индексы для ускорения queries.
 
-### 6.3 IO wait
+## Pageable в Spring Data
 
-**IO wait** = процессор ждёт I/O операцию (диск, сеть).
+Pageable это Spring абстракция для pagination. Не про pool напрямую но связан с database queries.
 
-Для БД-запроса типичное:
-1. Приложение отправляет SQL по сети (~1 мс).
-2. **PG работает над запросом** (может 5-500 мс).
-3. Возвращает результат по сети (~1 мс).
-
-Всё это время Java-поток **заблокирован** — ждёт I/O. CPU простаивает (может быть занят другими потоками).
-
-Мониторить:
-- В приложении — метрика `hikari.connections.acquire.time` + `jdbc.query.time` (если есть APM).
-- В OS — `top` показывает `%wa` (CPU waiting for I/O).
-- В PG — `pg_stat_activity.wait_event`.
-
-Высокий IO wait в JVM = много блокирующих I/O операций. Решения:
-- **Batch** — уменьшить количество round-trip.
-- **Reactive / Virtual Threads** — не блокировать поток на I/O.
-- **Кэш** — избежать I/O.
-- **Индексы** — ускорить сам запрос.
-
-### 6.4 Что такое Pageable
-
-Не про пул, но пользователь спросил. Разбирал в файле `14-spring-data-jpa.md`, повторим кратко.
-
-**`Pageable`** — Spring абстракция для пагинации:
+Использование:
 ```java
-Page<Fno> page = repo.findAll(PageRequest.of(0, 20, Sort.by("createdAt").descending()));
+Page<Fno> page = repo.findAll(
+    PageRequest.of(0, 20, Sort.by("createdAt").descending()));
 ```
 
-Под капотом:
-- `SELECT ... LIMIT 20 OFFSET 0` — данные.
-- `SELECT COUNT(*) ...` — total count.
+Под капотом Spring генерирует два запроса. SELECT ... LIMIT 20 OFFSET 0 возвращает страницу данных. SELECT COUNT(*) считает total rows.
 
-**`Page`** содержит:
-- `content` — список.
-- `totalElements` — общее количество.
-- `totalPages`.
-- `hasNext`, `hasPrevious`.
+Page объект содержит content (список), totalElements (общее количество), totalPages (расчётное количество страниц), hasNext, hasPrevious. Полезен для UI показывающих pagination controls.
 
-**`Slice`** — без COUNT, только `hasNext` (быстрее, если total не нужен).
+Slice это alternative без total count — только hasNext. Быстрее чем Page потому что не выполняет COUNT query. Использовать когда total не нужен, только «есть ли следующая страница».
 
-**Кавет OFFSET на больших страницах**: `OFFSET 100000 LIMIT 20` заставит PG прочитать 100020 строк, отбросить 100000. Медленно! Решение — **keyset pagination**:
+Caveat OFFSET на больших страницах. OFFSET 100000 LIMIT 20 заставляет PostgreSQL прочитать 100020 rows и отбросить первые 100000. Extremely slow на глубоких страницах. Также COUNT(*) на большой таблице сам по себе expensive.
+
+Решение — keyset pagination или курсор пагинация:
 ```sql
-WHERE created_at < :last_seen_at ORDER BY created_at DESC LIMIT 20
+WHERE created_at < :last_seen_at 
+ORDER BY created_at DESC 
+LIMIT 20
 ```
 
-Курсор двигается вперёд по значению, без OFFSET.
+Клиент передаёт последний seen timestamp вместо номера страницы. PostgreSQL использует индекс для быстрого seek к правильной позиции без чтения skipped rows. Значительно быстрее OFFSET для глубоких страниц. Ограничение — можно двигаться только forward/backward последовательно, нет random access к произвольной странице.
 
----
+## PgBouncer
 
-## 7. PgBouncer
+PgBouncer это connection pooler на уровне сети между приложением и PostgreSQL. Работает как proxy принимающий соединения от клиентов и мультиплексирующий их на small pool real PostgreSQL connections.
 
-Между приложением и PG часто ставят **PgBouncer** — connection pooler на уровне сети.
+Зачем нужен. Приложение может держать сотни connections к PgBouncer (дешёвые с его стороны). PgBouncer держит только desktop 20 к настоящему PostgreSQL. Мультиплексирует запросы — когда клиент simult idle между queries, real PostgreSQL connection может быть использован для другого клиента.
 
-### 7.1 Зачем
+Три режима работы. Session mode — одно клиентское соединение биндится к одному PostgreSQL соединению на весь session. Работает как прямой PostgreSQL с точки зрения клиента, включая prepared statements и session state. Не даёт экономии connections — 1:1 mapping.
 
-- Приложение может держать 100 connections к PgBouncer.
-- PgBouncer держит только 20 к настоящему PG.
-- Мультиплексирует запросы.
+Transaction mode это рекомендуемый режим для мультиплексирования. Клиентское соединение биндится к PostgreSQL connection только на время транзакции, потом возвращается в pool. Один PostgreSQL connection может обслуживать много клиентов sequentially. Экономия огромна — 100 клиентов могут работать через 10 PostgreSQL connections. Ограничение — prepared statements не сохраняются между транзакциями потому что session меняется. SET session settings теряются между transactions.
 
-### 7.2 Режимы
+Statement mode — соединение возвращается после каждого statement. Не поддерживает transactions клиента. Только для read-only аналитики.
 
-**Session** — одно соединение приложения = одно соединение PG на весь сеанс.
-- Плюс: как обычный PG.
-- Минус: не помогает уменьшить количество PG connections.
+В КНП обычно transaction mode для максимальной экономии. Memory кейс knp-fs-consul-deregister-after-db-flap упоминает db-knp это PgBouncer в pod сети, доступный только внутри podа не с хоста.
 
-**Transaction** ⭐ — соединение возвращается в пул после каждой транзакции.
-- Плюс: экономия соединений PG (100 приложений → 10 PG).
-- **Минус**: **prepared statements не работают** (кэш на уровне session).
+Требования JDBC при использовании PgBouncer transaction mode. Отключить prepared statements caching в клиенте:
+```yaml
+data-source-properties:
+  prepareThreshold: 0
+  preparedStatementCacheQueries: 0
+```
 
-**Statement** — после каждого statement.
-- Не поддерживает транзакции клиента.
-- Только для аналитики.
+Не использовать session-level SET — теряются между transactions. Не полагаться на session state как temp tables — не сохраняются.
 
-### 7.3 В ИСНА
+## SSL
 
-Memory `knp-fs-consul-deregister-after-db-flap`: `db-knp` = PgBouncer в pod-сети (с хоста не пинганеть, exec из пода).
-
-Обычно **transaction mode**. Отсюда:
-- Отключить prepared statements caching в JDBC:
-  ```yaml
-  data-source-properties:
-    prepareThreshold: 0
-    preparedStatementCacheQueries: 0
-  ```
-- Не использовать `SET ...` (session-level settings) — теряются между транзакциями.
-
----
-
-## 8. SSL
-
-По умолчанию JDBC PG не шифрует. Для production обычно включают:
+По default JDBC connections к PostgreSQL не encrypted. Для production обычно включают SSL особенно для connections через untrusted networks:
 ```yaml
 spring.datasource.url: jdbc:postgresql://db:5432/knp?sslmode=require
 ```
 
-Режимы `sslmode`:
-- `disable` — нет SSL.
-- `allow` — предпочтителен без.
-- `prefer` — предпочтителен с, fallback без.
-- `require` — только SSL.
-- `verify-ca` — + проверка cert authority.
-- `verify-full` — + проверка hostname.
+Режимы sslmode. disable совсем без SSL. allow предпочитает без но принимает если сервер требует. prefer предпочитает с SSL, fallback на без. require только с SSL, отклоняет без. verify-ca плюс require добавляет проверку certificate authority. verify-full плюс verify-ca добавляет проверку hostname в сертификате.
 
-SSL handshake ~ 10-50 мс — оправдан только один раз при open connection (пул спасает).
+Production обычно require минимум, verify-full для максимальной безопасности. verify-full требует правильно настроенных certificates соответствующих hostnames что может быть сложнее в dynamic environments.
 
----
+SSL handshake добавляет 10-50 миллисекунд к open connection. С pool этот cost платится только при первом установлении, потом соединения переиспользуются — impact minimal.
 
-## 9. Timezone
+## Timezone
 
-Классическая проблема JDBC + PG.
+Классическая проблема JDBC плюс PostgreSQL. Разные timezones на JVM, database, PostgreSQL server могут привести к unexpected timestamp values.
 
+Стандартная рекомендация — всё в UTC внутри системы. Отображение в local timezone только на UI уровне через explicit conversion. Настройка:
 ```yaml
 spring.jpa.properties.hibernate:
   jdbc.time_zone: UTC
 ```
 
-Плюс `-Duser.timezone=UTC` в JVM args.
+Плюс JVM argument -Duser.timezone=UTC для установки JVM default timezone.
 
-Иначе `LocalDateTime` может интерпретироваться в разных TZ на разных нодах → путаница.
+Без правильной настройки LocalDateTime интерпретируется в JVM default timezone что может отличаться между podами (например если один в UTC, другой в local timezone). Приводит к inconsistent storage дат и потенциальным off-by-timezone багам в бизнес-логике.
 
-**Правило**: **всё в UTC внутри**. Отображение в UI — конвертация к timezone пользователя.
+Правило always timestamptz в PostgreSQL columns вместо timestamp. timestamptz сохраняет explicit timezone information избегая ambiguity. timestamp без timezone это naive datetime потенциально проблемный при conversion.
 
----
+## Prepared statements
 
-## 10. Prepared statements
-
-### 10.1 Что это
-
+PreparedStatement основа безопасного и эффективного query execution:
 ```java
 PreparedStatement ps = conn.prepareStatement("SELECT * FROM fno WHERE reg_num = ?");
 ps.setString(1, "12345");
 ResultSet rs = ps.executeQuery();
 ```
 
-vs regular statement:
+Vs regular Statement:
 ```java
 Statement st = conn.createStatement();
 ResultSet rs = st.executeQuery("SELECT * FROM fno WHERE reg_num = '12345'");
 ```
 
-Плюсы prepared:
-- **SQL injection** невозможен (параметры отдельно).
-- **План запроса cache**ится на сервере — быстрее следующие вызовы.
-- **Batch** возможен.
+Плюсы PreparedStatement. SQL injection невозможен — параметры передаются отдельно и правильно escaped драйвером. План запроса кэшируется на сервере — повторные execute быстрее потому что PostgreSQL не парсит и планирует каждый раз. Batch operations возможны через addBatch и executeBatch.
 
-### 10.2 Client vs server side
+Различие client-side vs server-side prepared statements. Client-side — JDBC формирует финальный SQL с подставленными значениями и шлёт как regular statement. Работает всегда, но не даёт server-side plan caching. Server-side — JDBC шлёт explicit PREPARE и EXECUTE команды, PostgreSQL хранит план. Дают maximum performance для повторяющихся queries.
 
-**Client side**: JDBC формирует SQL с подставленными значениями, шлёт как обычный statement.
-
-**Server side** ⭐: JDBC шлёт `PREPARE` + `EXECUTE` — PG хранит план.
-
-Настройка PG JDBC:
+Настройка через свойства:
 ```yaml
 data-source-properties:
-  prepareThreshold: 5              # начать серверный prepare после 5-го использования
+  prepareThreshold: 5              # начать server-side prepare после 5-го использования
   preparedStatementCacheQueries: 256
   preparedStatementCacheSizeMiB: 5
 ```
 
-Хороший тюнинг для повторяющихся запросов.
+prepareThreshold контролирует когда переключаться на server-side. 5 означает первые 5 executions client-side, потом server-side. 0 отключает server-side полностью.
 
-### 10.3 PgBouncer transaction mode ломает
+Caveat PgBouncer transaction mode. Server prepared statements хранятся в session PostgreSQL. При использовании PgBouncer transaction mode session между transactions меняется. Prepared statement подготовленное в одной transaction невидимо в следующей. Ошибки при execute. Отключить server-side prepare через prepareThreshold равное 0 при использовании PgBouncer в transaction mode.
 
-Как упоминалось (§7.2) — сервер prepared statements не сохраняются между транзакциями в PgBouncer transaction. Отключай.
+## Реальные проблемы и диагностика
 
----
+Connection is not available request timed out after 30000ms — classical сообщение при исчерпании pool. Возможные причины утечка соединений (кто-то взял, не вернул), долгие транзакции с external API вызовами внутри, pool просто мал для нагрузки.
 
-## 11. Реальные проблемы и диагностика
+Диагностика. Включить leak-detection-threshold — получить stack trace откуда connection не возвращается. pg_stat_activity показывает что делают все backends database — можно найти долго висящие queries. Метрики hikaricp.connections.pending показывают частоту waits.
 
-### 11.1 `Connection is not available, request timed out after 30000ms`
+Прод тормозит после нескольких часов работы. Возможно max-lifetime не установлен и stale connections накопились. Или firewall убивает idle connections без обнаружения приложением. Fix — установить keepalive-time для регулярной проверки idle connections.
 
-Причины:
-- Утечка соединения (кто-то взял, не отдал).
-- Долгие транзакции (внешний API внутри `@Transactional`).
-- Пул мал для нагрузки.
+После БД maintenance приложение мертво. Connections не пересоздались после перезапуска database. Fix — HikariCP has broken connection detection, но требует настройки. keepalive-time помогает обнаружить проблемы быстро. connection-test-query для older pools эквивалент.
 
-Диагностика:
-- Включить `leak-detection-threshold` — stack trace где утечка.
-- `pg_stat_activity` — что делают backend'ы.
-- Метрики `hikaricp.connections.pending`.
+PgBouncer transaction mode plus prepared statements crash. Классическая проблема. Fix — отключить client-side prepared caching через prepareThreshold равное 0. Или переход на session mode если экономия connections не критична.
 
-### 11.2 «Прод тормозит после нескольких часов»
+Реальный кейс knp-e2e-runner-hikari-isolation-poisoning из КНП memory. Раннер использовал opt-in isolation равное -1 что при shared через PgBouncer «отравляло» pool — subsequent transactions получали wrong isolation level. gate-knp краснел около 18 минут. Fix — явно установить transactionIsolation равное TRANSACTION_READ_COMMITTED вместо opt-in default.
 
-- Возможно `max-lifetime` не установлен → stale connections накопились.
-- Или firewall убивает idle → нужен `keepalive-time`.
+## Production конфигурация пример
 
-### 11.3 «После БД maintenance приложение мертво»
-
-- Соединения не пересоздались.
-- Fix: `keepalive-time` + `connection-test-query` (для старых пулов).
-- HikariCP умеет detect broken → пересоздать.
-
-### 11.4 «PgBouncer, но prepared statements крашатся»
-
-`transaction` mode → отключай client-side prep cache:
-```
-prepareThreshold=0
-preparedStatementCacheQueries=0
-```
-
-Или переходи на `session` mode (теряя экономию соединений).
-
-### 11.5 Реальный ИСНА: HikariCP #2269 isolation=-1
-
-Memory `knp-e2e-runner-hikari-isolation-poisoning`: raннер брал с opt-in isolation → пул на pp-pgbouncer отравлялся → gate-knp краснел ~18 мин. Фикс = явный `transactionIsolation: TRANSACTION_READ_COMMITTED`.
-
----
-
-## 12. Прод-конфигурация (пример)
-
+Полная production configuration для КНП микросервиса:
 ```yaml
 spring:
   datasource:
@@ -481,31 +302,32 @@ spring:
     username: ${DB_USER:knp}
     password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
-
+    
     hikari:
       pool-name: knp-hikari
       maximum-pool-size: 20
       minimum-idle: 5
       idle-timeout: 300000
       connection-timeout: 10000
-      max-lifetime: 1200000               # < PG idle_in_transaction_session_timeout
-      keepalive-time: 300000              # firewall keeper
+      max-lifetime: 1200000              # меньше PG idle_in_transaction_session_timeout
+      keepalive-time: 300000             # firewall keeper
       leak-detection-threshold: 60000
       auto-commit: false
       transaction-isolation: TRANSACTION_READ_COMMITTED
       data-source-properties:
-        socketTimeout: 60                  # секунды
+        socketTimeout: 60                # секунды
         connectTimeout: 10
         # для PgBouncer transaction mode:
         prepareThreshold: 0
         preparedStatementCacheQueries: 0
-        # для обычного PG (не через PgBouncer):
+        # для обычного PostgreSQL без PgBouncer:
         # prepareThreshold: 5
         # cachePrepStmts: true
         # useServerPrepStmts: true
-        reWriteBatchedInserts: true
+        reWriteBatchedInserts: true      # batch INSERT переписываются в multi-value
 ```
 
+Actuator для метрик:
 ```yaml
 management:
   metrics:
@@ -515,36 +337,30 @@ management:
     web.exposure.include: health,metrics,prometheus,hikaricp
 ```
 
----
+ApplicationName в URL позволяет identify connections в pg_stat_activity — очень полезно для debugging когда несколько микросервисов работают с одной database.
 
-## 13. Собесные вопросы
+## Итоги
 
-1. **Зачем connection pool?** — Избежать overhead создания соединения (TCP + auth) + ограничить количество к БД.
-2. **Что такое HikariCP?** — Самый быстрый JDBC-пул; default в Spring Boot.
-3. **Что такое `maximum-pool-size`?** — Максимум соединений; правило `(CPU × 2) + spindle`, обычно 10-30.
-4. **Что такое `connection-timeout`?** — Максимум ожидания соединения из пула.
-5. **Что такое `max-lifetime`?** — Максимальный возраст соединения; после — закрывается.
-6. **Разница `connection-timeout` и `socketTimeout`?** — Первый = ожидание в пуле; второй = ожидание ответа от БД.
-7. **Что такое `leak-detection-threshold`?** — Log warning со stack trace если соединение не возвращено N мс.
-8. **Статусы соединений в пуле?** — idle, active/in-use, awaiting, evicted.
-9. **Что такое PgBouncer?** — Connection pooler между приложением и PG; режимы session/transaction/statement.
-10. **PgBouncer transaction mode и prepared statements?** — Не работают (сохраняются в session, а session между tx меняется).
-11. **Что такое `Pageable` в Spring Data?** — Абстракция пагинации (page + size + sort); Page/Slice.
-12. **Проблема OFFSET на больших страницах?** — PG читает все N+offset строк; лучше keyset pagination.
-13. **Что такое IO wait?** — Процесс/поток блокирован ожидая I/O (сеть, диск).
-14. **Prepared statements — зачем?** — SQL injection prevention + план кэшируется + batch.
-15. **Timezone в JDBC — как правильно?** — Всё в UTC (JVM + Hibernate `jdbc.time_zone: UTC`).
+JDBC базовый API для работы с PostgreSQL из Java. PostgreSQL JDBC driver реализует TCP протокол, prepared statements, type conversion. try-with-resources для безопасного освобождения ресурсов.
 
----
+Connection pool необходим для performance. Overhead создания соединения 30-100 миллисекунд — недопустимо на каждый запрос. Pool держит открытые соединения для reuse.
 
-## Итог
+HikariCP default в Spring Boot. Самый быстрый и легковесный. Rich metrics через Micrometer.
 
-- **JDBC** → PostgreSQL через `postgresql` driver.
-- **HikariCP** = default пул, легко настраивается.
-- **Ключевые настройки**: `maximum-pool-size`, `connection-timeout`, `max-lifetime`, `leak-detection-threshold`.
-- **PgBouncer** — экономит PG connections, но требует настроек в JDBC.
-- **Prepared statements** = must (безопасность + производительность).
-- **Timezone** = UTC везде.
-- **Мониторинг**: Hikari metrics в Prometheus, `pg_stat_activity`.
+Ключевые настройки. maximum-pool-size 10-30 обычно. connection-timeout 30 секунд default. max-lifetime 20-30 минут. leak-detection-threshold 60000 обязательно в production. transaction-isolation explicit значение чтобы избежать surprises.
 
-Следующий — `30-highload-expensive-operations.md`.
+connection-timeout vs socketTimeout vs IO wait разные концепции. Первый — ожидание из pool. Второй — timeout выполнения statement. Третий — waiting for I/O в OS.
+
+Pageable в Spring Data. Page vs Slice. OFFSET expensive на глубоких страницах. Keyset pagination предпочтительна для big data.
+
+PgBouncer connection pooler между приложением и PostgreSQL. Transaction mode даёт максимальную экономию но ограничивает prepared statements и session state.
+
+SSL для production. sslmode require минимум, verify-full максимум. Overhead handshake амортизируется через pool.
+
+Timezone всё в UTC. hibernate.jdbc.time_zone UTC. JVM -Duser.timezone UTC. timestamptz в PostgreSQL всегда.
+
+Prepared statements обязательны для SQL injection prevention plus performance. Server-side prepare для повторяющихся queries. Отключить при PgBouncer transaction mode.
+
+Реальные проблемы — pool exhaustion, stale connections, PgBouncer plus prepared statements skew, isolation poisoning. Каждая имеет known cause и standard fix.
+
+Дальше — highload considerations и expensive operations как fokus на performance optimization в production системах.

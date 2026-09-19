@@ -1,289 +1,256 @@
 # 26. Keycloak: realm, client, users, roles
 
-Что такое Keycloak, его сущности, как настроить, как выдаёт токены.
+## Что такое Keycloak
 
----
+Keycloak это open source Identity and Access Management (IAM) solution от Red Hat. Предоставляет централизованное управление аутентификацией и авторизацией для множества приложений через стандартные протоколы. В экосистеме КНП Keycloak играет роль центрального IAM — все микросервисы валидируют выданные им токены для authentication и authorization.
 
-## 1. Что такое Keycloak
+Роль Keycloak в архитектуре покрывает несколько функций одновременно. OAuth2 и OpenID Connect provider — выдаёт tokens по стандартным flows, обслуживает discovery endpoint, публикует JWKS для валидации токенов. SAML 2.0 provider для enterprise интеграций где требуется этот протокол. User management — регистрация пользователей, пароли, сброс, атрибуты, роли. Federation с внешними user stores — LDAP, Active Directory, социальные сети через standard identity providers. Admin console — web UI для управления всеми аспектами системы. Adapters — client-side библиотеки для разных языков, хотя они deprecated в пользу стандартных OAuth2 клиентов.
 
-**Keycloak** — open-source Identity and Access Management (IAM) от RedHat.
+Deployment типично включает несколько нод Keycloak в кластере плюс PostgreSQL как persistent store плюс Infinispan для sessions cache. Такая конфигурация обеспечивает высокую доступность IAM что критично поскольку падение Keycloak означает что все связанные с ним приложения теряют возможность authentication.
 
-Роль:
-- **OAuth2 / OIDC provider** — выдаёт токены.
-- **SAML 2.0 provider** (для enterprise).
-- **User management** — регистрация, пароли, роли.
-- **Federation** — LDAP, Active Directory, соцсети.
-- **Admin console** — веб-морда для управления.
-- **Adapters** — библиотеки для Java, JS, Python (deprecated).
+## Основные сущности
 
-В ИСНА — центральный IAM. Все микросервисы валидируют токены оттуда.
+Keycloak организует данные в иерархическую структуру. Понимание этой иерархии критически важно для правильной настройки системы.
 
----
-
-## 2. Основные сущности
-
-Иерархия:
 ```
 Keycloak Server
     │
-    └── Realm  (изолированный контейнер)
+    └── Realm (изолированный контейнер)
          │
-         ├── Users            (пользователи)
-         ├── Groups           (группы пользователей)
-         ├── Roles (Realm)    (realm-level roles)
-         ├── Clients          (приложения)
-         │    └── Client Roles (роли специфичные клиенту)
-         ├── Identity Providers (federation: LDAP, Google, GitHub)
-         ├── Authentication Flows
-         ├── User Federation  (external stores)
-         ├── Client Scopes    (переиспользуемые наборы claims)
-         └── Events           (audit)
+         ├── Users              (пользователи с credentials)
+         ├── Groups             (логические группы пользователей)
+         ├── Realm Roles        (роли уровня realm)
+         ├── Clients            (приложения-потребители)
+         │    ├── Client Roles  (роли специфичные клиенту)
+         │    ├── Mappers       (маппинг данных в claims)
+         │    ├── Scopes        (scope конфигурация)
+         │    └── Service Account (для M2M)
+         ├── Identity Providers (federation с внешними IdP)
+         ├── User Federation    (LDAP, Kerberos, custom stores)
+         ├── Authentication Flows (customizable login sequences)
+         ├── Client Scopes      (переиспользуемые наборы claims)
+         ├── Roles Mapper       (правила маппинга ролей)
+         └── Events             (audit trail)
 ```
 
-### 2.1 Realm
+Realm это фундаментальная единица изоляции в Keycloak. Каждый realm представляет собой независимый контейнер со своими пользователями, клиентами, ролями, keys для подписи tokens. Разные realm полностью изолированы — token выданный одним realm никогда не будет валиден в другом. Типичное использование включает master realm для администрирования самого Keycloak, отдельные realm для разных бизнес доменов или клиентских организаций, dev/staging/prod realm для разных окружений.
 
-**Изолированный контейнер**. Свои users, clients, roles, keys. Разные realm — независимые «пространства».
+Практический пример из КНП. Master realm для админов Keycloak. Realm knp для пользователей налоговой системы — налогоплательщики, инспекторы, администраторы. Realm internal для сотрудников службы. Полная изоляция означает что compromise одного realm не влияет на другие, разные policies аутентификации применимы к разным аудиториям.
 
-Пример:
-- `master` — для админов Keycloak.
-- `knp` — для пользователей КНП.
-- `internal` — для сотрудников.
+Users это записи о людях или service accounts. Каждый user имеет username, email, набор атрибутов включая custom fields определённые администратором. Пароль хранится в hashed виде через настроенный algorithm. Enabled флаг позволяет временно блокировать аккаунт без удаления. Атрибуты используются в mappers для наполнения claims в токенах.
 
-Токен из одного realm НЕ валиден в другом.
+Groups это логические объединения пользователей. Пользователь может входить в несколько групп. Groups наследуют роли — пользователь автоматически получает все роли своих групп. Полезно для управления большими наборами пользователей — вместо назначения ролей каждому по одному можно управлять членством в группе. Иерархические groups поддерживаются — subgroup наследует roles родительской group.
 
-### 2.2 Users
+Roles разделяются на два типа. Realm roles определяются на уровне realm и применимы ко всем клиентам этого realm. Стандартный пример — admin, user, taxpayer как общие категории. Client roles определяются в контексте конкретного client и специфичны для этого приложения. Например client roles knpKnpIntegration CREATE_FNO, VIEW_FNO, DELETE_FNO для функциональности связанной с ФНО. Пользователь может иметь роли обоих типов одновременно, все они попадают в токен через соответствующие mappers.
 
-Пользователь realm'а:
-- Username / email.
-- Пароль (хешированный).
-- Атрибуты (custom fields).
-- Roles / groups.
-- Enabled / disabled.
+Clients представляют приложения использующие Keycloak для authentication. Каждый client имеет client_id как identifier плюс возможно client_secret для confidential clients. Access type определяет тип клиента и влияет на доступные grant types. Public клиенты для SPA, mobile apps — не могут хранить secret. Confidential клиенты для backend приложений — имеют client_secret. Bearer-only клиенты для чистых resource servers которые только валидируют tokens без инициации login flow.
 
-### 2.3 Groups
+Client настройки определяют разрешённые OAuth2 flows. Standard flow enabled активирует Authorization Code flow. Implicit flow deprecated и обычно отключено. Direct access grants соответствует password grant, обычно отключено кроме legacy migrations. Service accounts enabled активирует Client Credentials flow для M2M сценариев.
 
-Логическая группа пользователей. Наследует roles.
+Client Scopes представляют переиспользуемые конфигурации mappers и требуемых claims. Scope может быть default (всегда включён в токены client) или optional (включается только когда запрошен). Стандартные OIDC scopes включают profile для basic user info, email для email address, address для physical address. Custom scopes определяют application specific наборы claims. Использование scopes упрощает управление — общие sets claims определяются один раз и переиспользуются в разных clients.
 
-### 2.4 Roles
+## Mappers
 
-**Realm role** — общая для realm (`admin`, `user`).
-**Client role** — специфична клиенту (`isnaKnp:CREATE_FNO`).
+Mapper определяет правило как данные из user record попадают в claims JWT токенов. Без mapper токен содержит только базовые claims — sub, exp, iat. Mappers добавляют custom claims делающие токен полезным для application.
 
-У пользователя может быть много ролей: и realm, и client-специфичных.
+Типы mappers покрывают разные источники данных. User Attribute Mapper берёт значение custom attribute пользователя и помещает в claim. User Property Mapper использует стандартные поля пользователя (username, email, firstName) как claims. Group Membership Mapper добавляет список групп пользователя как claim обычно groups. Role Mapper специализированный для ролей, помещает их в claim обычно как список.
 
-### 2.5 Clients
+Hardcoded Claim Mapper вставляет фиксированное значение независимо от пользователя. Полезно для marker claims идентифицирующих tenant или environment. Script Mapper использует JavaScript или Java для complex логики — вычисляемые claims, transformations, conditional inclusion. Мощный но требует care потому что скрипт выполняется на каждом token issuance.
 
-Приложения, использующие Keycloak.
+Keycloak по умолчанию использует специфическую структуру для ролей в токенах. Realm roles попадают в realm_access.roles как array. Client roles идут в resource_access.<client_id>.roles также как array. Пример структуры claims:
 
-**Access type**:
-- **Public** — SPA, mobile. Нет secret.
-- **Confidential** — backend, есть client_secret.
-- **Bearer-only** — только resource server (проверяет токены, не логинит).
-
-**Standard flow enabled** — Authorization Code flow.
-**Implicit flow** — deprecated.
-**Direct access grants** — Password grant (для legacy).
-**Service accounts enabled** — Client Credentials (M2M).
-
-### 2.6 Client Scopes
-
-Переиспользуемый набор claims, mapper'ов, ролей.
-
-Например `email` scope добавляет claim `email`, `email_verified`. `profile` — `given_name`, `family_name`, `picture`.
-
----
-
-## 3. Mappers
-
-**Mapper** — как поле пользователя → в claim JWT.
-
-Типы:
-- **User Attribute** — атрибут → claim.
-- **User Property** — стандартное поле (username, email) → claim.
-- **Group Membership** — список групп → claim `groups`.
-- **Role Mapper** — роли → claim `realm_access.roles` / `resource_access.<client>.roles`.
-- **Hardcoded Claim** — фиксированное значение.
-- **Script** — JS/Java для сложной логики.
-
-По умолчанию Keycloak кладёт роли специфично:
 ```json
 {
+    "sub": "b3f2a1c4-...",
+    "preferred_username": "berik",
+    "email": "berik@example.com",
     "realm_access": {
         "roles": ["admin", "user"]
     },
     "resource_access": {
         "isna-knp-integration": {
-            "roles": ["CREATE_FNO"]
+            "roles": ["CREATE_FNO", "VIEW_FNO"]
+        },
+        "isna-knp-front": {
+            "roles": ["UI_ACCESS"]
         }
     }
 }
 ```
 
-Spring Security по умолчанию НЕ знает про эту структуру → надо кастомный `JwtAuthenticationConverter` (см. `27-spring-security-oauth2-keycloak.md`).
+Spring Security по default не понимает эту структуру — читает только scope claim который стандартный OAuth2 scope. Для работы с Keycloak-специфичной структурой ролей нужен custom JwtAuthenticationConverter преобразующий эти claims в GrantedAuthorities. Это одна из основных задач при интеграции Spring Security с Keycloak.
 
----
+## Endpoints Keycloak
 
-## 4. Endpoints Keycloak
+Каждый realm имеет стандартный набор OIDC endpoints. Все URLs формируются от base URL Keycloak плюс имя realm.
 
-Основные URL:
 ```
-Base: https://keycloak.isna/realms/knp
+Base URL для realm:
+  https://keycloak.isna/realms/knp
 
-.well-known:
+Discovery endpoint (все URLs автоматически):
   https://keycloak.isna/realms/knp/.well-known/openid-configuration
 
-Authorization (для UI login flow):
+Authorization endpoint (UI login flow):
   https://keycloak.isna/realms/knp/protocol/openid-connect/auth
 
-Token:
+Token endpoint (обмен code, client credentials, refresh):
   https://keycloak.isna/realms/knp/protocol/openid-connect/token
 
-Userinfo:
+Userinfo endpoint (OIDC user info):
   https://keycloak.isna/realms/knp/protocol/openid-connect/userinfo
 
-JWKS (публичные ключи):
+JWKS endpoint (публичные ключи для валидации подписи):
   https://keycloak.isna/realms/knp/protocol/openid-connect/certs
 
-Logout:
+Logout endpoint (RP-initiated logout):
   https://keycloak.isna/realms/knp/protocol/openid-connect/logout
 
-Introspection (для opaque tokens):
+Introspection endpoint (для opaque tokens):
   https://keycloak.isna/realms/knp/protocol/openid-connect/token/introspect
 
-Revocation:
+Revocation endpoint (отзыв tokens):
   https://keycloak.isna/realms/knp/protocol/openid-connect/revoke
 
-Admin REST API:
+Admin REST API (управление realm):
   https://keycloak.isna/admin/realms/knp/users
+  https://keycloak.isna/admin/realms/knp/clients
+  https://keycloak.isna/admin/realms/knp/roles
 ```
 
----
+Discovery endpoint критически важен потому что через него клиенты автоматически конфигурируются. Одно поле issuer-uri в Spring Security достаточно — Spring читает discovery document и получает все другие URLs автоматически. Это standard OIDC practice работающий с любым compliant provider не только Keycloak.
 
-## 5. Стандартный flow
+## Стандартный Authorization Code flow
 
-### 5.1 Authorization Code (для UI)
+Практический пример прохождения полного flow для UI приложения КНП. Пользователь на knp.kgd.gov.kz кликает Войти. Дальше происходит следующая последовательность.
 
-Пользователь на knp.kgd.gov.kz кликает «Войти»:
-
-1. **Redirect на Keycloak**:
-   ```
-   GET https://keycloak.isna/realms/knp/protocol/openid-connect/auth?
-       client_id=isna-knp-front&
-       redirect_uri=https://knp.kgd.gov.kz/callback&
-       response_type=code&
-       scope=openid profile email&
-       state=<random>&
-       code_challenge=<sha256(code_verifier)>&
-       code_challenge_method=S256
-   ```
-
-2. **Пользователь вводит логин/пароль на Keycloak-странице**.
-
-3. **Redirect обратно с code**:
-   ```
-   GET https://knp.kgd.gov.kz/callback?code=<code>&state=<state>
-   ```
-
-4. **Frontend/backend обменивает code на token**:
-   ```
-   POST https://keycloak.isna/realms/knp/protocol/openid-connect/token
-   grant_type=authorization_code
-   code=<code>
-   redirect_uri=https://knp.kgd.gov.kz/callback
-   client_id=isna-knp-front
-   code_verifier=<original>
-   ```
-
-5. **Ответ**:
-   ```json
-   {
-       "access_token": "eyJ...",
-       "refresh_token": "eyJ...",
-       "id_token": "eyJ...",
-       "expires_in": 300,
-       "refresh_expires_in": 1800,
-       "token_type": "Bearer"
-   }
-   ```
-
-6. Frontend хранит токены, использует access_token в API.
-
-### 5.2 Client Credentials (M2M)
-
-Один сервис (`isna-knp-fno`) вызывает другой (`isna-knp-user`).
-
-1. **Получить токен**:
-   ```
-   POST https://keycloak.isna/realms/knp/protocol/openid-connect/token
-   grant_type=client_credentials
-   client_id=isna-knp-fno
-   client_secret=<secret>
-   ```
-
-2. **Ответ**:
-   ```json
-   {
-       "access_token": "eyJ...",
-       "expires_in": 300
-   }
-   ```
-
-3. **API вызов**:
-   ```
-   GET https://isna-knp-user/api/users/123
-   Authorization: Bearer <access_token>
-   ```
-
-Реальный кейс из ИСНА `taxreport21-java21-runtime-regressions` — bearer-канал НЗ падал OAuth NoSuchMethodError (spring-security jose skew).
-
-### 5.3 Refresh
-
+Redirect на Keycloak с параметрами:
 ```
-POST /token
-grant_type=refresh_token
-refresh_token=<old>
+GET https://keycloak.isna/realms/knp/protocol/openid-connect/auth?
+    client_id=isna-knp-front&
+    redirect_uri=https://knp.kgd.gov.kz/callback&
+    response_type=code&
+    scope=openid profile email&
+    state=<random-csrf-protection>&
+    code_challenge=<sha256-of-verifier-base64url>&
+    code_challenge_method=S256
+```
+
+Пользователь вводит username и пароль на Keycloak login странице. Никакой пароль не проходит через client application — только на Keycloak. После successful authentication Keycloak redirect обратно на client:
+```
+GET https://knp.kgd.gov.kz/callback?
+    code=<authorization-code>&
+    state=<same-state-value>
+```
+
+Client проверяет state matches ожидаемый (защита от CSRF). Обменивает code на tokens:
+```
+POST https://keycloak.isna/realms/knp/protocol/openid-connect/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&
+code=<authorization-code>&
+redirect_uri=https://knp.kgd.gov.kz/callback&
+client_id=isna-knp-front&
+code_verifier=<original-random-value>
+```
+
+Ответ содержит tokens:
+```json
+{
+    "access_token": "eyJhbGci...",
+    "refresh_token": "eyJhbGci...",
+    "id_token": "eyJhbGci...",
+    "expires_in": 300,
+    "refresh_expires_in": 1800,
+    "token_type": "Bearer"
+}
+```
+
+Frontend сохраняет tokens securely (HttpOnly cookie для web) и использует access_token в Authorization header для всех API запросов к backend.
+
+## Client Credentials flow
+
+Machine-to-machine коммуникация между микросервисами КНП использует Client Credentials flow. Пример когда isna-knp-fno сервису нужно позвать isna-knp-user API от имени сервиса не пользователя.
+
+Получение токена:
+```
+POST https://keycloak.isna/realms/knp/protocol/openid-connect/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&
+client_id=isna-knp-fno-service&
+client_secret=<securely-stored-secret>
+```
+
+Ответ:
+```json
+{
+    "access_token": "eyJhbGci...",
+    "expires_in": 300,
+    "token_type": "Bearer",
+    "scope": "profile email"
+}
+```
+
+API вызов с полученным токеном:
+```
+GET https://isna-knp-user/api/users/123
+Authorization: Bearer <access_token>
+```
+
+Client Credentials flow не выдаёт refresh_token — client может получить новый access_token в любой момент используя свои credentials. Обычно клиенты кэшируют access_token до его expiration и получают новый когда старый почти истёк, минимизируя нагрузку на Keycloak.
+
+Реальный кейс из КНП — memory taxreport21-java21-runtime-regressions показал что bearer канал НЗ падал с OAuth NoSuchMethodError из-за skew версий spring-security-jose и spring-security-core. Урок — версии всех Spring Security компонентов должны быть согласованы через BOM.
+
+## Refresh Token flow
+
+При истечении access_token client обменивает refresh_token на новый access_token без re-authentication пользователя:
+```
+POST https://keycloak.isna/realms/knp/protocol/openid-connect/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token&
+refresh_token=<current-refresh-token>&
 client_id=isna-knp-front
 ```
 
-Возвращается новый access + иногда rotated refresh.
+Возвращается новый access_token и опционально rotated refresh_token. Rotation refresh_token это security best practice — каждый refresh инвалидирует старый refresh_token, обнаруживая кражу если атакующий использовал token до legitimate user.
 
----
+## ЭЦП flow Казахстан-специфика
 
-## 6. ЭЦП flow (Казахстан-specific)
+В КНП пользователи аутентифицируются не только логин/пароль но и электронной цифровой подписью через криптоплагин Kalkan. Это Kazakhstan-specific требование поддерживается через custom authentication flow в Keycloak.
 
-В ИСНА пользователи не только логин/пароль, но и **ЭЦП (Kalkan)**.
+Схема работы. Frontend просит пользователя подписать challenge через ЭЦП plugin. Пользователь подписывает ключом хранящимся в NCA storage или на USB. Frontend отправляет подпись на backend. Backend валидирует ЭЦП, извлекает данные из certificate — ИИН, ФИО. Обменивает у Keycloak на токен через custom flow используя Direct Grant с custom authenticator.
 
-Обычно:
-1. Frontend просит пользователя подписать «challenge» ЭЦП.
-2. Отправляет подпись на backend.
-3. Backend валидирует ЭЦП, извлекает данные пользователя (ИИН).
-4. Обменивает у Keycloak на токен через custom flow (Direct Grant с custom authenticator).
+Технически это реализуется через custom Authentication Flow в Keycloak с custom Authenticator SPI написанным на Java. Authenticator реализует логику проверки ЭЦП, извлечения атрибутов пользователя, поиска или создания user record. Deployment требует упаковки Authenticator в JAR и разворачивания в Keycloak providers directory.
 
-Технически — свой Authentication Flow в Keycloak с custom Authenticator SPI.
+Такой подход даёт полную интеграцию ЭЦП с остальной OIDC инфраструктурой. Пользователь после ЭЦП авторизации получает стандартные OIDC tokens которые могут быть использованы во всех сервисах платформы без специальной обработки ЭЦП на каждом уровне.
 
----
+## Admin REST API
 
-## 7. Admin API
+Keycloak предоставляет полноценный REST API для управления realm. API покрывает все operations доступные в Admin console — создание/изменение/удаление users, clients, roles, group memberships, custom attributes.
 
-Полный REST для управления:
-
+Основные endpoints:
 ```
-GET  /admin/realms/knp/users
-POST /admin/realms/knp/users
-PUT  /admin/realms/knp/users/{id}
-GET  /admin/realms/knp/users/{id}/role-mappings/realm
-POST /admin/realms/knp/users/{id}/role-mappings/realm
-GET  /admin/realms/knp/clients
+GET  /admin/realms/{realm}/users
+POST /admin/realms/{realm}/users
+PUT  /admin/realms/{realm}/users/{id}
+DELETE /admin/realms/{realm}/users/{id}
+
+GET  /admin/realms/{realm}/users/{id}/role-mappings/realm
+POST /admin/realms/{realm}/users/{id}/role-mappings/realm
+
+GET  /admin/realms/{realm}/clients
+GET  /admin/realms/{realm}/roles
+GET  /admin/realms/{realm}/groups
 ```
 
-Требует admin-token. Обычно service account с client_credentials.
+Аутентификация в API через bearer token. Обычно используется service account с client_credentials — специальный client настроенный с admin роли для управления realm. Никогда не использовать admin console credentials в автоматизации.
 
-Использование:
-- Автопровижнинг пользователей.
-- Массовые операции (список активных, отзыв доступа).
-- Custom-скрипты для интеграции.
+Использование Admin API покрывает несколько сценариев. Автопровижнинг пользователей при интеграции с внешними системами — новые сотрудники автоматически появляются в Keycloak из HR system. Массовые операции — генерация reports по активным пользователям, bulk revocation прав при security incidents. Custom скрипты для интеграции — например синхронизация atributes из external system периодически.
 
-Есть Java admin-client:
+Java admin client предоставляет typed API вместо raw HTTP:
 ```java
 Keycloak kc = KeycloakBuilder.builder()
     .serverUrl("https://keycloak.isna")
@@ -293,167 +260,93 @@ Keycloak kc = KeycloakBuilder.builder()
     .clientSecret("...")
     .build();
 
-kc.realm("knp").users().search("berik");
+List<UserRepresentation> users = kc.realm("knp").users().search("berik");
 ```
 
----
+## User Federation
 
-## 8. Federation
+Keycloak может интегрироваться с внешними user stores чтобы не дублировать данные пользователей. Federation полезна для организаций где existing directory (LDAP, AD) является source of truth для user identities.
 
-Keycloak может подключаться к внешним источникам пользователей:
-- **LDAP / Active Directory** — синхронизация users.
-- **Kerberos**.
-- **SAML / OIDC** — другие IdP (Google, GitHub).
+LDAP и Active Directory поддерживаются напрямую через встроенный User Storage Provider. Настройка включает LDAP URL, bind DN и credentials, base DN для поиска пользователей, mappings атрибутов между LDAP и Keycloak model. Пользователи из LDAP автоматически появляются в Keycloak при первом успешном login, credentials проверяются через LDAP bind, atributes синхронизируются из LDAP.
 
-Пользователи из LDAP появляются в Keycloak, могут логиниться под своими credentials.
+Kerberos поддерживается через SPNEGO integration для seamless SSO в корпоративных environments где пользователи уже authenticated через domain login. SAML и OIDC federation позволяют использовать другие Identity Providers — Google, GitHub, Microsoft Azure AD как upstream аутентификация. Custom User Storage Providers через SPI позволяют интеграцию с proprietary user stores.
 
----
+## Authentication Flows
 
-## 9. Authentication Flows
+Authentication flow в Keycloak это настраиваемая последовательность шагов при login. Стандартные встроенные flows покрывают типичные сценарии — Browser flow для web login, Direct Grant flow для password grant, Reset Credentials для password recovery, Registration для sign-up.
 
-Конфигурируемая цепочка шагов при логине. Стандартные:
-- Cookie (SSO)
-- Kerberos (SPNEGO)
-- Identity provider redirect
-- Forms (username/password)
-- OTP
-- WebAuthn
-- Password reset
+Каждый flow состоит из последовательных executions каждый выполняющий specific проверку. Cookie execution проверяет existing SSO session. Identity provider redirect позволяет federated login. Forms представляет username/password form. OTP execution требует one-time password. WebAuthn поддерживает passwordless authentication через platform authenticators.
 
-Можно построить свою:
-- Password → OTP (mandatory) → captcha → success.
+Каждый execution имеет requirement — REQUIRED (обязательное успешное завершение), ALTERNATIVE (одно из группы должно пройти), DISABLED (пропустить), CONDITIONAL (выполнить условно).
 
-Или custom Authenticator (Java class) — например «войти по ЭЦП».
+Custom flows позволяют комбинировать executions создавая специфические scenarios. Например flow «password обязательно, потом OTP обязательно» реализует two-factor authentication. Flow «либо ЭЦП либо password + OTP» даёт выбор пользователю с fallback.
 
----
+Custom Authenticators расширяют возможности — Java class реализующий Authenticator interface, deployed как JAR в providers directory. Позволяет arbitrary логику включая integration с внешними системами вроде ЭЦП верификации в КНП.
 
-## 10. Themes
+## Themes
 
-Кастомизация UI (login page, email templates). HTML/CSS/JS + FreeMarker templates.
+Themes управляют визуальным представлением user-facing страниц Keycloak — login page, registration, password reset, error pages. Также email templates для системных email включая password reset, email verification, account confirmation.
 
-В ИСНА обычно свои темы под брендинг.
+Structure themes использует FreeMarker templates для HTML, отдельные CSS для styling, JavaScript для интерактивности. Themes организованы в директории со specific структурой которую Keycloak scans при старте.
 
----
+В КНП обычно custom themes под corporate branding — цвета, лого, welcome текст, formatted email templates. Custom themes упаковываются как JAR и deployment в Keycloak themes directory.
 
-## 11. Adapters (DEPRECATED)
+## Adapters deprecated
 
-Раньше Keycloak давал client-адаптеры для Java (`keycloak-spring-boot-starter`). Они делали всё сами: интегрировались с Spring Security, парсили токены, извлекали роли.
+Раньше Keycloak предоставлял client-side adapters для интеграции с приложениями — keycloak-spring-boot-starter, keycloak-spring-security-adapter, keycloak-tomcat-adapter и другие. Adapters делали всё автоматически — интеграция с Spring Security, парсинг токенов, извлечение ролей.
 
-**С 2022 адаптеры deprecated**. Рекомендуется — **Spring Security OAuth2 Resource Server** (стандартный).
+С 2022 adapters помечены deprecated. Рекомендуемый подход — стандартный Spring Security OAuth2 Resource Server работающий с любым OIDC-compliant provider. Причины deprecation включают дублирование функциональности со стандартами, сложность поддержки для новых версий Spring, привязка приложения к Keycloak-специфичному API вместо стандартов.
 
-Плюсы миграции:
-- Стандартный подход, не Keycloak-специфичный.
-- Легче обновлять Spring Boot.
-- Работает с любым OIDC provider.
+Плюсы миграции на стандартный Spring Security подход. Portability — приложение работает с любым OIDC provider не только Keycloak. Проще обновлять Spring Boot версии — не нужно ждать пока Keycloak выпустит совместимый adapter. Better integration с остальной Spring экосистемой — standard patterns и practices.
 
-Минусы:
-- Роли Keycloak в claim `realm_access` / `resource_access` — Spring не знает про это по умолчанию. Нужен кастомный `JwtAuthenticationConverter`.
+Минусы миграции — Keycloak-specific структура ролей в realm_access и resource_access не понимается Spring по default. Требуется custom JwtAuthenticationConverter преобразующий эти claims в GrantedAuthorities. Некоторая работа для миграции но подробно описано в файле 27.
 
-В ИСНА постепенно перешли или переходят с adapter на Spring Security Resource Server (см. `27-spring-security-oauth2-keycloak.md`).
+В КНП постепенный переход или уже переход на Spring Security OAuth2 Resource Server от Keycloak adapters. Отдельные модули могут ещё использовать adapters но новые модули и мигрирующие делают через стандартный подход.
 
----
+## Настройка realm пример
 
-## 12. Настройка в realm (пример)
+Полный setup нового realm в Keycloak включает несколько шагов. Создание realm через Admin console — Add realm, указать name (например knp), enabled true.
 
-### 12.1 Создать realm
+Создание клиентов для разных use cases. Bearer-only client для backend API — Client ID isna-knp-integration, protocol openid-connect, access type bearer-only, standard flow off, direct access grants off (только валидация tokens). Public client для UI SPA — Client ID isna-knp-front, access type public, valid redirect URIs со wildcard для https://knp.kgd.gov.kz/*, web origins + для CORS, standard flow on, PKCE required. Confidential client для M2M — Client ID isna-knp-fno-service, access type confidential, service accounts enabled, standard flow off, direct access grants off.
 
-Admin console → Add realm → `knp`.
+Создание ролей. Realm roles общие — admin, user, taxpayer. Client roles на isna-knp-integration специфичные для операций — CREATE_FNO, VIEW_FNO, DELETE_FNO, KNP_PERM_CREATE_NZ_N07 для конкретных permissions.
 
-### 12.2 Создать клиент
+Создание пользователя. Username berik, email, first name, last name. Set password с temporary flag чтобы пользователь сменил при первом login. Role mapping — assign taxpayer realm role, CREATE_FNO client role на isna-knp-integration.
 
-- Client ID: `isna-knp-integration`
-- Client protocol: `openid-connect`
-- Access type: `bearer-only` (только проверяет токены)
+Настройка mappers. Default mappers для realm roles и client roles уже присутствуют — realm_access.roles и resource_access.<client>.roles. Custom mapper для group membership если groups используются. Custom attribute mappers если применимы — tenant_id, department, любые бизнес-specific атрибуты.
 
-Для UI:
-- Client ID: `isna-knp-front`
-- Access type: `public`
-- Valid redirect URIs: `https://knp.kgd.gov.kz/*`
-- Web Origins: `+` (для CORS)
-- Standard flow: on
-- PKCE: on
+Настройка token settings — access token lifespan 5 минут, refresh token lifespan 30 минут, SSO session idle timeout 30 минут, SSO session max lifespan 10 часов. Настройка client scopes для переиспользуемых конфигураций между клиентами.
 
-Для M2M:
-- Client ID: `isna-knp-fno-service`
-- Access type: `confidential`
-- Service accounts: enabled
-- Standard flow: off
-- Direct access grants: off
+## HA и мониторинг
 
-### 12.3 Создать роли
+Keycloak stateful приложение — держит sessions в memory. Persistent данные (users, roles, clients) хранятся в external database обычно PostgreSQL. Sessions cache используется Infinispan.
 
-Realm roles: `admin`, `user`, `taxpayer`.
-Client roles на `isna-knp-integration`: `CREATE_FNO`, `VIEW_FNO`, `KNP_PERM_CREATE_NZ_N07`.
+Standalone deployment для development и небольших installations — один Keycloak instance с embedded H2 database. Простой но не подходит для production.
 
-### 12.4 Создать пользователя
+Cluster deployment для production — несколько Keycloak nodes, external database (PostgreSQL), Infinispan для sessions с replication между nodes. Обычно 3 или больше nodes для HA. Load balancer перед nodes для распределения трафика. Sticky sessions предпочтительны хотя не обязательны с полной sessions replication.
 
-- Username: berik
-- Email, name.
-- Set password (temporary).
-- Role mapping: `taxpayer`.
+Мониторинг критически важен потому что Keycloak central IAM — его failure ломает authentication во всех связанных приложениях. Metrics endpoint /metrics в Prometheus формате экспортирует все ключевые показатели — request rates, latencies, error rates, session counts, cache hit rates.
 
-### 12.5 Mappers
+Events log audit trail всех security-relevant событий. Login success, login failure, logout, token refresh, admin actions — все логируются с deltas of context. Storage events возможно в database или external system. Alerting на suspicious patterns — многочисленные failed login attempts, admin actions outside business hours.
 
-- Realm roles → `realm_access.roles` (default).
-- Client roles → `resource_access.<client>.roles` (default).
-- Group membership → `groups` (custom).
+Admin events отдельно логируют changes конфигурации — user create/delete, role assignments, client updates, realm configuration changes. Critical для audit compliance и security investigations.
 
----
+## Итоги
 
-## 13. HA и мониторинг
+Keycloak это open source IAM платформа предоставляющая OAuth2/OIDC provider, user management, federation, admin capabilities. В КНП играет роль центрального IAM для всех микросервисов.
 
-### 13.1 HA
+Иерархия сущностей — Realm как контейнер изоляции, внутри users, groups, roles (realm и client), clients, mappers, scopes. Клиенты трёх типов — public для SPA/mobile, confidential для backend, bearer-only для чистых resource servers.
 
-Keycloak — stateful. Session хранится в:
-- Infinispan cache (embedded).
-- External (кластерная конфигурация).
+Mappers определяют как user data попадает в JWT claims. Keycloak specific структура ролей в realm_access и resource_access требует custom JwtAuthenticationConverter в Spring Security для правильного парсинга.
 
-В production — cluster с 3+ node + внешний БД + Infinispan replication.
+Стандартный набор OIDC endpoints per realm — discovery, authorization, token, userinfo, JWKS, logout, introspection, revocation. Discovery endpoint позволяет автоматическую конфигурацию клиентов через одну строку issuer-uri.
 
-### 13.2 БД
+Authorization Code flow стандарт для UI приложений. Client Credentials для M2M. Refresh Token для обновления. Password grant deprecated. ЭЦП flow в КНП через custom Authenticator SPI.
 
-Persistent store — обычно PostgreSQL. Хранит:
-- Users.
-- Realms.
-- Clients.
-- Roles.
-- Sessions (опционально).
+Admin REST API для программного управления. User Federation для integration с external directories вроде LDAP. Authentication Flows customizable для complex scenarios. Themes для branding. Custom Authenticators через SPI для extension.
 
-### 13.3 Мониторинг
+Adapters deprecated в пользу стандартного Spring Security OAuth2 Resource Server. Portability и integration benefits перевешивают need в custom JwtAuthenticationConverter.
 
-- Metrics endpoint `/metrics` (Prometheus).
-- Events log (login, failed, token refresh).
-- Admin events (user create/delete).
+HA deployment через cluster с external database и Infinispan sessions replication. Мониторинг через Prometheus metrics плюс events log критически важен потому что Keycloak central IAM.
 
----
-
-## 14. Собесные вопросы
-
-1. **Что такое Keycloak?** — OAuth2/OIDC provider, IAM, open-source.
-2. **Что такое realm?** — Изолированный контейнер users/clients/roles.
-3. **Разница realm role и client role?** — Realm role — общая; client role — специфична приложению.
-4. **Access types клиента?** — Public (SPA), confidential (backend с secret), bearer-only (только validation).
-5. **Что такое mapper?** — Правило как поле пользователя попадает в claim JWT.
-6. **Где Keycloak кладёт роли в JWT?** — `realm_access.roles` и `resource_access.<client>.roles`.
-7. **Что такое discovery endpoint?** — `/realms/<r>/.well-known/openid-configuration`.
-8. **JWKS в Keycloak?** — `/realms/<r>/protocol/openid-connect/certs` — публичные ключи.
-9. **Как получить токен для M2M?** — Client Credentials flow с client_secret.
-10. **Что такое Client Scope?** — Переиспользуемый набор mappers / claims.
-11. **Adapters deprecated — что взамен?** — Spring Security OAuth2 Resource Server.
-12. **Как интегрировать с LDAP?** — User Federation → LDAP; users синхронизируются.
-13. **Что такое Authentication Flow?** — Настраиваемая цепочка шагов при логине (пароль → OTP → ...).
-
----
-
-## Итог
-
-- **Keycloak** = центральный IAM в ИСНА.
-- **Realm** = изоляция пространства.
-- **Client** = приложение (public / confidential / bearer-only).
-- **Realm + Client roles** — иерархия ролей.
-- **Mappers** — поля пользователя → JWT claims.
-- **Discovery + JWKS** — auto-конфиг Spring Security.
-- **Admin REST API** для управления.
-- **Adapters deprecated** → Spring Security OAuth2 Resource Server.
-
-Следующий — `27-spring-security-oauth2-keycloak.md`.
+Следующий файл — Spring Security плюс OAuth2 плюс Keycloak в production, конкретная реализация всех этих концепций в микросервисах.

@@ -1,440 +1,299 @@
 # 30. Дорогостоящие операции в highload проектах
 
-Что убивает производительность. Как узнать что дорого, что дешёво. Правила highload.
+## Иерархия дороговизны операций
 
----
+Понимание относительной стоимости операций критически важно для проектирования highload систем. Разница между быстрыми и медленными операциями составляет несколько порядков магнитуды, что делает правильный выбор архитектуры решающим для производительности.
 
-## 1. Иерархия «дороговизны» операций
-
-Ориентировочные времена (для средней машины):
+Ориентировочные времена типичных операций на современной серверной машине:
 
 ```
-Регистр CPU                ~1 нс          × 1
-L1 cache                   ~1 нс          × 1
-L2 cache                   ~4 нс          × 4
-L3 cache                   ~15 нс         × 15
-RAM                        ~100 нс        × 100
-NVMe SSD (random)          ~100 мкс       × 100 000
-Network (local DC)         ~500 мкс       × 500 000
-HDD (random)               ~10 мс         × 10 000 000
-Network (cross-region)     ~150 мс        × 150 000 000
+Регистр CPU                ~1 нс          ×1
+L1 cache                   ~1 нс          ×1
+L2 cache                   ~4 нс          ×4
+L3 cache                   ~15 нс         ×15
+RAM                        ~100 нс        ×100
+NVMe SSD (random)          ~100 мкс       ×100 000
+Network (local DC)         ~500 мкс       ×500 000
+HDD (random)               ~10 мс         ×10 000 000
+Network (cross-region)     ~150 мс        ×150 000 000
 ```
 
-Разница между L1 и HDD — **7 порядков** (10 миллионов раз).
+Разница между L1 cache и HDD составляет семь порядков магнитуды — десять миллионов раз. Это не просто abstract number — практическое последствие в том что операция кажущаяся быстрой в testing environment может стать bottleneck в production под нагрузкой.
 
-**Правило**: чем ближе к CPU, тем дешевле. Всё что «идёт наружу» (диск, сеть, БД) — дорого.
+Фундаментальное правило — чем ближе к CPU тем дешевле операция. Всё что идёт «наружу» — диск, сеть, database — принципиально дорого по сравнению с in-memory операциями. Architectural решения должны минимизировать количество таких «внешних» вызовов на critical path.
 
----
+## Что реально дорого в highload
 
-## 2. Что реально дорого в highload
+Ниже разберём наиболее значимые категории дорогостоящих операций встречающиеся в реальных приложениях.
 
-### 2.1 Синхронный HTTP-вызов внутри транзакции ⭐⭐⭐
-
+Синхронный HTTP-вызов внутри транзакции это критическая ошибка часто встречающаяся в enterprise коде:
 ```java
 @Transactional
 void submit(Fno f) {
     repo.save(f);
-    externalApi.call(f);   // ← 30 сек ждём внешний API, ВСЁ ЭТО ВРЕМЯ transaction ОТКРЫТА
+    externalApi.call(f);   // ← до 30 секунд ждём внешний API
     audit(f);
 }
 ```
 
-Последствия:
-- Connection в пуле занят 30 сек.
-- Row locks в БД держатся.
-- Deadlock'и растут.
-- Пул исчерпается → 500 на новых запросах.
-- Прод падает.
+Последствия катастрофические. Connection в pool занят все время внешнего вызова. Row locks в БД держатся всё это время. Deadlocks растут потому что locks дольше живут. Pool исчерпается быстро при нескольких таких запросах. Приложение возвращает 500 на новых запросах когда pool exhausted.
 
-**Правило**: **никаких сетевых вызовов внутри `@Transactional`**. Только БД.
-
-Fix:
+Правило абсолютное — никаких сетевых вызовов внутри @Transactional. Только database операции. Fix путём разбиения на короткую transaction plus внешний вызов вне неё:
 ```java
 void submit(Fno f) {
-    doSave(f);                // короткая tx
-    externalApi.call(f);      // снаружи tx
+    doSave(f);                // короткая транзакция
+    externalApi.call(f);      // вне транзакции
 }
+
 @Transactional
-void doSave(Fno f) { repo.save(f); }
+void doSave(Fno f) { 
+    repo.save(f); 
+}
 ```
 
-Или **outbox pattern**: сохранить в БД + запись «отправь этому API», отдельный job подхватит.
+Или через outbox pattern — сохранить в БД запись «отправь этому API», отдельный job подхватит и вызовет вне transaction контекста. Дополнительно даёт guarantee что вызов произойдёт даже при сбое.
 
-### 2.2 N+1 запросы ⭐⭐⭐
+N+1 запросы это одна из наиболее частых performance проблем в ORM-based приложениях. Обсуждалось в файле 15. Каждый дополнительный SQL — round-trip к database — 1-5 миллисекунд. При 1000 запросов вместо одного JOIN легко получить 5 секунд дополнительной latency. Лечится через JOIN FETCH, EntityGraph, DTO projection, @BatchSize.
 
-Обсуждали в `15-jpa-performance.md`. Каждый лишний SQL = round-trip = 1-5 мс. 1000 SELECT вместо одного JOIN = +5 сек latency.
+Отсутствие индекса (Seq Scan) убийственно для больших таблиц. Таблица с 10 миллионами строк без индекса — PostgreSQL читает все 10 миллионов при каждом query. С индексом читаются 10-100 строк. Разница в latency 100 000 раз. Диагностика через EXPLAIN ANALYZE ищет Seq Scan на больших таблицах.
 
-Лечится: JOIN FETCH / EntityGraph / DTO projection / @BatchSize.
+SELECT COUNT(*) на большой таблице специфическая проблема PostgreSQL. Из-за MVCC невозможно просто взять число из header — PostgreSQL должен прочитать все строки чтобы определить какие видимы для текущей transaction. На таблице 10 миллионов строк может занять несколько секунд.
 
-### 2.3 Отсутствие индекса (Seq Scan) ⭐⭐⭐
+Решения включают кэширование count с периодическим обновлением. Approximate count из pg_class.reltuples — приблизительно достаточно для UI. Slice вместо Page в Spring Data — избегает COUNT query. Секционирование таблицы уменьшает scope count. Materialized view для аналитических dashboard.
 
-Таблица 10M строк, запрос без индекса → PG читает все 10M строк.
-С индексом → 10-100 строк.
-
-Разница 100 000× в latency.
-
-Проверить: `EXPLAIN ANALYZE`. Ищи `Seq Scan` на больших таблицах.
-
-### 2.4 SELECT COUNT(*) на большой таблице
-
-PG вынужден прочитать все строки (для MVCC — нельзя просто взять число из header). На таблице 10M — до нескольких секунд.
-
-Fixes:
-- Кэшировать (обновлять периодически).
-- `EXPLAIN` — approximate count.
-- Использовать `Slice` вместо `Page` (без COUNT).
-- Секционировать таблицу.
-- В аналитике — материализованный view.
-
-### 2.5 OFFSET для пагинации на больших страницах
-
-`OFFSET 100000 LIMIT 20` → PG читает 100020 строк, отбрасывает 100000. Медленно.
-
-Fix: **keyset pagination** (курсор):
+OFFSET для pagination на больших страницах. OFFSET 100000 LIMIT 20 заставляет PostgreSQL прочитать 100020 строк из индекса и отбросить первые 100000. Extremely slow. Fix через keyset pagination:
 ```sql
-WHERE created_at < :last_seen ORDER BY created_at DESC LIMIT 20
+WHERE created_at < :last_seen_at 
+ORDER BY created_at DESC 
+LIMIT 20
 ```
 
-Двигается вперёд без OFFSET.
+Курсор движется вперёд по значению без OFFSET. Полагается на индекс для быстрого seek.
 
-### 2.6 LIKE '%x%' (leading wildcard)
+LIKE с leading wildcard не может использовать B-Tree индекс:
+```sql
+WHERE name LIKE '%berik%'
+```
 
-`WHERE name LIKE '%berik%'` — не может использовать B-Tree индекс.
+B-Tree индекс работает только для prefix search. Full-text search через tsvector plus GIN индекс правильный подход для полнотекстового поиска. Trigram index через pg_trgm extension для fuzzy matching. Elasticsearch для complex text search сценариев.
 
-Fixes:
-- **Full-text search** (`tsvector` + GIN).
-- **Trigram index** (`pg_trgm` extension).
-- Elasticsearch для полного текстового поиска.
+Deep JSON parsing на CPU-intensive для больших payloads. Jackson readValue на 10 MB JSON занимает 200-500 миллисекунд CPU. Многократные parse операции нагружают CPU до 100 процентов. Решения включают streaming API через JsonParser чтение token за token без full materialization. Явная схема (POJO) заранее известная — быстрее generic parsing. Меньше JSON в API через правильные DTO с filter'ами полей.
 
-### 2.7 Deep JSON parsing ⭐
+SSL/TLS handshake добавляет 10-50 миллисекунд к каждому новому connection. Без connection pool это становится значительной частью latency. HTTP client keep-alive и JDBC connection pool это ключевые mitigation.
 
-Парсинг больших JSON (мегабайты) — CPU-intensive.
-- Jackson `readValue` на 10 MB = 200-500 мс.
-- Многократно = CPU 100%.
+DNS resolution может быть surprisingly slow. Медленный DNS server или сеть вне DC добавляет 10-100 миллисекунд. Local DNS caching через nscd или dnsmasq решает. В JVM параметр -Dnetworkaddress.cache.ttl=60 контролирует DNS cache. Consul service discovery кэширует список инстансов уменьшая DNS lookups.
 
-Fixes:
-- **Streaming API** — `JsonParser`, читать token за token.
-- **Схема** — заранее знать структуру.
-- Меньше JSON в API (правильные DTO с filters).
+Full GC в JVM это stop-the-world pause. G1 обычно 50-200 миллисекунд, редко секунды. ZGC меньше 10 миллисекунд что делает его предпочтительным для latency-sensitive приложений. Мониторинг через -Xlog:gc*. Долгие GC часто indicate memory leak, insufficient heap, или бедный tuning.
 
-### 2.8 SSL/TLS handshake
-
-10-50 мс на каждый новый connection. При частых новых соединениях (без пула) — большая доля latency.
-
-Fix: connection pooling (JDBC pool, HTTP client keep-alive).
-
-### 2.9 DNS resolution
-
-Разрешение имени → 10-100 мс если DNS медленный / уходит наружу.
-
-Fix:
-- Локальный DNS caching (`/etc/nscd.conf`, `dnsmasq`).
-- В JVM: `-Dnetworkaddress.cache.ttl=60`.
-- Consul service discovery кэширует список инстансов.
-
-### 2.10 Full GC ⭐
-
-Stop-the-world пауза в JVM.
-- G1: обычно 50-200 мс, изредка секунды.
-- ZGC: <10 мс.
-
-Мониторь `-Xlog:gc*`. Долгие Full GC = утечка / мало heap / плохой tuning.
-
-### 2.11 Логирование в проде
-
-`log.debug(...)` со сложной строкой — если DEBUG выключен, всё равно вычисляется:
+Логирование в production может неожиданно стоить дорого:
 ```java
-log.debug("Fno: " + heavyToString(fno));   // heavyToString вызовется всегда!
+log.debug("Fno: " + heavyToString(fno));   // heavyToString вызовется ВСЕГДА
 ```
 
-Правильно:
+Even если DEBUG level disabled, конкатенация строки происходит перед вызовом log метода. heavyToString производит CPU work бесполезно. Правильный подход через parameterized logging:
 ```java
-log.debug("Fno: {}", fno);                 // toString только если DEBUG on
+log.debug("Fno: {}", fno);   // toString только если DEBUG enabled
 ```
 
-Или guard:
+SLF4J deferred evaluation — toString вызывается лениво только при actual logging. Или explicit guard через isDebugEnabled если требуется сложная preparation:
 ```java
 if (log.isDebugEnabled()) {
     log.debug("Fno: " + heavyToString(fno));
 }
 ```
 
-### 2.12 Reflection
+Reflection на горячем пути в 10-100 раз медленнее прямого вызова метода. Fix через cache Method и Field объектов, использование MethodHandles для faster invocation, кодогенерация через Lombok, MapStruct вместо runtime reflection. Для конфигурации и edge use cases reflection acceptable, но не на critical path.
 
-Reflection на **горячем пути** — 10-100× медленнее прямого вызова.
+Открытие и закрытие ресурсов имеет overhead. File open это system call 10-100 микросекунд. Socket open плюс TCP handshake plus SSL если применимо. Всё это должно быть pooled.
 
-Fixes:
-- Кэшировать `Method`/`Field`.
-- `MethodHandles`.
-- Кодогенерация (Lombok, MapStruct).
+Блокировки БД через SELECT FOR UPDATE. Fine-grained locks на одной строке ok. Coarse-grained locks like LOCK TABLE catastrophic — вся таблица блокируется. Долгие locks приводят к timeouts и deadlocks. Правило держать locks максимально коротко. Optimistic locking через version columns часто предпочтительнее — WHERE id=? AND version=?.
 
-Для конфигурации / edge — приемлемо.
+Cross-DC вызовы 150+ миллисекунд round-trip между географически distant DCs. Пять таких вызовов equals 750 миллисекунд только на network. Решения через local replicas, кэш, batching, редизайн для локальности данных.
 
-### 2.13 Открытие/закрытие ресурсов
+Горячие мьютексы создают contention. synchronized на static field с многими threads означает все ждут одного lock. Решения через ReentrantLock с tryLock для non-blocking attempts, lock-free structures через Atomic и CAS, sharding на разные locks по ключу, immutable data не требующая synchronization.
 
-- File open — sys call, ~10-100 мкс.
-- Socket open — TCP handshake, +SSL если есть.
+Много файловых дескрипторов и sockets. Каждый это kernel resource с limit через ulimit -n. Утечка приводит к Too many open files errors. Мониторинг через lsof -p pid.
 
-Пуливать.
+Encryption/decryption операции на CPU. BCrypt intentionally slow 10-100 миллисекунд для brute force защиты. RSA sign/verify 1-10 миллисекунд. AES миллисекунды на MB. Решения через кэширование результатов (не re-encrypt то же самое), hardware acceleration через AES-NI где доступно.
 
-### 2.14 Блокировки БД (SELECT FOR UPDATE)
+## Как узнать что дорого
 
-- Тонкая гранула: одна строка — ок.
-- Крупная гранула: `LOCK TABLE` — плохо, всё встало.
-- Долгая блокировка → deadlock, timeout.
+Диагностика performance требует правильных инструментов. Guessing без данных обычно приводит к optimization wrong вещей.
 
-Правило: **держать локи как можно короче**. Обновление через `WHERE id=? AND version=?` (optimistic).
+Profilers для JVM. Java Flight Recorder (JFR) встроенный low-overhead. Всегда включать в production на sampling basis. async-profiler даёт sampling для CPU, allocations, locks с flame graph visualization. VisualVM для быстрой GUI диагностики. YourKit и JProfiler коммерческие с богатыми возможностями.
 
-### 2.15 Cross-DC вызовы
+Application Performance Monitoring системы — Datadog, New Relic, Elastic APM. Показывают distributed tracing через все сервисы. Latency каждого HTTP запроса, SQL query, external call. Automatic detection anomalies. OpenTelemetry как open standard для распределённой трассировки.
 
-150+ мс round-trip между Almaty и Amsterdam. Если делаешь 5 таких — уже 750 мс.
+Метрики через Micrometer plus Prometheus plus Grafana это стандартный observability stack. Что мониторить. HTTP метрики через http.server.requests — rate, latency percentiles, error rates. JDBC через hikaricp.* — pool usage, wait times. JPA через hibernate.* — queries per session, cache hits. JVM — heap usage, GC pauses, thread counts. Custom бизнес метрики специфичные для application.
 
-Fixes:
-- Локальные реплики.
-- Кэш.
-- Batch.
+Логи с correlation ID для распределённой трассировки. Каждому входящему запросу — уникальный trace ID пропускаемый через все downstream calls. Легко найти всю chain обработки одного запроса. Spring Cloud Sleuth или Micrometer Tracing.
 
-### 2.16 Горячие мьютексы
+Load testing критически важен для highload систем. Инструменты — JMeter, Gatling, k6, wrk. Метрики важные — p50, p95, p99, p99.9 latency. p99 значительно больше p95 указывает на «fat tail» — occasional slow requests которые могут быть unacceptable для UX.
 
-`synchronized` на static field, много потоков → contention → все ждут.
+## Стратегии оптимизации
 
-Fixes:
-- `ReentrantLock` с TryLock.
-- Lock-free (Atomic, CAS).
-- Sharding — разные потоки на разные locks.
-- Immutable data.
+Кэш это одна из самых мощных техник — самая быстрая операция это та которую не сделали. Уровни кэша. Redis, Memcached, Hazelcast для distributed cache. Caffeine для in-memory JVM cache. HTTP cache через nginx или CDN для static content. Hibernate second-level cache для JPA entities.
 
-### 2.17 Много дескрипторов файлов / сокетов
+Правила эффективного кэширования. Знать TTL или условия invalidation — устаревший cache хуже отсутствия cache. Stale-while-revalidate pattern — отдавать старое пока обновление на подходе. Cache stampede protection — когда expiration приводит к thundering herd (все clients simultaneously miss и лезут за данными), решается через mutex или debounce на regeneration.
 
-Каждый — kernel resource. Лимит `ulimit -n`. Утечка → «Too many open files».
+Async и очереди для non-blocking обработки. Не блокировать HTTP запрос долгими операциями. Положить сообщение в Rabbit или Kafka, ответить клиенту сразу, обработать в background. Улучшает UX (быстрый response) и throughput (нет blocking).
 
-Мониторить `lsof -p <pid> | wc -l`.
+Batch операции для reducing round-trips. Много одинаковых операций объединяются в одну. INSERT/UPDATE batch через JDBC. HTTP requests к batch API endpoint. Bulk Elasticsearch indexing. Общий принцип — если хотите быструю систему делайте меньше operations.
 
-### 2.18 Encryption / decryption на CPU
+Sharding и partitioning разделение данных по ключу. Database partitions для больших таблиц. Kafka partitions для parallel consumption. Shards в Elasticsearch. Parallel обработка ускоряет операции пропорционально количеству shards.
 
-BCrypt: 10-100 мс (специально, для brute-force защиты).
-RSA sign / verify: 1-10 мс.
-AES: миллисекунды на MB.
+Скэйлинг vertical или horizontal. Vertical scaling увеличение CPU/RAM одного instance — простая но ограниченная максимальным hardware. Horizontal scaling больше instances — theoretically unlimited если приложение stateless. Правильно спроектированные микросервисы легко scale horizontally.
 
-Fixes:
-- Кэшировать результаты (не пере-шифровывать одно и то же).
-- Hardware acceleration (AES-NI).
+Precompute и materialized views. Тяжёлые аггрегаты рассчитываются заранее раз в час или раз в 5 минут вместо каждого запроса. Пример dashboard с counts по 20 категориям — materialized view refresh раз в 5 минут вместо 20 SELECT COUNT на каждый view page.
 
----
+## Highload принципы
 
-## 3. Как узнать что дорого
+Fail fast принцип критичен для системной стабильности. Не ждать 30 секунд если downstream упал — circuit breaker размыкается быстро после нескольких failures, дальнейшие вызовы возвращают immediate error без attempt соединения. Пользователь получает 503 быстро вместо hanging endpoint. Resilience4j стандартный инструмент, Hystrix устарел но были подобные концепции.
 
-### 3.1 Profilers
+Bulkhead pattern разделяет пулы ресурсов для разных зависимостей. Downstream A упал — его pool exhausted, но pool B продолжает работать. Failure одной dependency не каскадирует на всю систему. Реализуется через отдельные thread pools, connection pools per dependency.
 
-- **JFR (Java Flight Recorder)** — встроенный, low-overhead. Bсегда включай в проде на семпле.
-- **async-profiler** — sampling для CPU, alloc, lock. Flame graph.
-- **VisualVM** — GUI для быстрой диагностики.
-- **YourKit, JProfiler** — коммерческие, мощные.
+Timeouts на всех уровнях. HTTP connect и read timeout. Database connection и socket timeout. RabbitMQ publish timeout. Redis command timeout. Kafka consumer poll timeout. Никогда не полагаться на defaults — часто бесконечные что приводит к hanging при проблемах.
 
-### 3.2 APM (Application Performance Monitoring)
+Retry с exponential backoff. Не сразу повторять после failure — только усугубит перегрузку downstream. Ждать увеличивающееся время между попытками — 1 секунду, 2 секунды, 4 секунды, 8 секунд. Даёт time для recovery downstream.
 
-- **Datadog**, **New Relic**, **Elastic APM** — трассировка запросов через сервисы.
-- Показывает latency каждого HTTP-запроса, SQL, external call.
-- Distributed tracing (OpenTelemetry).
+Идемпотентность при retry обязательна. Если retry может повторить операцию, она должна быть безопасна при повторе. Все write operations должны быть идемпотентны через unique keys или conditional updates.
 
-### 3.3 Метрики
+Rate limiting защищает от abuse и перегрузки. Ограничение rate от одного клиента или IP. Token bucket или sliding window algorithms. Обычно реализуется через Redis with atomic scripts.
 
-- **Micrometer** + **Prometheus** + **Grafana**.
-- Что мониторить:
-  - HTTP: `http.server.requests` (rate, latency percentiles, errors).
-  - JDBC: `hikaricp.*` (см. предыдущий файл).
-  - JPA: `hibernate.*`.
-  - JVM: heap, GC, threads.
-  - Кастомные бизнес-метрики.
+Graceful degradation — часть функционала недоступна, отдаём что можем. Страница блога — comments сервис упал, показываем пост без comments с «comments temporarily unavailable» notice. Better than showing full error page.
 
-### 3.4 Логи с correlation ID
+Observability first — метрики, логи, distributed traces обязательны. Без них troubleshooting production issues становится guessing. Investment в observability окупается многократно при первом же сложном bugе.
 
-Каждому запросу — уникальный ID (traceId). Пропускать через все сервисы. Легко найти цепочку.
+## Правила для JVM/Java highload
 
-Spring Cloud Sleuth / Micrometer Tracing.
+Минимизировать object allocations на горячем пути. Больше allocations означает больше GC pressure, потенциально дольше pauses. Reuse buffers where possible.
 
-### 3.5 Load testing
+Кэшировать immutable objects. String.intern для repeatedly used strings. Autoboxed Integer values -128 до 127 автоматически cached JVM. Reuse ThreadLocal buffers.
 
-- **JMeter**, **Gatling**, **k6**, **wrk** — стрельба нагрузкой.
-- Ищи deltas: p50, p95, p99, p99.9 latency.
-- p99 << p95 = fat tail (иногда очень плохо).
+Streaming вместо full-load для больших data. InputStream reading в chunks вместо readAllBytes которое materializes весь file в memory. Одинаково для network data, database results.
 
----
+Avoid autoboxing на hot path. List<Long> boxes каждый long значение — creates garbage. Для performance-critical кода primitive collections через Eclipse Collections, Koloboke, Trove.
 
-## 4. Стратегии оптимизации
+Async I/O для reducing thread blocking. CompletableFuture, Reactor, Virtual Threads в Java 21+. Позволяет много concurrent operations на limited количестве threads.
 
-### 4.1 Кэш
+Prefer immutable objects. Thread-safe без synchronization. GC-friendly в некоторых implementations. Проще reason about.
 
-Правило: **самая быстрая операция — та, которую не сделали**.
+## Правила для БД highload
 
-Кэшируй:
-- Redis / Memcached / Hazelcast — распределённый.
-- Caffeine — in-memory JVM.
-- HTTP-кэш (nginx / CDN).
-- Кэш второго уровня Hibernate.
+Правильные индексы обязательны. Каждый query на большой таблице должен использовать индекс. EXPLAIN ANALYZE для medium/slow queries — regular exercise not just when problems arise.
 
-Правила:
-- Знать TTL / когда инвалидировать.
-- Stale-while-revalidate — отдавать старое, пока обновляется.
-- Cache stampede (все сразу лезут за expired) → mutex / debounce.
+Небольшие транзакции. Никогда external network calls внутри @Transactional. Держать transactions максимально короткими для minimize lock contention.
 
-### 4.2 Async / очереди
+Keyset pagination для больших наборов данных вместо OFFSET-based. Batch INSERT/UPDATE вместо individual queries. Read replicas для тяжёлого read traffic — уменьшает нагрузку на master.
 
-Не блокировать HTTP-запрос долгими операциями. Положить в Rabbit/Kafka, ответить сразу, обработать асинхронно.
+Партиционирование для очень больших таблиц. Материализованные views для аналитики. pg_stat_statements обязательный для profiling queries в production.
 
-### 4.3 Batch
+## Правила для микросервисов
 
-Много одинаковых операций → одной пачкой.
-- INSERT/UPDATE batch (JDBC).
-- HTTP-запросы к batch API.
-- Bulk Elastic index.
+Не синхронно там где можно async. Long-running operations через message queues.
 
-### 4.4 Sharding / Partitioning
+Timeouts, retry, circuit breaker обязательны на любом external вызове. Idempotency для всех write operations. Cache service discovery lookups — не resolving на каждый call.
 
-Разделить данные по ключу → параллельная обработка.
-- БД партиции.
-- Kafka partitions.
-- Shards в Elastic.
+Не логировать sensitive data — tokens, passwords, PII. Trace IDs через все services для correlated logs.
 
-### 4.5 Скэйлинг
+Метрики per API — rate, latency percentiles, error rates. Alerting на нарушение SLO.
 
-- **Vertical** — больше CPU/RAM для одного инстанса.
-- **Horizontal** — больше инстансов.
+## Реальные кейсы КНП
 
-Горизонтально масштабируется stateless + правильная балансировка.
+Memory knp-filter-sent-documents-perf — синхронный RestTemplate на АРМ создавал новый HTTPS connection на каждый запрос. Блокирует downstream, expensive SSL handshake каждый раз. Fix через connection pool в HTTP client plus async обработка где applicable.
 
-### 4.6 Precompute / materialized views
+Memory knp-fno21-shedlock-stale-image-dup-regnum — без ShedLock scheduled job лупился параллельно на всех репликах. Приводил к duplicate INSERT операциям с одинаковыми регистрационными номерами. Fix через ShedLock как distributed coordination — только одна replica выполняет job at a time.
 
-Тяжёлые агрегаты — считать заранее (job раз в час), хранить.
+Memory knp-fo-sync-notification-bugs — @Transactional dead из-за self-invocation plus printStackTrace вместо log.error. Ошибки не попадали в ELK создавая слепую зону мониторинга. Fix через правильные transactions без self-invocation plus structured logging через SLF4J.
 
-Пример: dashboard с count по 20 категориям → материализованный view + refresh раз в 5 мин.
+Memory knp-e2e-runner-hikari-isolation-poisoning — opt-in isolation равное -1 отравлял shared PgBouncer pool. gate-knp краснел 18 минут. Fix через explicit transactionIsolation равное TRANSACTION_READ_COMMITTED.
 
----
+## Ключевые метрики
 
-## 5. Highload principles
+Что должно быть мониторено в production. Response time percentiles — p50, p95, p99 для user-facing endpoints. Throughput — requests per second на разные endpoints. Error rate — процент 4xx и 5xx responses. Saturation — CPU, memory, disk, network utilization.
 
-### 5.1 Fail fast
+Специфичные для JVM метрики. Heap usage — total и per generation. GC frequency и pause times. Thread count и state distribution. Class loading counts.
 
-Не ждать 30 сек: если downstream упал → **circuit breaker** размыкается → fast fail → пользователь получает 503 сразу.
+Database специфичные метрики. Connection pool usage через hikaricp.connections.*. Query execution times через APM или pg_stat_statements. Lock waits и deadlocks. Replication lag для replicas.
 
-Resilience4j, Hystrix (устарел).
+Message broker метрики. Queue depth per queue. Publish и consume rates. Redelivery rates. Consumer lag для Kafka.
 
-### 5.2 Bulkhead
+Business метрики. Domain-specific counts — например количество отправленных ФНО в час, количество новых пользователей, количество failed authentications. Показатели health бизнеса не только technical health.
 
-Разделять пулы для разных зависимостей. Downstream A упал → его пул исчерпан, но пул B работает.
+## Alerting стратегии
 
-### 5.3 Timeouts everywhere
+Alert должен быть actionable. Каждый alert должен требовать human action или он должен быть suppressed. Alerts которые regularly ignore приводят к alert fatigue где critical alerts miss.
 
-- HTTP connect + read timeout.
-- DB connection timeout.
-- DB socket timeout.
-- Rabbit publish timeout.
-- Redis command timeout.
+Тиеринг alerts. Critical — page кого-то немедленно, ночью, в любое время. Warning — notify team в working hours для investigation. Info — dashboard indicators без active notification.
 
-Никогда без явного timeout (default может быть бесконечный).
+Пороги должны быть tunated к baseline. Static thresholds типа CPU больше 80% часто false positive при нормальных spikes. Alerting on trend changes или SLO violations более meaningful.
 
-### 5.4 Retry с exponential backoff
+Symptoms alerts не causes. Alert на «response time p99 больше 500ms» полезнее чем «CPU больше 80%». User-facing symptoms directly relevant. Root cause определяется after alert firing через investigation.
 
-Не сразу retry (только усугубит перегрузку). Ждать: 1с, 2с, 4с, 8с.
+Silencing и dampening. При known maintenance или incidents дважды не alert. Grouping связанных alerts чтобы не флудить channel.
 
-### 5.5 Идемпотентность
+## Load testing patterns
 
-При retry можешь повторить операцию → должна быть безопасна.
+Test что реально критично. Не все endpoints одинаково важны. Load test самые user-facing и critical paths.
 
-### 5.6 Rate limiting
+Realistic traffic pattern. Не constant rate — реальный traffic имеет peaks и troughs. Simulate diurnal patterns, weekend variations, seasonal spikes.
 
-Ограничение rate от одного клиента. Защита от abuse.
+Gradual ramp up. Start низкая нагрузка, increase gradually. Позволяет observe degradation points before catastrophic failure. Suddenly hitting peak load часто отличается по characteristics.
 
-Token bucket, sliding window. Reddis + Lua скрипт.
+Chaos engineering complement to load testing. Что случается когда downstream упал во время нагрузки. Что если 50% Kafka partitions unavailable. Что если replica lag increases. Real failures happen — тест readiness системы к ним.
 
-### 5.7 Graceful degradation
+Regular exercise не one-off. System changes over time — new features, dependencies, data growth. Regular load testing выявляет regressions before они становятся production issues.
 
-Часть функционала упала → отдать что можешь.
+## Собеседные вопросы часто задают
 
-Пример: страница блога. Комментарии упали → показать пост без комментариев (с текстом «комментарии временно недоступны»).
+Что дорого в БД — Seq Scan без индекса, N+1, COUNT star на большой таблице, OFFSET на больших pages, LIKE с leading wildcard, долгие transactions.
 
-### 5.8 Observability first
+Что дорого в JVM — Full GC, много allocations на hot path, reflection на hot path, blocking I/O в много threads.
 
-Метрики + логи + trace = must. Без них — тыкаешь пальцем в небо.
+Почему нельзя внешний API в @Transactional — держит connection pool и row locks, pool исчерпается, deadlocks возможны, всё встанет при downstream slow.
 
----
+Как избежать N+1 — JOIN FETCH, @EntityGraph, @BatchSize, DTO projection through Spring Data query methods.
 
-## 6. Правила для JVM/Java highload
+Что такое keyset pagination — cursor-based pagination через WHERE created_at < last_seen вместо OFFSET. Для больших pages где OFFSET slow.
 
-- **Не new-ить много объектов на горячем пути** — allocation pressure → GC.
-- **Кэшировать** immutable-объекты, use of `String.intern`.
-- **Reuse buffers** (`ByteBuffer`, `char[]`).
-- **Streaming вместо full-load** (`InputStream` вместо `readAllBytes`).
-- **Avoid autoboxing** — `List<Long>` boxes каждый `long`; для hot path — примитивные коллекции (Eclipse Collections, Koloboke).
-- **Async I/O** — CompletableFuture, Reactor, Virtual Threads.
-- **Prefer immutable** — потокобезопасно, GC-friendly.
+Как ускорить COUNT star — кэш, approximate через pg_class, materialized view, Slice вместо Page, партиционирование.
 
----
+Как ускорить cold start — меньше auto-configuration, CDS/AppCDS, GraalVM Native Image для extreme cases.
 
-## 7. Правила для БД highload
+Что такое circuit breaker — разомкнутая цепь при повторных failures downstream, fast fail без attempt соединения.
 
-- **Правильные индексы** — must.
-- **EXPLAIN ANALYZE** для медленных.
-- **Небольшие транзакции**.
-- **Никаких сетевых вызовов** в tx.
-- **Keyset pagination** для больших наборов.
-- **Batch insert/update**.
-- **Read replicas** для тяжёлого чтения.
-- **Партиционирование** для очень больших таблиц.
-- **Материализованные views** для аналитики.
-- **`pg_stat_statements`** для профилирования запросов.
+Что такое bulkhead — изоляция resource pools для разных зависимостей, failure одной не каскадирует.
 
----
+Что такое graceful degradation — часть функционала недоступна, отдаём остальное с acknowledgment.
 
-## 8. Правила для микросервисов
+Зачем connection pool — reuse TCP plus authentication, saves 30-100ms на each connection acquire.
 
-- **Не синхронно** там где можно async.
-- **Timeouts + retry + circuit breaker** на любом внешнем вызове.
-- **Idempotency** для всех write-операций.
-- **Кэшировать service discovery lookups**.
-- **Не логировать чувствительное**.
-- **Trace ID** через все сервисы.
-- **Метрики per API** (rate, latency percentiles, errors).
+Что такое retry backoff — waiting increasing time между attempts, 1s, 2s, 4s, exponentially.
 
----
+Как найти узкое место — metrics через Prometheus/Grafana, APM через Datadog/etc, JFR profiles для detailed analysis.
 
-## 9. Реальные ИСНА-кейсы
+Что дороже HTTP или БД — depends. Local database ~1ms, local HTTP ~1-10ms, remote HTTP 10-500ms. Network location matters greatly.
 
-Из memory:
-- `knp-filter-sent-documents-perf`: синхронный RestTemplate на АРМ → блокирует downstream + новый HTTPS-connect на запрос. **Fix**: connection pool + async.
-- `knp-fno21-shedlock-stale-image-dup-regnum`: без ShedLock scheduled-job лупился параллельно на всех репликах → duplicate INSERT. **Fix**: distributed lock.
-- `knp-fo-sync-notification-bugs`: @Transactional мёртв из-за self-invocation + `printStackTrace` вместо log.error → ELK-слепая зона. **Fix**: правильные транзакции + structured logging.
-- `knp-e2e-runner-hikari-isolation-poisoning`: opt-in `isolation=-1` отравлял пул → gate краснел 18 мин. **Fix**: явный `transactionIsolation`.
+Как измерить performance метода — JFR или async-profiler flame graph. Или Micrometer Timer для explicit measurements.
 
----
+## Итоги
 
-## 10. Собесные вопросы
+Семь порядков магнитуды разница между CPU cache и HDD. Всё что идёт «наружу» — диск, сеть, database — фундаментально дорого. Architecture должна минимизировать external calls на critical path.
 
-1. **Что дорого в БД?** — Seq scan (нет индекса), N+1, COUNT(*), OFFSET на больших, LIKE '%x%', долгие транзакции.
-2. **Что дорого в JVM?** — Full GC, много аллокаций, reflection на горячем пути, blocking I/O в мало потоках.
-3. **Почему нельзя внешний API внутри `@Transactional`?** — Держит connection БД и row locks → пул истощается / deadlock.
-4. **Как избежать N+1?** — JOIN FETCH, @EntityGraph, @BatchSize, DTO projection.
-5. **Что такое keyset pagination?** — Курсор по значению (WHERE created_at < ?), без OFFSET; для больших страниц.
-6. **Как ускорить COUNT(*)?** — Кэш, approximate из pg_class, материализованный view, Slice вместо Page.
-7. **Как ускорить старт (cold start)?** — Меньше auto-config, CDS, AppCDS, GraalVM Native.
-8. **Что такое circuit breaker?** — Разомкнутая цепь при повторных отказах downstream → fast fail.
-9. **Что такое bulkhead?** — Изоляция пулов ресурсов для разных зависимостей.
-10. **Что такое graceful degradation?** — Часть функционала упала → отдаём что можем.
-11. **Зачем connection pool?** — Reuse TCP + auth (30-100 мс saved на acquire).
-12. **Что такое retry backoff?** — Ждать увеличивающееся время между повторами (1s, 2s, 4s, ...).
-13. **Как найти узкое место в проде?** — Метрики (Prometheus/Grafana) + APM (Datadog/etc) + JFR profiles.
-14. **Что дороже: HTTP или БД?** — Зависит: локальная БД (~1 мс), локальный HTTP (~1-10 мс), remote HTTP (10-500 мс).
-15. **Как измерить перформанс метода?** — JFR / async-profiler flame graph; или Micrometer Timer.
+Топ 4 убийцы production. N+1 queries — 1000 SQL вместо одного JOIN. Sync HTTP в transaction — pool exhaustion. Seq Scan на большой таблице — missing index. printStackTrace вместо structured logging — blind spot в мониторинге.
 
----
+Стандартные способы масштабирования. Кэш для reducing operations. Async для non-blocking. Batch для reducing round-trips. Sharding для parallelism.
 
-## Итог
+Паттерны надёжности. Timeouts везде. Retry с backoff. Circuit breaker для fast fail. Bulkhead для изоляции. Graceful degradation для partial availability.
 
-- **7 порядков** разница между CPU cache и HDD → всё что «наружу» дорого.
-- **N+1, sync-в-tx, Seq scan, printStackTrace** — топ-4 убийцы прода.
-- **Кэш, async, batch, sharding** — стандартные способы масштабирования.
-- **Timeouts, retry, circuit breaker, bulkhead** — паттерны надёжности.
-- **Метрики + APM + JFR** — must для диагностики.
-- **Правила**: не блокировать поток на I/O надолго, не держать транзакцию, всегда явные timeouts.
+Observability обязательна. Metrics plus APM plus JFR profiles plus distributed tracing. Без них troubleshooting production становится guessing что unacceptable.
 
-Следующий — `31-load-balancer.md`.
+Правила для JVM. Меньше allocations на hot path. Streaming вместо full-load. Async I/O через CompletableFuture или Virtual Threads. Prefer immutable objects.
+
+Правила для БД. Правильные индексы. Небольшие transactions. Keyset pagination. Batch operations. Read replicas для scaling reads. pg_stat_statements включён.
+
+Правила для микросервисов. Async where possible. Timeouts, retry, circuit breaker on external calls. Idempotency for writes. Cached service discovery. Не логировать sensitive. Trace IDs everywhere. Metrics per API.
+
+Реальные кейсы КНП подтверждают что теоретически известные проблемы регулярно встречаются в production. Каждый должен быть explicitly avoided через discipline и code review.
+
+Дальше — load balancer как ключевая инфраструктурная компонента для scaling микросервисов.
