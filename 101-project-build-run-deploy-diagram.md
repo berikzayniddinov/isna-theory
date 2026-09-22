@@ -1184,6 +1184,871 @@ High latency                      →   Prometheus JVM metrics
 
 ---
 
+## 13. ИНФРАСТРУКТУРНЫЙ УРОВЕНЬ — от железа до syscalls
+
+Всё, что мы разбирали выше (Pod, container, JVM), работает поверх нескольких слоёв абстракции. Понимать эти слои критично, потому что реальные проблемы часто приходят снизу: «Pod OOMKilled» может быть из-за memory pressure на **хост-ноде**, «high latency» может быть из-за оверлей-сети, «disk slow» — из-за overprovisioned storage на гипервизоре.
+
+Разберём точечно, что стоит под Kubernetes'ом.
+
+### 13.1 Полная стек-диаграмма — все 7 слоёв
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  СЛОЙ 7:  Java Application (Spring Boot)                            │
+│           - Business logic                                          │
+│           - Beans, controllers, services                            │
+│           - Работает как обычный Java-код                           │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ JVM API
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  СЛОЙ 6:  JVM (HotSpot)                                             │
+│           - Heap, Metaspace, Code Cache, Thread Stacks              │
+│           - GC (G1/ZGC/Parallel)                                    │
+│           - JIT compilation (C1/C2)                                 │
+│           - Bytecode interpretation                                 │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ POSIX syscalls (read, write, mmap, futex)
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  СЛОЙ 5:  Container (namespaces + cgroups + rootfs)                 │
+│           - Изолированный view of filesystem                        │
+│           - Свои PID / network / IPC namespaces                     │
+│           - Cgroup ограничивает CPU/memory/IO                       │
+│           - Всё это — обычные Linux features, не отдельная VM       │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ Linux kernel API
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  СЛОЙ 4:  Linux Kernel (guest OS в K8s node VM)                     │
+│           - Scheduler (CFS)                                         │
+│           - Memory manager (MMU, page tables)                       │
+│           - VFS + Filesystems (ext4, xfs, overlayfs)                │
+│           - Network stack (iptables, netfilter, TCP/IP)             │
+│           - Device drivers                                          │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ virtual hardware API (virtio)
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  СЛОЙ 3:  Виртуальная машина (K8s worker node)                      │
+│           - Например: 4 vCPU, 16 GB vRAM, 100 GB vDisk              │
+│           - Один "сервер" с точки зрения администратора K8s         │
+│           - На самом деле — процесс на гипервизоре                  │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ hypercalls / trap-and-emulate
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  СЛОЙ 2:  Гипервизор (KVM / VMware ESXi / Hyper-V)                  │
+│           - Управляет несколькими VM одновременно                   │
+│           - Разделяет CPU, RAM, disk, network между VM              │
+│           - Type 1 (bare metal): KVM (Linux), ESXi, Hyper-V         │
+│           - Type 2 (hosted): VirtualBox, VMware Workstation         │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ Ring 0 / VMX instructions
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  СЛОЙ 1:  Физическое железо (bare metal сервер)                     │
+│           - CPU: Intel Xeon / AMD EPYC (64-128 cores)               │
+│           - RAM: 256-1024 GB DDR4/5                                 │
+│           - Storage: NVMe SSD массивы                               │
+│           - Network: 10/25/100 GbE                                  │
+│           - Расположение: дата-центр (стойки, охлаждение, питание)  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 Physical bare metal — что там снизу
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  ДАТА-ЦЕНТР                                                        │
+│                                                                    │
+│  Стойка №1:                                                        │
+│    ├── Blade Server 1 (Dell R750)                                  │
+│    │   - 2× Intel Xeon Gold 6338 (32 cores × 2 = 64 cores)         │
+│    │   - 512 GB DDR4 ECC RAM                                       │
+│    │   - 4× 1.9TB NVMe SSD (RAID 10)                               │
+│    │   - 2× 25GbE NIC                                              │
+│    │   - Redundant PSU                                             │
+│    ├── Blade Server 2 (аналогично)                                 │
+│    ├── Blade Server 3 ...                                          │
+│    └── Top-of-Rack Switch (Cisco Nexus)                            │
+│                                                                    │
+│  Стойка №2, №3, ...                                                │
+│                                                                    │
+│  Всё соединено через spine-leaf топологию.                         │
+│  SAN storage (Pure Storage / NetApp) через FC или iSCSI.           │
+└────────────────────────────────────────────────────────────────────┘
+
+На одном физическом сервере запущен гипервизор
+(KVM+libvirt или VMware ESXi).
+
+Один физический сервер (64 cores, 512 GB RAM) обычно держит:
+  - 4-8 больших VM (K8s worker nodes: 16 cores / 64 GB каждая)
+  - или 20-40 маленьких VM
+  - или 1-2 приложения на bare metal (для performance-critical: БД)
+```
+
+### 13.3 Гипервизор — типы 1 и 2
+
+**Type 1 (bare metal hypervisor)** — работает **напрямую на железе**, без промежуточной OS. Гипервизор сам — минимальная OS.
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Physical Hardware                                                 │
+├────────────────────────────────────────────────────────────────────┤
+│  Hypervisor (VMware ESXi / KVM+bare-linux / Hyper-V)               │
+│  ├── VM 1 (Guest OS: Linux, K8s worker)                            │
+│  ├── VM 2 (Guest OS: Linux, K8s worker)                            │
+│  ├── VM 3 (Guest OS: Windows, для legacy)                          │
+│  └── VM 4 (Guest OS: Linux, DB server)                             │
+└────────────────────────────────────────────────────────────────────┘
+
+Плюсы: near-native performance, security изоляция.
+Enterprise стандарт для дата-центров.
+
+KVM (Kernel-based Virtual Machine) — часть Linux kernel.
+Технически, host запускает минимальный Linux → KVM модуль → VM'ки.
+Формально Type 1, но с "hosted" вкусом.
+```
+
+**Type 2 (hosted hypervisor)** — работает **поверх обычной OS** как обычное приложение.
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Physical Hardware                                                 │
+├────────────────────────────────────────────────────────────────────┤
+│  Host OS (Windows / macOS / Linux)                                 │
+│  ├── обычные приложения (браузер, IDE)                             │
+│  └── Hypervisor (VirtualBox / VMware Workstation / Parallels)      │
+│      ├── VM 1 (Linux)                                              │
+│      └── VM 2 (Linux)                                              │
+└────────────────────────────────────────────────────────────────────┘
+
+Плюсы: простая установка.
+Использование: разработка (Docker Desktop, minikube).
+Не используется в production.
+```
+
+### 13.4 Что делает гипервизор при запуске VM
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  СОЗДАНИЕ VM                                                       │
+│                                                                    │
+│  1. Аллокация ресурсов:                                            │
+│     - vCPUs: например 4 (гипервизор мэпит на реальные cores)       │
+│     - vRAM: 16 GB (кусок физической RAM host'а)                    │
+│     - vDisk: 100 GB (файл на storage или LUN на SAN)               │
+│     - vNIC: virtual network interface                              │
+│                                                                    │
+│  2. Загрузка виртуального BIOS/UEFI                                │
+│                                                                    │
+│  3. Boot loader читает vDisk                                       │
+│     → находит GRUB на "диске" (файле)                              │
+│     → загружает kernel image в vRAM                                │
+│                                                                    │
+│  4. Linux kernel стартует внутри VM                                │
+│     - Думает, что железо реальное                                  │
+│     - На самом деле все "инструкции" перехватываются гипервизором  │
+│     - Privileged instructions (Ring 0) → trap → гипервизор → эмул. │
+│                                                                    │
+│  5. Systemd запускается, поднимает services (docker, kubelet)      │
+│                                                                    │
+│  6. VM готова принимать роль K8s worker node                       │
+└────────────────────────────────────────────────────────────────────┘
+
+Ключевая техника: hardware-assisted virtualization.
+CPU имеет специальные instructions (Intel VT-x, AMD-V):
+  - VMX root mode (гипервизор)
+  - VMX non-root mode (guest OS)
+Guest думает, что в Ring 0, но на самом деле — в non-root mode.
+Privileged operations вызывают VM Exit → гипервизор обрабатывает.
+```
+
+### 13.5 Virtio — как VM общается с "железом"
+
+Гипервизор не может тратить время на эмуляцию каждого disk read/write. Вместо этого guest OS видит **виртуальные устройства** через `virtio` — оптимизированный интерфейс.
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Guest OS видит:                                                   │
+│    /dev/vda    ← virtio block device (диск)                        │
+│    eth0        ← virtio-net (сеть)                                 │
+│    /dev/vport  ← virtio-console (консоль)                          │
+│                                                                    │
+│  Внутри guest kernel:                                              │
+│    Application → syscall write() → filesystem → block layer        │
+│                → virtio-blk driver                                 │
+│                → shared ring buffer с гипервизором                 │
+│                                                                    │
+│  На host:                                                          │
+│    KVM видит запись в shared buffer                                │
+│    → передаёт QEMU (user-space процесс, обслуживающий VM)          │
+│    → QEMU пишет в реальный файл /var/lib/libvirt/images/vm1.qcow2  │
+│    → host kernel → real disk driver → SSD                          │
+└────────────────────────────────────────────────────────────────────┘
+
+Итог: application → 7 слоёв → SSD. И каждый слой добавляет latency.
+```
+
+### 13.6 K8s node = обычная Linux VM
+
+Важно понимать: **worker node в Kubernetes — это НЕ специальная сущность**. Это обычный Linux с установленными:
+
+```
+K8s worker node (VM или bare metal):
+  OS: Ubuntu 22.04 / RHEL 9 / Amazon Linux 2023
+  ├── systemd (init)
+  ├── kubelet.service           ← агент K8s
+  ├── containerd.service        ← container runtime
+  ├── kube-proxy (как DaemonSet Pod)
+  ├── CNI plugin (Calico / Flannel / Cilium)
+  ├── monitoring agents (node-exporter, cAdvisor)
+  ├── log collectors (Fluent Bit / Filebeat)
+  └── обычные Linux utils (bash, curl, systemctl)
+
+Ты можешь SSH сюда и посмотреть:
+  $ ps aux | grep java       # твои JVM процессы
+  $ docker ps                 # контейнеры (если crictl)
+  $ crictl ps                 # containerd containers
+  $ ls /var/lib/kubelet/pods/ # Pod directories
+```
+
+### 13.7 Container ≠ VM — фундаментальная разница
+
+Классическое непонимание: «контейнер это лёгкая виртуалка». **НЕ ВЕРНО**.
+
+```
+┌──────────────────────────────┐    ┌──────────────────────────────┐
+│  VIRTUAL MACHINE             │    │  CONTAINER                   │
+├──────────────────────────────┤    ├──────────────────────────────┤
+│  Guest Kernel (own)          │    │  ─── (использует host kernel)│
+│  Guest OS libs               │    │  Container image libs        │
+│  Application                 │    │  Application                 │
+├──────────────────────────────┤    ├──────────────────────────────┤
+│  Hypervisor (KVM/ESXi)       │    │  Container runtime (runc)    │
+│  ↕ virtual hardware          │    │  ↕ namespaces + cgroups      │
+│  Host Kernel                 │    │  Host Kernel                 │
+│  Host Hardware               │    │  Host Hardware               │
+└──────────────────────────────┘    └──────────────────────────────┘
+
+VM:
+  - Свой ядро (guest kernel)
+  - Свои драйверы, свой boot
+  - Полная изоляция (kernel-level)
+  - Overhead: 100-500 MB RAM минимум на VM
+  - Startup: 10-60 секунд (boot Linux)
+
+Container:
+  - Использует host kernel
+  - Просто изолированный процесс с namespaces
+  - Изоляция на уровне namespaces (не kernel)
+  - Overhead: почти ноль
+  - Startup: миллисекунды
+```
+
+Container **разделяет kernel** с host'ом. Все containers на одной ноде — это процессы одного Linux'а, просто изолированные.
+
+### 13.8 Linux namespaces — как работает изоляция контейнера
+
+Container = процесс с несколькими namespaces. Каждый namespace изолирует определённый вид ресурсов.
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  6 (7) типов namespace в Linux                                     │
+├────────────────────────────────────────────────────────────────────┤
+│  Namespace     Что изолирует                                       │
+│  ─────────────────────────────────────────────                     │
+│  PID           Process IDs. Внутри container PID 1 — твоё          │
+│                приложение. На host у него другой PID.              │
+│                                                                    │
+│  NET           Network stack. Свои interfaces (eth0),              │
+│                свои IP addresses, routes, iptables, sockets.       │
+│                                                                    │
+│  MNT           Mount points. Свой view файловой системы (rootfs).  │
+│                                                                    │
+│  IPC           Inter-Process Communication. Свои message queues,   │
+│                semaphores, shared memory.                          │
+│                                                                    │
+│  UTS           Hostname, domain name.                              │
+│                                                                    │
+│  USER          User/Group IDs. Root в контейнере = не root на host.│
+│                                                                    │
+│  CGROUP        Cgroup view. Container видит только свои cgroups.   │
+│                                                                    │
+│  TIME          System time (новое, редко используется).            │
+└────────────────────────────────────────────────────────────────────┘
+
+Все namespaces создаются через syscall clone() или unshare()
+с соответствующими флагами:
+  CLONE_NEWPID, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWIPC,
+  CLONE_NEWUTS, CLONE_NEWUSER, CLONE_NEWCGROUP
+
+Из host можно посмотреть namespaces процесса:
+  $ ls -la /proc/<pid>/ns/
+  ipc -> ipc:[4026532288]
+  mnt -> mnt:[4026532286]
+  net -> net:[4026532290]
+  pid -> pid:[4026532289]
+  user -> user:[4026531837]
+  uts -> uts:[4026532287]
+
+Число в скобках — inode namespace'а. Одинаковый inode = один namespace.
+```
+
+### 13.9 Cgroups — как ограничиваются ресурсы
+
+Namespaces дают **изоляцию**. Cgroups дают **ограничения**.
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  cgroup v2 controllers                                             │
+├────────────────────────────────────────────────────────────────────┤
+│  memory     - лимиты RAM, swap                                     │
+│  cpu        - лимит CPU time (quota per period)                    │
+│  io         - лимит disk I/O bandwidth и IOPS                      │
+│  pids       - лимит процессов                                      │
+│  net        - через iptables/tc (не отдельный controller)          │
+└────────────────────────────────────────────────────────────────────┘
+
+Файловая система cgroup:
+  /sys/fs/cgroup/
+  └── kubepods.slice/
+      └── kubepods-burstable.slice/
+          └── kubepods-burstable-pod<uid>.slice/
+              └── cri-containerd-<id>.scope/
+                  ├── memory.max         → 2147483648 (2 GB)
+                  ├── memory.current     → 1048576000 (1 GB used)
+                  ├── memory.high        → 1717986918 (soft limit)
+                  ├── memory.events      → oom counter
+                  ├── cpu.max            → "200000 100000" (2 cores)
+                  ├── cpu.stat           → usage stats
+                  ├── cpu.pressure       → PSI throttle info
+                  ├── io.max             → per-device IOPS/bandwidth
+                  ├── pids.max           → 1024
+                  └── cgroup.procs       → список PID'ов в cgroup
+
+Когда JVM в контейнере обращается за памятью:
+  1. JVM syscall mmap()
+  2. Kernel аллоцирует virtual pages
+  3. First write → page fault → kernel аллоцирует physical page
+  4. Kernel обновляет cgroup memory.current
+  5. Если memory.current > memory.max → cgroup OOM killer
+     → SIGKILL к процессу в cgroup с наибольшим oom_score
+     → Container exits with code 137
+     → K8s помечает Pod как OOMKilled
+```
+
+### 13.10 rootfs и overlayfs — как файловая система контейнера
+
+Container имеет свой view файловой системы. Как это работает?
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Docker image = набор слоёв (read-only)                            │
+│                                                                    │
+│  eclipse-temurin:21-jre                                            │
+│  ├── Layer 1: base Ubuntu (/, /bin, /usr, /lib, ...)               │
+│  ├── Layer 2: JRE installation                                     │
+│  └── Layer 3: environment setup                                    │
+│                                                                    │
+│  Твой image добавляет:                                             │
+│  ├── Layer 4: dependencies JARs                                    │
+│  ├── Layer 5: application code                                     │
+│  └── Layer 6: config                                               │
+└──────────────────────┬─────────────────────────────────────────────┘
+                       │ при запуске container
+                       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  OverlayFS (union mount)                                           │
+│                                                                    │
+│  Kernel создаёт объединённый view:                                 │
+│    lowerdir=Layer1:Layer2:Layer3:Layer4:Layer5:Layer6  (read-only) │
+│    upperdir=<writable layer>          (read-write, per container)  │
+│    workdir=<internal>                                              │
+│                                                                    │
+│  Внутри контейнера видит одну ФС.                                  │
+│  Read: ищется в upper → потом в layers сверху вниз.                │
+│  Write: copy-on-write в upper layer.                               │
+│                                                                    │
+│  Когда container удаляется — upper layer выбрасывается.            │
+│  Read-only layers остаются в /var/lib/containerd/                  │
+│  и переиспользуются другими containers из того же image.           │
+└────────────────────────────────────────────────────────────────────┘
+
+Можно посмотреть на host:
+  $ mount | grep overlay
+  overlay on /var/lib/containerd/.../rootfs type overlay
+    (rw,relatime,lowerdir=...,upperdir=...,workdir=...)
+
+Практический эффект:
+  - Container startup быстрый (не копирование, а mount)
+  - Экономия disk (shared layers)
+  - Каждый container имеет иллюзию собственной ФС
+```
+
+### 13.11 Container runtime layer — containerd, runc, CRI
+
+Kubelet не запускает контейнеры напрямую. Есть цепочка:
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  KUBELET (K8s node agent)                                          │
+│  Собирает информацию о Pod'ах, следит за их состоянием.            │
+└──────────────────────┬─────────────────────────────────────────────┘
+                       │ CRI (Container Runtime Interface, gRPC)
+                       │ Методы: RunPodSandbox, PullImage,
+                       │         CreateContainer, StartContainer, ...
+                       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  CONTAINERD (high-level runtime)                                   │
+│  - Управляет lifecycle контейнеров                                 │
+│  - Работает с image registry (pull/push)                           │
+│  - Управляет layers (overlayfs)                                    │
+│  - Мониторинг                                                      │
+└──────────────────────┬─────────────────────────────────────────────┘
+                       │ containerd → containerd-shim (per container)
+                       │ containerd-shim вызывает:
+                       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  RUNC (low-level runtime, OCI Runtime Spec)                        │
+│  - Прямо вызывает Linux syscalls                                   │
+│  - clone() → создание namespaces                                   │
+│  - mount() → filesystem setup                                      │
+│  - pivot_root() → смена root ФС                                    │
+│  - setresuid() → non-root user                                     │
+│  - execve() → запуск entrypoint                                    │
+└──────────────────────┬─────────────────────────────────────────────┘
+                       │
+                       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  LINUX KERNEL — контейнер как процесс с namespaces + cgroups       │
+└────────────────────────────────────────────────────────────────────┘
+
+Альтернативы runc:
+  - crun (быстрее, C вместо Go)
+  - kata-containers (запускает каждый контейнер в мини-VM для изоляции)
+  - gVisor (user-space kernel для sandbox)
+
+Альтернативы containerd:
+  - CRI-O (заточен под K8s, минималистичный)
+  - Docker (изначально, но deprecated в K8s 1.24+)
+```
+
+### 13.12 Networking — как Pod получает сеть
+
+Самый нетривиальный слой. Каждый Pod имеет свой IP, доступный со всего кластера. Как это работает физически?
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  ФИЗИЧЕСКАЯ СЕТЬ                                                   │
+│  Node1: 192.168.1.10 / 25GbE eth0                                  │
+│  Node2: 192.168.1.11 / 25GbE eth0                                  │
+│  Node3: 192.168.1.12 / 25GbE eth0                                  │
+│  Все в одном L2 сегменте или связаны через L3 routing              │
+└────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│  POD SUBNETS (Cluster CIDR)                                        │
+│                                                                    │
+│  Каждой ноде выделяется /24 диапазон:                              │
+│    Node1: 10.244.1.0/24 (256 IPs для Pod'ов)                       │
+│    Node2: 10.244.2.0/24                                            │
+│    Node3: 10.244.3.0/24                                            │
+│                                                                    │
+│  Service ClusterIP range: 10.96.0.0/16 (виртуальные IP)            │
+└────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│  ВНУТРИ ОДНОЙ НОДЫ (Node1)                                         │
+│                                                                    │
+│  Physical NIC: eth0 (192.168.1.10)                                 │
+│         │                                                          │
+│         │ (host network namespace)                                 │
+│         │                                                          │
+│  Bridge cni0 (10.244.1.1 — gateway для Pod'ов ноды)                │
+│         │                                                          │
+│    ┌────┼────┬─────┬─────┐                                         │
+│    │    │    │     │     │                                         │
+│  veth1 veth2 veth3 veth4 (host-side veth pairs)                    │
+│    │    │    │     │                                               │
+│    │    │    │     │  ← "туннель" в Pod namespace                  │
+│    │    │    │     │                                               │
+│  eth0 eth0 eth0 eth0 (внутри каждого Pod namespace)                │
+│    │    │    │     │                                               │
+│  Pod1 Pod2 Pod3  Pod4                                              │
+│  10.244.1.5 10.244.1.6 10.244.1.7 10.244.1.8                       │
+└────────────────────────────────────────────────────────────────────┘
+
+Что делает CNI plugin при создании Pod:
+  1. Создаёт veth pair (два виртуальных сетевых interface).
+  2. Один конец (veth_host) остаётся в host namespace.
+  3. Другой (eth0) переносится в Pod network namespace.
+  4. Присваивает IP из diapason ноды.
+  5. Добавляет route: default via 10.244.1.1 (bridge).
+  6. Обновляет iptables для NetworkPolicy.
+
+Overlay (VXLAN):
+  Если Pod1 (10.244.1.5) на Node1 хочет talk to Pod5 (10.244.2.9) на Node2:
+    1. Пакет: src=10.244.1.5, dst=10.244.2.9
+    2. Local route: 10.244.2.0/24 не в моей подсети → default gw
+    3. CNI daemon видит: destination на Node2
+    4. Инкапсуляция в VXLAN: outer пакет src=Node1(192.168.1.10),
+       dst=Node2(192.168.1.11), UDP:8472, payload=inner пакет
+    5. Отправляется по физической сети
+    6. На Node2: VXLAN decapsulation, inner пакет доставляется Pod5.
+
+Альтернатива VXLAN — BGP routing (Calico):
+    Каждая нода анонсирует свои Pod subnets через BGP.
+    Роутеры дата-центра знают маршруты. Пакеты идут напрямую.
+    Быстрее, но требует BGP-совместимую infrastructure.
+```
+
+### 13.13 Storage — как Pod получает persistent volumes
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  ФИЗИЧЕСКОЕ ХРАНИЛИЩЕ (варианты)                                   │
+│  - SAN (Storage Area Network): FC / iSCSI                          │
+│  - NAS (Network Attached Storage): NFS / SMB                       │
+│  - Cloud: AWS EBS / GCP PD / Azure Disk                            │
+│  - Local: NVMe SSD прямо на ноде                                   │
+└──────────────────────┬─────────────────────────────────────────────┘
+                       │ CSI (Container Storage Interface)
+                       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  CSI DRIVER (per storage vendor)                                   │
+│                                                                    │
+│  Например ceph-csi, pd.csi.storage.gke.io, ebs.csi.aws.com         │
+│                                                                    │
+│  Компоненты:                                                       │
+│    - Controller: provisions volumes (create/delete)                │
+│    - Node plugin: attaches и mounts volumes на конкретной ноде     │
+└──────────────────────┬─────────────────────────────────────────────┘
+                       │
+                       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  K8s ABSTRACTIONS                                                  │
+│                                                                    │
+│  StorageClass — определяет тип storage:                            │
+│    apiVersion: storage.k8s.io/v1                                   │
+│    kind: StorageClass                                              │
+│    metadata: {name: fast-ssd}                                      │
+│    provisioner: ebs.csi.aws.com                                    │
+│    parameters: {type: gp3, iops: "3000"}                           │
+│                                                                    │
+│  PersistentVolume (PV) — конкретный volume (создан или сам, или    │
+│    провижнером):                                                   │
+│    - capacity: 100Gi                                               │
+│    - accessModes: [ReadWriteOnce]                                  │
+│    - storageClassName: fast-ssd                                    │
+│    - awsElasticBlockStore: {volumeID: vol-abc123}                  │
+│                                                                    │
+│  PersistentVolumeClaim (PVC) — запрос от Pod:                      │
+│    - resources.requests.storage: 50Gi                              │
+│    - storageClassName: fast-ssd                                    │
+│    → K8s binds PVC to подходящий PV                                │
+└──────────────────────┬─────────────────────────────────────────────┘
+                       │
+                       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  ATTACH & MOUNT flow                                               │
+│                                                                    │
+│  1. Pod с PVC назначен на Node3.                                   │
+│  2. CSI controller: attach volume к Node3 (в AWS: API call для     │
+│     "attach EBS to instance i-xyz").                               │
+│  3. На Node3 появляется block device /dev/xvdf.                    │
+│  4. CSI node plugin: mkfs.ext4 (первый раз) или mount.             │
+│  5. Kubelet mounts в Pod:                                          │
+│     /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~csi/pvc-.../ │
+│  6. Bind mount в container:                                        │
+│     /data (внутри контейнера) → /var/lib/kubelet/pods/.../mount    │
+│                                                                    │
+│  Приложение внутри Pod'а видит /data как обычную папку.            │
+│  На самом деле — это mount на attached network storage.            │
+│  Latency: 100 μs - 5 ms per I/O (в облаке).                        │
+└────────────────────────────────────────────────────────────────────┘
+
+Local storage vs network:
+  - `emptyDir` — временный, живёт с Pod. Хранится на диске ноды.
+  - `hostPath` — прямая ссылка на путь ноды. Не рекомендуется.
+  - Network PV (EBS, Ceph) — persist через рестарты Pod'а и ноды.
+```
+
+### 13.14 Как процесс "чувствует себя" внутри контейнера
+
+Взгляд изнутри JVM-контейнера. Что видит процесс?
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Внутри контейнера (JVM думает, что он "самостоятельная система") │
+│                                                                    │
+│  $ hostname                                                        │
+│  isnaknpuser-abc-xyz               ← UTS namespace                 │
+│                                                                    │
+│  $ ps auxf                                                         │
+│  UID  PID  ...                                                     │
+│  spring  1  java -jar app.jar        ← только процессы этого Pod  │
+│  spring  9  {C1 CompilerThread}      (PID namespace)               │
+│                                                                    │
+│  $ ip addr                                                         │
+│  eth0: 10.244.1.5/24                 ← свой network namespace      │
+│                                                                    │
+│  $ ls /                                                            │
+│  bin  boot  dev  etc  home  lib  opt  usr  var                     │
+│  app                                 ← MNT namespace, rootfs image │
+│                                                                    │
+│  $ id                                                              │
+│  uid=1000(spring) gid=1000(spring)   ← non-root                    │
+│                                                                    │
+│  $ nproc                                                           │
+│  2                                   ← видит cgroup CPU quota      │
+│                                                                    │
+│  $ free -h                                                         │
+│  Mem:  2Gi                           ← видит cgroup memory limit   │
+│                                       (при cgroup-aware nproc/free)│
+│                                                                    │
+│  $ ls /proc/1/                                                     │
+│  status cmdline maps ...             ← это твоя JVM = PID 1        │
+│                                                                    │
+│  $ cat /proc/self/cgroup                                           │
+│  0::/kubepods.slice/kubepods-burstable.slice/...                   │
+│                                                                    │
+│  Всё выглядит как обычный Linux. Но:                               │
+│  - kernel — общий с host'ом                                        │
+│  - другие Pod'ы этой ноды невидимы                                 │
+│  - файловая система — union из image layers                        │
+│  - ресурсы ограничены cgroup                                       │
+└────────────────────────────────────────────────────────────────────┘
+
+Ты не поймёшь этого, пока не выйдешь на host и не увидишь:
+  $ ps -ef | grep java
+  spring  12345  ...  java -jar app.jar     ← реальный PID в host
+
+  $ ls /proc/12345/ns/
+  net -> net:[4026532290]                    ← это net namespace
+  pid -> pid:[4026532289]                    ← это pid namespace
+
+Тот же процесс, но с точки зрения host'а — PID 12345, а не 1.
+```
+
+### 13.15 Полная миграция запроса — от клиента до JVM
+
+Когда пользователь делает HTTP-запрос, он проходит через все слои:
+
+```
+Пользователь: браузер, HTTP GET https://knp.gov.kz/api/users/1
+        │
+        │ Public Internet
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  DNS (Route53 / внутренний DNS)                                    │
+│    knp.gov.kz → 185.100.10.20 (public IP LB)                       │
+└──────────────────────┬─────────────────────────────────────────────┘
+        │
+        │ TLS handshake, TCP
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Load Balancer (F5 / HAProxy / cloud LB)                           │
+│    Terminates TLS, forwards к Ingress Controller                   │
+└──────────────────────┬─────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Ingress Controller (Nginx / Traefik) — Pod в кластере             │
+│    Routing rules: knp.gov.kz/api → Service isnaknpgateway          │
+└──────────────────────┬─────────────────────────────────────────────┘
+        │
+        │ HTTP to Service ClusterIP (10.96.5.10:80)
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  kube-proxy на ноде клиента                                        │
+│    iptables DNAT: 10.96.5.10:80 → 10.244.1.5:8080                  │
+│    (случайный из Ready Pod'ов)                                     │
+└──────────────────────┬─────────────────────────────────────────────┘
+        │
+        │ Возможно overlay network (VXLAN)
+        │ если Pod на другой ноде
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Physical network (25 GbE)                                         │
+│    Пакет летит между worker nodes                                  │
+└──────────────────────┬─────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Node2 hypervisor → VM (K8s worker)                                │
+│    virtio-net: shared ring buffer, VM kernel получает пакет        │
+└──────────────────────┬─────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Linux kernel в VM                                                 │
+│    eth0 (physical NIC VM) → route → cni0 bridge → veth → Pod ns    │
+└──────────────────────┬─────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Pod network namespace                                             │
+│    eth0 (10.244.1.5) → TCP stack → socket (JVM listening :8080)    │
+└──────────────────────┬─────────────────────────────────────────────┘
+        │
+        │ epoll_wait возвращает event
+        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  JVM (внутри container namespace)                                  │
+│    Tomcat NIO connector reads bytes                                │
+│    → парсинг HTTP                                                  │
+│    → Spring DispatcherServlet                                      │
+│    → UserController.getUser(1)                                     │
+│    → UserService → UserRepository                                  │
+│    → HikariCP выдаёт JDBC connection                               │
+│    → PostgreSQL query (через сетевой стек снова, но короче)        │
+│    → Result serialization в JSON                                   │
+│    → HTTP response back                                            │
+└────────────────────────────────────────────────────────────────────┘
+
+Ответ идёт в обратную сторону через все те же слои.
+
+Total latency (без БД): 5-50 ms.
+Latency components:
+  - DNS lookup: 1-10 ms (кэшируется)
+  - TLS handshake: 50-200 ms (первый раз, потом keep-alive)
+  - LB → Ingress: <1 ms
+  - kube-proxy iptables: microseconds
+  - Overlay (VXLAN): 0.1-1 ms
+  - virtio (VM → host): microseconds
+  - JVM processing: 1-100 ms (зависит от логики)
+  - DB query: 1-100 ms
+```
+
+### 13.16 Что реально видит администратор в проде
+
+Разные уровни доступа для разных ролей:
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Developer видит:                                                  │
+│    - kubectl get pods                                              │
+│    - kubectl logs                                                  │
+│    - kubectl exec / port-forward                                   │
+│    - ArgoCD UI                                                     │
+│    - Grafana dashboards                                            │
+│    - Sentry / Kibana                                               │
+│  Не видит: физическую инфраструктуру, гипервизор.                  │
+└────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│  Platform / DevOps engineer видит:                                 │
+│    - Всё что Developer                                             │
+│    - K8s control plane (etcd, apiserver metrics)                   │
+│    - Node-level metrics (Node Exporter)                            │
+│    - ArgoCD admin                                                  │
+│    - Docker registry admin                                         │
+│    - CI/CD runners status                                          │
+│    - Ansible / Terraform state                                     │
+│  Обычно не видит: hypervisor management console.                   │
+└────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│  Infrastructure / Datacenter engineer видит:                       │
+│    - VMware vCenter / KVM libvirt / OpenStack                      │
+│    - iDRAC / iLO для bare metal (out-of-band management)           │
+│    - SAN storage arrays                                            │
+│    - Physical network switches                                     │
+│    - Rack power/cooling                                            │
+│    - IPMI, BMC (baseboard management controllers)                  │
+│  Обычно не имеет root в K8s namespaces developers.                 │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.17 Cloud vs On-Premises — где живут K8s ноды
+
+В КНП/enterprise часто on-premises. В облаке — managed K8s. Разница:
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  ON-PREMISES (КНП, банки, госсектор)                               │
+│                                                                    │
+│  Physical hardware:                                                │
+│    - Dell / HPE / SuperMicro серверы                               │
+│    - VMware ESXi / KVM+OpenNebula как hypervisor                   │
+│    - VMs создаются вручную или через Terraform + vSphere provider  │
+│    - VMs играют роль K8s master + worker nodes                     │
+│    - K8s installed через kubeadm / kubespray / Rancher             │
+│                                                                    │
+│  Плюсы: полный контроль, данные на своей территории, compliance.   │
+│  Минусы: capex, слабая эластичность, ops-heavy.                    │
+└────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│  MANAGED K8s В ОБЛАКЕ                                              │
+│                                                                    │
+│  EKS (AWS), GKE (Google), AKS (Azure):                             │
+│    - Control plane управляется провайдером (invisible)             │
+│    - Ты видишь только worker nodes (EC2 instances / Compute VMs)   │
+│    - Гипервизор — Nitro (AWS), KVM (GCP), Hyper-V (Azure)          │
+│    - Physical hardware — облачные дата-центры                      │
+│                                                                    │
+│  Плюсы: opex, автоматика (autoscaling, upgrades).                  │
+│  Минусы: vendor lock-in, стоимость egress трафика.                 │
+└────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│  HYBRID / KUBERNETES ON BARE METAL                                 │
+│                                                                    │
+│  Некоторые крупные компании ставят K8s прямо на bare metal:        │
+│    - kubelet работает на физической OS без VM                      │
+│    - Без overhead виртуализации                                    │
+│    - Но потеря flexibility (нельзя пересоздать node за минуту)     │
+│                                                                    │
+│  Использование: HFT, ML training, специализированные workloads.    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.18 Практическое замечание — как это влияет на JVM performance
+
+Каждый слой = latency + potential contention. Java-приложение в контейнере в VM на shared hypervisor имеет несколько "гостей":
+
+```
+Что может замедлить твоё JVM-приложение (сверху вниз):
+
+1. JVM level:
+   - GC pauses
+   - JIT compilation
+   - Thread contention (synchronized bottleneck)
+
+2. Container level:
+   - CPU throttling (cgroup CPU quota)
+   - Memory pressure (cgroup memory.high)
+   - Слишком много контейнеров на ноде → CPU steal
+
+3. VM level:
+   - CPU steal (host дал CPU другим VM)
+   - Noisy neighbor (другая VM жрёт I/O на shared disk)
+   - vRAM swap (гипервизор swap'ит из-за overcommit)
+
+4. Host / hypervisor level:
+   - Ядро host'а под нагрузкой
+   - Physical CPU / memory limits
+   - Network saturation on host NIC
+
+5. Physical:
+   - SSD wear, disk queue depth
+   - Network switch congestion
+   - Power / cooling issues (throttling)
+
+Метрики для наблюдения:
+  - JVM: heap used, GC pauses, thread count → jvm.gc.pause
+  - Container: CPU throttled periods → container_cpu_cfs_throttled_periods_total
+  - Node: load average, memory pressure → node_load1, node_memory_MemAvailable_bytes
+  - VM: CPU steal % → node_cpu_seconds_total{mode="steal"}
+  - Storage: iowait, disk latency → node_disk_io_time_seconds_total
+  - Network: packet drops → node_network_receive_drop_total
+```
+
+---
+
 ## Итог
 
 Полный путь от `git push` до трафика в prod'е — это ~10 отдельных систем, каждая со своим протоколом и failure modes. Понимая полную схему точечно:
