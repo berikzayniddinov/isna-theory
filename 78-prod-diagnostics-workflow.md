@@ -1,75 +1,73 @@
 # 78. Прод-диагностика: kubectl workflow, thread dumps, OOMKilled, crash-loop
 
-Практический workflow расследования прод-инцидентов в k8s+Spring Boot. Основано на реальных диагностиках КНП (sync crash-loop, gateway CI fails, liquibase checksum mismatch, deploy timeout).
+## Зачем это знать
 
----
+Инцидент в проде — это гонка со временем. Пользователи получают 5xx, бизнес считает потери, команда в чате ждёт ответа «что происходит и когда починим». В эти первые 5-10 минут работает или не работает натренированный алгоритм: где смотреть, что читать, в каком порядке. Без алгоритма — паника, случайные `kubectl` вслепую, шумные подсказки в чате, тратятся часы.
 
-## 1. Первое, что делаешь на алерте
+С алгоритмом 80% инцидентов диагностируются за 5-15 минут. Не потому что типовые (они разные), а потому что первые шаги одинаковые: понять статус pod'а, увидеть Events, прочитать логи предыдущего инстанса, глянуть события кластера. Остальные 20% — глубокие: thread dump, heap dump, `pg_stat_activity`, метрики за последние часы, разбор корреляции по логам. Тоже алгоритмичны, просто чуть длиннее.
 
-Алгоритм из 5 шагов, работает 80% случаев:
+Этот файл — практический workflow, собранный из реальных инцидентов на КНП: sync crash-loop от отсутствующего Secret, gateway rollout timeout, liquibase checksum mismatch после отредактированного changelog, OOM tax-rep-report из-за неограниченного кэша PDF-шаблонов. По каждому — как отличить от других, что смотреть, как чинить. Плюс инструменты, которые надо знать: `kubectl describe`, `kubectl logs --previous`, thread dumps через jcmd, heap dumps через MAT, `pg_stat_activity` и `pg_blocking_pids`, Boot Actuator для быстрого поворота log level на живую. И анти-паттерны — что **не** делать в проде, чтобы инцидент не превратился в катастрофу.
 
-```
-1. kubectl get pods -n <ns> -o wide
-2. kubectl describe pod <name> -n <ns>
-3. kubectl logs <name> -n <ns> --previous --tail=200
-4. kubectl get events -n <ns> --sort-by='.lastTimestamp' | tail -30
-5. Reproduce локально или в staging (только если критично)
-```
+## Первые пять шагов на любом алерте
 
-Разберём каждый шаг.
+Есть алгоритм, который работает в 80% случаев, вне зависимости от природы инцидента. Пять шагов, в жёстком порядке. Каждый следующий отвечает на вопрос, который поднял предыдущий.
 
----
+Шаг первый — увидеть pod'ы: `kubectl get pods -n <ns> -o wide`. Кто Running, кто Pending, у кого рестарты, где какие возрасты. Флаг `-o wide` добавляет колонку с IP pod'а и именем ноды — полезно если проблема на конкретной ноде.
 
-## 2. kubectl get pods — что смотреть
+Шаг второй — вытянуть детали по проблемному pod'у: `kubectl describe pod <name> -n <ns>`. Смотреть три раздела снизу вверх — Events, Last State, Containers.
 
-```
-NAME                       READY   STATUS             RESTARTS       AGE
-isnaknpsync-abc-xyz        0/1     CrashLoopBackOff   17 (2m ago)    3h
-isnaknpuser-def-xyz        1/1     Running            0              7d
-```
+Шаг третий — прочитать логи упавшего инстанса: `kubectl logs <name> -n <ns> --previous --tail=200`. Флаг `--previous` — золото, показывает логи того контейнера, который упал, а не текущего попытавшегося запуск.
 
-**READY 1/1** — pod живой и readinessProbe = OK.
-**READY 0/1** — либо не готов (readiness fail), либо контейнер не стартовал.
+Шаг четвёртый — контекст namespace'а: `kubectl get events -n <ns> --sort-by='.lastTimestamp' | tail -30`. События уровня выше pod'а — schedule, PVC, network, controller manager.
 
-**STATUS**:
-- `Running` — pod живой.
-- `Pending` — pod ещё не запущен: нет ресурсов (Insufficient CPU/memory), нет ноды с нужными selectors/taints, wait for PVC.
-- `ContainerCreating` — образ качается, том монтируется.
-- `CrashLoopBackOff` — контейнер запустился, но упал, k8s ждёт увеличивающийся интервал перед следующим restart (10s, 20s, 40s, ..., до 5min).
-- `ImagePullBackOff` / `ErrImagePull` — не может скачать образ (нет прав в registry, image не существует, wrong tag).
-- `OOMKilled` — контейнер убит cgroup OOM killer.
-- `Error` / `Completed` — Job закончился.
-- `Terminating` — pod в процессе удаления (или застрял в удалении если >60s).
+Шаг пятый — воспроизвести локально или в staging **только если критично**. Быстрый fix прод → расследование позже. Затягивать инцидент ради «сначала понять до конца» — против бизнеса.
 
-**RESTARTS** — растёт → контейнер регулярно падает. `17 (2m ago)` = 17 рестартов, последний 2 минуты назад = активный crash-loop.
+Дальше разберём каждый шаг подробно с типовыми сигналами.
 
-**AGE** — pod существует столько-то. Свежий pod с 0 рестартов после deploy — обычно ok.
+## kubectl get pods: чтение статусов
 
----
+Вывод состоит из колонок READY, STATUS, RESTARTS, AGE — за каждой стоит своя семантика.
 
-## 3. kubectl describe pod — 90% ответов здесь
+**READY** — соотношение containers-Ready / containers-total. `1/1` — единственный контейнер прошёл readiness. `0/1` — либо readiness fails, либо контейнер не стартовал вообще. Для multi-container pod'ов `2/3` означает что один из трёх не Ready — его надо искать через describe.
 
-```bash
-kubectl describe pod isnaknpsync-abc-xyz -n knp
-```
+**STATUS** — состояние pod'а в целом:
 
-Скроллим до конца:
+- `Running` — pod живёт, все контейнеры запущены.
+- `Pending` — pod ещё не запущен. Причины: `Insufficient CPU/memory` на всех подходящих нодах, taints без соответствующих tolerations, PVC ещё не смонтирован (`ContainerCreating` на самом деле состоит из фаз, включая pull image + volume mount).
+- `ContainerCreating` — kubelet работает: качает образ, монтирует тома, готовит cgroups. Длится обычно секунды-минуты; если висит десятками минут — искать причину в events (image pull failed, PVC issue).
+- `CrashLoopBackOff` — контейнер стартовал, упал, kubelet ждёт с увеличивающимся backoff (10s, 20s, 40s, 80s, ..., cap 5min) перед следующим restart. Классика для application-level ошибок.
+- `ImagePullBackOff` или `ErrImagePull` — не удалось скачать образ. Причины: неверный tag, нет прав в registry (imagePullSecret не настроен или битый), registry unreachable.
+- `OOMKilled` — контейнер убит cgroup OOM killer. Технически это состояние lastState, но `kubectl get pods` иногда показывает как short-lived reason.
+- `Error`, `Completed` — терминальные для Job'ов. Error = exit != 0, Completed = exit 0.
+- `Terminating` — pod удаляется. Нормально длится до `terminationGracePeriodSeconds`. Если висит дольше — застрял в удалении (обычно из-за не завершившегося finalizer'а).
+
+**RESTARTS** — сколько раз контейнер перезапускался. `17 (2m ago)` — 17 рестартов, последний 2 минуты назад. Активный crash-loop. `0` на pod'е возрастом день — стабильно работает.
+
+**AGE** — сколько существует. Свежий pod с 0 рестартов после deploy — обычно ok, но `describe` подтвердит.
+
+Ключевой навык — по первому взгляду на `kubectl get pods` понимать: массовая проблема (много pod'ов не Ready, cluster-level инцидент) или локальная (один pod дурит, application-level).
+
+## kubectl describe pod: 90% ответов здесь
+
+Describe — самая информативная команда, выдаёт целую страницу текста. Читать надо сверху вниз, но начинать с конца.
+
+**Events в самом низу**:
 
 ```
 Events:
-  Type     Reason     Age                  From     Message
-  ----     ------     ----                 ----     -------
-  Normal   Scheduled  20m                  ...      Successfully assigned knp/isnaknpsync-abc-xyz
-  Normal   Pulling    20m                  kubelet  Pulling image "registry.1sc.kz/isnaknpsync:ac01514b"
-  Normal   Pulled     20m                  kubelet  Image pulled
-  Normal   Created    20m (x3 over 3h)     kubelet  Created container isnaknpsync
-  Normal   Started    20m (x3 over 3h)     kubelet  Started container isnaknpsync
-  Warning  BackOff    2m50s (x1693 over 3h)  kubelet  Back-off restarting failed container
+  Type     Reason     Age                     From     Message
+  Normal   Scheduled  20m                     ...      Successfully assigned knp/isnaknpsync-abc-xyz
+  Normal   Pulling    20m                     kubelet  Pulling image "registry.1sc.kz/isnaknpsync:ac01514b"
+  Normal   Pulled     20m                     kubelet  Image pulled
+  Normal   Created    20m (x3 over 3h)        kubelet  Created container isnaknpsync
+  Normal   Started    20m (x3 over 3h)        kubelet  Started container isnaknpsync
+  Warning  BackOff    2m50s (x1693 over 3h)   kubelet  Back-off restarting failed container
 ```
 
-**Смотрим Events снизу вверх** — самый свежий внизу. `BackOff x1693` = 1693 попыток за 3 часа перезапустить — сильный crash-loop.
+Свежие события внизу. `BackOff x1693 over 3h` — 1693 попытки за 3 часа. Сильный crash-loop. `Created (x3 over 3h)` — контейнер создавали 3 раза за 3 часа, значит между попытками был большой backoff, каждая попытка длилась минуты.
 
-Выше в describe:
+**Last State и State посередине**:
+
 ```
 State:          Waiting
   Reason:       CrashLoopBackOff
@@ -80,14 +78,12 @@ Last State:     Terminated
   Finished:     Fri, 12 Sep 2026 10:15:12 +0500
 ```
 
-Exit Code:
-- **0** — ok, программа завершилась чисто.
-- **1** — общая ошибка приложения (`throw new RuntimeException`).
-- **137** — SIGKILL. Обычно OOMKilled или terminationGracePeriod истёк.
-- **139** — SIGSEGV. Native crash (rare).
-- **143** — SIGTERM. Штатный shutdown (Boot graceful).
+Exit code — важная подсказка о причине падения. **0** — чистый выход, программа завершилась сама. **1** — общая application ошибка (например, `throw new RuntimeException` в main). **137** = 128 + 9 (SIGKILL). Обычно OOMKilled (cgroup убил) или terminationGracePeriod истёк. **139** = 128 + 11 (SIGSEGV) — native crash, редко, обычно JNI-код. **143** = 128 + 15 (SIGTERM) — штатный shutdown, если exit 143 без OOM — Boot корректно принял сигнал и вышел.
 
-**Секции резюме сверху describe**:
+Если Started и Finished рядом (12 секунд) — приложение падает при старте, не успевает даже прогреться. Смотреть логи `--previous`.
+
+**Containers сверху** — образ, ресурсы, environment:
+
 ```
 Containers:
   isnaknpsync:
@@ -101,46 +97,41 @@ Containers:
       memory:   2Gi
     Environment:
       SPRING_PROFILES_ACTIVE:  prod
+      DB_HOST:                 postgres-primary
       ...
 ```
 
-Смотри **Image tag** (ту ли версию задеплоили), **Environment** (все ли ENV на месте, не пустые ли ключи), **Requests/Limits** (не задушен ли).
+Проверять: тот ли Image tag (мог задеплоиться не тот SHA), все ли Environment на месте (пустой ключ = не задан), не задушен ли по ресурсам (Requests/Limits ниже реальных потребностей).
 
-Смотри **Conditions**:
+**Conditions**:
+
 ```
 Conditions:
   Type              Status
   Initialized       True
-  Ready             False    ← ноготок
+  Ready             False    ← вот проблема
   ContainersReady   False
   PodScheduled      True
 ```
 
-Ready=False → readinessProbe fails → pod не в endpoints Service'а → трафик не идёт.
+`Ready: False` = readiness probe не проходит = pod не в endpoints = трафик не идёт. Дальше смотреть в logs — почему readiness падает.
 
----
+## kubectl logs: фактическая ошибка приложения
 
-## 4. kubectl logs — фактическая ошибка приложения
+Логи — единственный источник, где видно что реально происходит внутри JVM. `kubectl logs <pod>` показывает stdout/stderr **текущего** живого контейнера. Если pod в CrashLoopBackOff — контейнер сейчас лежит, логи покажут только последнюю попытку.
 
-```bash
-kubectl logs isnaknpsync-abc-xyz -n knp --tail=200
-```
+Ключевой флаг — **`--previous`**. Показывает логи предыдущего инстанса контейнера, того самого который упал. Без него разбор crash-loop невозможен — актуальные логи будут пустые или обрезанные до момента падения.
 
-Логи **живого** контейнера. Если pod в CrashLoopBackOff — контейнер сейчас не запущен, тут покажет только последние строки последнего запуска.
-
-Для **предыдущего** container'а (упавшего):
 ```bash
 kubectl logs isnaknpsync-abc-xyz -n knp --previous --tail=400
 ```
 
-Это **золото** — оно покажет что было в моменте краха.
+Что искать в логах:
 
-**Что искать**:
-- `ERROR` и `Exception` — конкретные исключения.
-- `Caused by:` — root cause в цепочке exception'ов.
-- Стектрейсы приложения (не Spring internal).
+Первым делом — `ERROR` и `Exception` в конце (перед падением). Не самая первая ошибка, а последняя перед выходом — обычно она и есть причина. Дальше — `Caused by:` в цепочке — root cause. Spring обёрнутый в свои исключения (BeanCreationException, UnsatisfiedDependencyException) — надо докопать до реального `Caused by`, там будет содержательная причина.
 
-Пример из sync crash-loop:
+Пример из реального sync crash-loop:
+
 ```
 ERROR o.s.boot.SpringApplication : Application run failed
 org.springframework.beans.factory.UnsatisfiedDependencyException: Error creating bean 
@@ -149,221 +140,200 @@ Caused by: java.lang.IllegalStateException:
   phys_person_capacity_status_history_hash backfill enabled without ENCRYPTION_BLIND_INDEX_KEY
 ```
 
-Причина ясна: не задана env variable. Идти в Deployment/Secret, добавить.
+Причина сразу ясна: не задан `ENCRYPTION_BLIND_INDEX_KEY` в environment. Идти в Deployment/Secret, добавлять. Разбор занял секунды после того как открыл логи с `--previous`.
 
-**Другие полезные флаги logs**:
-- `-f` (`--follow`) — стрим live (как tail -f).
-- `--since=10m` — только за последние 10 минут.
+Полезные флаги logs, за которые новички забывают:
+
+- `-f` (`--follow`) — стрим live как `tail -f`.
+- `--since=10m` — только за последние 10 минут (очень полезно на нагруженных сервисах).
 - `--since-time=2026-09-12T10:00:00Z` — с точной timestamp.
-- `-c <container>` — если multi-container pod.
-- `--all-containers` — все контейнеры pod'а сразу.
+- `-c <container>` — если pod multi-container.
+- `--all-containers` — все контейнеры pod'а сразу (init + main + sidecars).
+- `--timestamps` — добавить timestamp к каждой строке (нужно когда логи сами не пишут время).
 
----
+## kubectl get events: контекст кластера
 
-## 5. kubectl get events — контекст кластера
+События — то, что происходило в namespace на уровне выше pod'ов. Schedule решения, pull образов, восстановление PVC, изменения Deployment. Часто причина того что pod не стартует — не в самом pod'е, а в scheduling или volume.
 
 ```bash
 kubectl get events -n knp --sort-by='.lastTimestamp' | tail -30
 ```
 
-Показывает "что происходило в namespace недавно": schedule, image pull, pod restart, PVC events, Ingress reload.
+Типичные полезные события:
 
-Полезно когда pod не стартует и в describe pod непонятно:
 ```
-Warning  FailedScheduling  pod/isnaknpuser-xyz  0/5 nodes are available: 
-  1 Insufficient memory, 4 node(s) had untolerated taint {dedicated: infra}
-```
-
-Причина: нет свободной memory на подходящих нодах.
-
-Или:
-```
-Warning  FailedMount  pod/postgres-0  Unable to attach or mount volumes: 
-  timed out waiting for the condition; unattached volumes=[data]
+Warning  FailedScheduling  pod/isnaknpuser-xyz  
+  0/5 nodes are available: 1 Insufficient memory, 
+  4 node(s) had untolerated taint {dedicated: infra}
 ```
 
-PVC не монтируется — проблема со storage provisioner'ом.
+Scheduler не нашёл ноду. Один узел с достаточно памяти есть, но там taint без соответствующего toleration; на остальных нодах памяти не хватает. Fix: либо освободить память (может кто-то раздутый живёт), либо расширить кластер, либо добавить toleration.
 
----
+```
+Warning  FailedMount  pod/postgres-0  
+  Unable to attach or mount volumes: timed out waiting for the condition; 
+  unattached volumes=[data]
+```
 
-## 6. Типовые сценарии
+PVC не монтируется. Storage provisioner не смог создать/присоединить том. Причины: проблема с CSI-драйвером, том занят другим pod'ом (RWO конфликт), исчерпан лимит EBS attach на инстансе.
 
-### 6.1 CrashLoopBackOff с exit=1
+```
+Warning  Unhealthy  pod/isnaknpuser-xyz  
+  Readiness probe failed: HTTP probe failed with statuscode: 503
+```
 
-Приложение падает при старте. Смотри `logs --previous`:
+Readiness пробу kubelet бьёт, приложение возвращает 503. Смотреть логи приложения — почему health/readiness падает (обычно БД недоступна, зависимость не поднялась).
 
-- **ClassNotFoundException / NoSuchMethodError** — dependency conflict. Проверь build (`gradle dependencies`) на конфликтующие версии.
-- **BeanCreationException** — Spring не может создать бин. Дальше в стектрейсе Caused by → реальная причина: missing env, missing bean, круговая зависимость.
-- **PSQLException: Connection to db... refused** — БД недоступна. Проверь `SPRING_DATASOURCE_URL`, network, БД жив ли.
-- **liquibase.exception.ValidationFailedException: checksum** — как в нашей ситуации: файл поменяли после apply. Откатить файл или clearCheckSums.
-- **IllegalStateException при @PostConstruct** — env variable не задана. `describe pod → Environment` покажет.
+## Типовые сценарии
 
-### 6.2 OOMKilled
+Каждый сценарий имеет свою характерную сигнатуру и своё лечение.
+
+### CrashLoopBackOff с exit=1
+
+Приложение падает при старте. Логи через `--previous`:
+
+- **ClassNotFoundException / NoSuchMethodError** — конфликт версий зависимостей. Проверять `./gradlew dependencies` на конфликтующие версии, часто причина в том что fat jar собрался с не той версией библиотеки.
+- **BeanCreationException** — Spring не может создать бин. Копать глубже в `Caused by`: обычно missing env variable, отсутствующий бин зависимости, circular dependency.
+- **PSQLException: Connection to db... refused** — БД недоступна на этапе создания DataSource. Проверить `SPRING_DATASOURCE_URL`, network policies, живёт ли БД (`kubectl get pods -l app=postgres`).
+- **liquibase.exception.ValidationFailedException: checksum** — типичная история: изменили уже применённый changeset. Fix — откатить файл к оригиналу или запустить `liquibase clearCheckSums` (осторожно, только если понимаешь последствия).
+- **IllegalStateException при @PostConstruct** — обычно проверка env variable в bean init. Смотреть `describe pod → Environment`.
+
+### OOMKilled
+
+Признак: `Reason: OOMKilled` в Last State, exit 137. Диагностика:
+
+Первое — live memory usage: `kubectl top pod X -n knp`. Показывает сколько ест сейчас (уже после рестарта, свежая копия). Если сразу близко к limit — приложение растёт быстро. Если мало — рост постепенный, ищем memory leak.
+
+Второе — JVM view: `kubectl exec X -- jstat -gc 1 1s 10`. Показывает состояние heap регионов раз в секунду 10 секунд. Смотреть S0U/S1U (Survivor), EU (Eden), OU (Old use). Если Old близко к максимуму и растёт после каждого GC — утечка. Если Old стабильный, но Eden часто заполняется — просто высокая аллокация, может быть нормально.
+
+Третье — heap dump:
 
 ```bash
-kubectl describe pod X | grep -A2 "Last State"
+kubectl exec X -- jcmd 1 GC.heap_dump /tmp/heap.hprof
+kubectl cp X:/tmp/heap.hprof ./heap.hprof
 ```
 
-Видишь `Reason: OOMKilled`. Диагностика:
+Открывать в Eclipse Memory Analyzer (MAT). Dominator Tree — топ по retained size. Path to GC Roots — почему объект не собирается. Классика утечек: HashMap-кэш без TTL, ThreadLocal без cleanup, статические поля с ростом, EhCache/Caffeine с неограниченной ёмкостью, JDBC statements без close.
 
-1. **Live memory usage**:
-   ```bash
-   kubectl top pod X -n knp
-   ```
-   `NAME  CPU  MEMORY`
-   `X    500m  1900Mi`
-   При лимите 2Gi = близко к пределу.
+Четвёртое — проверить JVM options: `kubectl exec X -- jinfo -flags 1 | grep -E "MaxHeapSize|Xmx"`. Убедиться что `-Xmx` меньше container `limits.memory` минимум на 512Mi (metaspace + direct memory + thread stacks + JIT code cache). Классика ошибки: `limits.memory: 2Gi`, `-Xmx2G` — heap сжирает всё, cgroup убивает при первой попытке взять metaspace.
 
-2. **JVM view**:
-   ```bash
-   kubectl exec X -- jstat -gc 1 1s 10
-   ```
-   Смотри S0U/S1U/EU/OU (Survivor, Eden, Old use). Если Old близко к limit и растёт после каждого GC → утечка.
+Полезные JVM опции: `-XX:+ExitOnOutOfMemoryError` — выйти сразу при OOM в heap, вместо попыток продолжить с полумёртвой памятью. `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/oom.hprof` — писать дамп автоматически при OOM (не забыть shared volume, иначе после рестарта потеряется).
 
-3. **Heap dump**:
-   ```bash
-   kubectl exec X -- jcmd 1 GC.heap_dump /tmp/heap.hprof
-   kubectl cp X:/tmp/heap.hprof ./heap.hprof
-   ```
-   Открой Eclipse Memory Analyzer (MAT). Dominator Tree → топ big retained objects. Path to GC Roots → почему не собирается.
-
-4. **JVM options проверить**:
-   ```bash
-   kubectl exec X -- jinfo -flags 1 | grep -E "MaxHeapSize|Xmx"
-   ```
-   Убедись `-Xmx` < container limit минимум на 512Mi (metaspace + direct + stacks).
-
-5. **Утекшие места**:
-   - Session-scoped bean с большим state?
-   - CacheManager без evict?
-   - Static Map с ростом?
-   - JDBC statements не закрываются?
-
-### 6.3 ImagePullBackOff
+### ImagePullBackOff
 
 ```
 Failed to pull image "registry.1sc.kz/isnaknpsync:abc": rpc error: 
-  code = Unknown desc = failed to pull and unpack image ...: 
+  code = Unknown desc = failed to pull and unpack image: 
   failed to resolve reference: not found
 ```
 
-Причины:
-- **Tag не существует** — сборка не прошла или деплой указал не тот tag.
-- **Нет доступа к registry** — imagePullSecret не настроен.
-- **Registry unreachable** — network policy блокирует, DNS не резолвит.
+Возможные причины:
 
-Проверка:
-```bash
-kubectl get pod X -o yaml | grep -A2 imagePullSecrets
-kubectl get secret <secret-name> -n knp -o yaml
-```
+- **Tag не существует в registry** — сборка не прошла или CI указал не тот tag. Проверить: `docker manifest inspect registry.1sc.kz/isnaknpsync:abc` (если есть доступ).
+- **Нет прав в registry** — imagePullSecret не настроен или невалидный. `kubectl get pod X -o yaml | grep -A2 imagePullSecrets` — есть ли секрет. `kubectl get secret <secret-name> -o yaml` — что внутри (обычно docker-config JSON).
+- **Registry unreachable** — network policy блокирует, DNS не резолвит, registry реально лежит.
 
-### 6.4 Deployment зависает (rollout не завершается)
+### Deployment rollout зависает
 
 ```bash
 kubectl rollout status deployment/X -n knp
 ```
 
-Ждёт, ждёт, timeout.
+Просто висит, ждёт. Через `--timeout=5m` вылетает с ошибкой.
+
+Что делать: посмотреть какие pod'ы образовались:
 
 ```bash
-kubectl rollout status deployment/X --timeout=5m
+kubectl get pods -n knp -l app=X --sort-by=.metadata.creationTimestamp
 ```
 
-Что делать:
-```bash
-kubectl get pods -n knp -l app=X
-```
-Смотри какие новые pod'ы Ready, какие нет. Если новые не Ready → они не проходят readiness. Смотри их логи, describe.
+Новые pod'ы (свежий hash в имени) внизу. Если они не Ready — они и являются причиной. Смотреть их `describe` и `logs`. Обычно причина — readiness fails по новой конфигурации, миссинг env, сломанная зависимость.
 
-Rollback:
+Если rollout зафейлился и надо срочно вернуть работу:
+
 ```bash
 kubectl rollout undo deployment/X -n knp
 ```
 
-### 6.5 Приложение отвечает медленно, 5xx растут
+Откатывает на предыдущую версию. Если хочешь на конкретную ревизию:
 
-1. **Метрики Prometheus/Grafana**:
-   - `rate(http_server_requests_seconds_count{status="5xx"}[5m])` — растёт где?
-   - `histogram_quantile(0.99, rate(http_server_requests_seconds_bucket[5m]))` — p99 latency.
-   - `jvm_memory_used_bytes / jvm_memory_max_bytes` — heap.
-   - `pg_stat_activity_count` — соединения к БД.
-
-2. **Логи по correlation_id**:
-   ```
-   {app="isnaknpuser"} |= "ERROR" | json | correlation_id=""
-   ```
-   Grafana Loki / Kibana.
-
-3. **Thread dump — узкое место в коде**:
-   ```bash
-   kubectl exec pod-x -- jstack 1 > threads.txt
-   ```
-   Или через jcmd:
-   ```bash
-   kubectl exec pod-x -- jcmd 1 Thread.print > threads.txt
-   ```
-   Читай: много ли threads на одной строке? Blocked на synchronized? Wait на HikariPool? На Rabbit? Fast Thread Analyzer поможет (fastthread.io).
-
-4. **DB slow queries**:
-   ```sql
-   -- В Postgres
-   SELECT pid, state, query, now() - query_start AS duration
-   FROM pg_stat_activity
-   WHERE state != 'idle' AND now() - query_start > interval '1 minute'
-   ORDER BY duration DESC;
-   ```
-
-### 6.6 Deploy job'а k8s зависает (Progressing timeout)
-
-Из моего опыта: sync deployment после MR:
-```
-error: deployment "isnaknpsync" exceeded its progress deadline
-```
-
-Означает `spec.progressDeadlineSeconds` истёк (по умолчанию 600s). Новый ReplicaSet не смог поднять replicas в Ready.
-
-Диагностика:
 ```bash
-kubectl describe deploy isnaknpsync -n knp
-kubectl get rs -n knp -l app=isnaknpsync  # старая и новая RS
-kubectl get pods -n knp -l app=isnaknpsync
+kubectl rollout history deployment/X -n knp
+kubectl rollout undo deployment/X --to-revision=3
 ```
 
-Новые pod'ы (свежий hash в имени) — почему не Ready? Смотри их логи.
+### Приложение отвечает медленно, 5xx растут
 
----
+Более сложный случай — pod'ы Running, ready, но качество работы деградировало. Работать нужно не только с kubectl, но с метриками, логами и внутренностями JVM.
 
-## 7. Thread dump: как читать
+Первое — метрики Prometheus/Grafana. Стандартный набор для JVM+Spring Boot:
+
+- `rate(http_server_requests_seconds_count{status=~"5..",app="X"}[5m])` — темп 5xx. Где именно растёт (какой endpoint).
+- `histogram_quantile(0.99, sum(rate(http_server_requests_seconds_bucket[5m])) by (le))` — p99 latency.
+- `jvm_memory_used_bytes / jvm_memory_max_bytes` по регионам — heap growth.
+- `hikaricp_connections_active`, `hikaricp_connections_pending` — пул к БД (см. файл 107).
+- `process_cpu_usage` — реальный CPU utilization JVM.
+
+Второе — логи по correlation_id, если проблема с конкретными запросами:
+
+```
+{app="isnaknpuser"} |= "ERROR" | json | correlation_id="..."
+```
+
+Grafana Loki / Kibana. Correlation ID должен пробрасываться через MDC в SLF4J — это стандартная практика для микросервисов.
+
+Третье — thread dump, если приложение висит или тормозит:
 
 ```bash
 kubectl exec pod-x -- jcmd 1 Thread.print > threads.txt
 ```
 
-Формат:
+Читать (подробнее ниже): много ли тредов на одной строке, blocked на synchronized, wait на HikariPool, wait на socket read. Загрузить в fastthread.io — визуализация групп тредов по состоянию/стеку.
+
+Четвёртое — БД, если по метрикам HikariCP пул проседает:
+
+```sql
+SELECT pid, state, wait_event_type, wait_event, 
+       now() - query_start AS duration, query
+FROM pg_stat_activity
+WHERE state != 'idle' AND now() - query_start > interval '1 minute'
+ORDER BY duration DESC;
+```
+
+Длинные активные запросы, ожидания блокировок (`wait_event_type = 'Lock'`), диск (`DataFileRead`), клиент (`ClientRead` — приложение держит транзакцию открытой без активности).
+
+## Thread dump: как читать
+
+Thread dump в JVM снимается за миллисекунды и не аффектит приложение. Может быть жизненно важен для расследования зависших/медленных ситуаций.
+
+Снятие:
+
+```bash
+kubectl exec pod-x -- jcmd 1 Thread.print > threads.txt
+```
+
+Альтернатива — `jstack 1` (простая версия) или через Actuator: `curl localhost:8080/actuator/threaddump`.
+
+Формат для каждого треда:
+
 ```
 "http-nio-8080-exec-42" #123 daemon prio=5 os_prio=0 tid=0x... nid=0x... waiting for monitor entry
    java.lang.Thread.State: BLOCKED (on object monitor)
-    at kz.example.Service.doWork(Service.java:42)
-    - waiting to lock <0x00000007f8a0cd28> (a java.lang.Object)
-    at kz.example.Controller.endpoint(Controller.java:15)
-    ...
-
-"http-nio-8080-exec-43" #124 daemon prio=5 os_prio=0 tid=0x... nid=0x... runnable
-   java.lang.Thread.State: RUNNABLE
-    at kz.example.Service.compute(Service.java:88)
-    ...
+	at kz.example.Service.doWork(Service.java:42)
+	- waiting to lock <0x00000007f8a0cd28> (a java.lang.Object)
+	at kz.example.Controller.endpoint(Controller.java:15)
 ```
 
-### Ключевые состояния:
+Ключевые состояния:
 
-- **RUNNABLE** — работает или в native (не всегда on-CPU).
-- **BLOCKED** — ждёт monitor lock, кто-то другой в synchronized блоке.
-- **WAITING / TIMED_WAITING** — ждёт условие (`Object.wait()`, `Thread.sleep()`, `LockSupport.park()`).
+- **RUNNABLE** — тред выполняется или готов выполняться. Может быть в userspace или в native syscall (blocking I/O). Топ фрейма покажет что делает — если `SocketDispatcher.read0` — ждёт сеть (не CPU!).
+- **BLOCKED (on object monitor)** — тред ждёт `synchronized` монитор, кто-то другой держит.
+- **WAITING** и **TIMED_WAITING** — ждёт условие (`Object.wait()`, `Thread.sleep()`, `LockSupport.park()`). У park будет фрейм `jdk.internal.misc.Unsafe.park`.
 
-### Что искать:
+Что искать:
 
-**1) Много threads в BLOCKED на одном lock**:
+**Много тредов BLOCKED на одном lock**. Ищи одинаковый идентификатор `<0x...>` в разных тредах:
+
 ```
 "exec-42" BLOCKED
   - waiting to lock <0x00000007f8a0cd28>
@@ -373,239 +343,307 @@ kubectl exec pod-x -- jcmd 1 Thread.print > threads.txt
   - locked <0x00000007f8a0cd28>
     at kz.example.LegacyService.slowMethod(LegacyService.java:100)
 ```
-Причина: `synchronized` bottleneck. `exec-50` держит monitor, все ждут его.
 
-**2) Тред застрял на HikariPool**:
+Причина: `synchronized` бутылочное горлышко. `exec-50` держит монитор внутри slowMethod, остальные ждут. Fix — либо переписать без глобального synchronized (использовать ConcurrentHashMap вместо HashMap+synchronized, ReentrantLock с fine-grained locking), либо ускорить slowMethod.
+
+**Тред застрял в HikariPool.getConnection**:
+
 ```
 "exec-42" TIMED_WAITING
   at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:80)
 ```
-Пул connection'ов исчерпан. Увеличь `spring.datasource.hikari.maximum-pool-size` или ищи транзакции которые долго не закрываются.
 
-**3) Тред в Feign/RestTemplate call, waiting on socket**:
+Пул исчерпан (см. файл 107). Либо реально мал, либо кто-то держит connection долго (транзакция с HTTP-вызовом внутри, забытый rollback).
+
+**Тред в HTTP-клиенте, ожидает socket read**:
+
 ```
 "exec-42" RUNNABLE
-  at java.net.SocketInputStream.socketRead0
+  at sun.nio.ch.SocketDispatcher.read0(Native Method)
   ...
-  at RestTemplate.execute...
+  at org.apache.http.impl.io.SessionInputBufferImpl.streamRead(...)
+  at ...
+  at org.springframework.web.client.RestTemplate.doExecute(...)
 ```
-Remote-сервис отвечает медленно. Смотри timeout настройки.
 
-**4) Rabbit consumer в receive**:
+Внешний сервис отвечает медленно. Проверять timeout настройки клиента (по умолчанию у RestTemplate без явных настроек — бесконечные timeouts, что плохо). Смотреть кому идёт вызов, реально ли тот сервис задыхается.
+
+**Rabbit consumer в receive**:
+
 ```
 "rabbit-consumer" WAITING (parking)
   at com.rabbitmq.client.impl.recovery.RecoveryAwareChannelN.basicGet
 ```
-Норм состояние, ждёт сообщения.
 
-### Инструменты:
+Норма. Тред-consumer припарковался в ожидании нового сообщения. Не путать с проблемой.
 
-- **fastthread.io** — залей dump, красивая визуализация групп потоков.
-- **VisualVM** — offline анализ (Load → Thread dump).
-- **jstack** — простая версия jcmd.
+**Много тредов в pool executor**:
 
----
+```
+"pool-2-thread-15" WAITING (parking)
+  at java.util.concurrent.locks.LockSupport.park
+  at java.util.concurrent.LinkedBlockingQueue.take
+  at java.util.concurrent.ThreadPoolExecutor.getTask
+```
 
-## 8. Postgres — pg_stat_activity, locks, slow queries
+Норма. ThreadPoolExecutor держит idle тредов, они парятся на take() из queue пока не появится задача.
 
-БД часто узкое место. Инструменты Postgres:
+Инструменты для читабельности:
 
-### 8.1 Кто сейчас что-то делает
+- **fastthread.io** — загружаешь dump, получаешь визуализацию: группировка по типу состояния, топ blocked locks, deadlocks. Бесплатно, часто хватает.
+- **VisualVM** — offline анализ (File → Load → выбрать dump). Хорош для глубокого копания.
+- **jstack** — простая CLI-версия, работает как `jcmd Thread.print`.
+
+## PostgreSQL: pg_stat_activity, locks, slow queries
+
+БД часто оказывается узким местом. Основные представления Postgres:
+
+**pg_stat_activity** — что происходит прямо сейчас:
 
 ```sql
-SELECT pid, usename, application_name, state,
-       now() - query_start AS duration,
-       query
+SELECT pid, usename, application_name, state, wait_event_type, wait_event,
+       now() - xact_start AS xact_age,
+       now() - query_start AS query_age,
+       left(query, 100) AS q
 FROM pg_stat_activity
 WHERE state != 'idle'
-ORDER BY duration DESC
-LIMIT 20;
+ORDER BY xact_start;
 ```
 
-### 8.2 Locks
+Ключевые сигналы (см. также файл 88):
+
+- `state = 'active'` + большой `query_age` — долгий запрос идёт.
+- `state = 'idle in transaction'` + большой `xact_age` — приложение начало транзакцию и не закрывает. Локи держатся, connection pool забивается.
+- `wait_event_type = 'Lock'` — ждёт блокировку. Кого — смотреть через `pg_blocking_pids`.
+- `wait_event_type = 'IO', wait_event = 'DataFileRead'` — читает с диска. Диск задыхается или запрос читает много.
+- `wait_event = 'ClientRead'` — база ждёт следующей команды от приложения. Признак что приложение занимается чем-то вне БД под транзакцией.
+
+**Кто кого блокирует**:
 
 ```sql
-SELECT blocked_locks.pid AS blocked_pid,
-       blocked_activity.usename AS blocked_user,
-       blocking_locks.pid AS blocking_pid,
-       blocking_activity.usename AS blocking_user,
-       blocked_activity.query AS blocked_query,
-       blocking_activity.query AS blocking_query
-FROM pg_locks blocked_locks
-JOIN pg_stat_activity blocked_activity ON blocked_locks.pid = blocked_activity.pid
-JOIN pg_locks blocking_locks ON blocking_locks.locktype = blocked_locks.locktype
-    AND blocking_locks.relation = blocked_locks.relation
-    AND blocking_locks.pid != blocked_locks.pid
-JOIN pg_stat_activity blocking_activity ON blocking_locks.pid = blocking_activity.pid
-WHERE NOT blocked_locks.granted;
+SELECT blocked.pid AS blocked_pid,
+       blocking.pid AS blocking_pid,
+       blocked.query AS blocked_query,
+       blocking.query AS blocking_query
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking 
+    ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+WHERE blocked.wait_event_type = 'Lock';
 ```
 
-Показывает "кто кого блокирует".
+`pg_blocking_pids(pid)` возвращает массив PID'ов, блокирующих данную сессию. Классическая цепочка расследования: находишь длинную транзакцию, идёшь по её `pg_blocking_pids` в глубину — обычно на дне цепочки одна старая транзакция, которую все ждут.
 
-### 8.3 Idle in transaction
-
-Классика прод-проблем — тред начал транзакцию и **не закрыл**. Держит locks, connection pool забивается.
+**Idle in transaction** — отдельный подход:
 
 ```sql
-SELECT pid, state, now() - state_change AS idle_duration, query
+SELECT pid, state, now() - state_change AS idle_duration, 
+       left(query, 100) AS last_query
 FROM pg_stat_activity
 WHERE state = 'idle in transaction'
 ORDER BY idle_duration DESC;
 ```
 
-Kill sesscsию:
+Убить конкретную сессию:
+
 ```sql
 SELECT pg_terminate_backend(pid);
 ```
 
-Причина в коде: `@Transactional` метод бросает exception → транзакция rollback. Но если проглотить exception и продолжать — HikariCP не возвращает connection в пул.
+Причина в коде обычно одна из двух: транзакционный метод не завершается (HTTP-вызов внутри @Transactional, ждущий 30 сек), либо exception в @Transactional был проглочен и rollback не сделан. Долгосрочное решение — `idle_in_transaction_session_timeout = 60s` в PostgreSQL, чтобы такие транзакции убивались автоматически.
 
-### 8.4 Медленные запросы
+**Медленные запросы через pg_stat_statements**:
 
-Включи `pg_stat_statements`:
 ```sql
-CREATE EXTENSION pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
-SELECT query, calls, total_time, mean_time, rows
+SELECT calls, mean_exec_time, total_exec_time, rows,
+       left(query, 200) AS q
 FROM pg_stat_statements
-ORDER BY mean_time DESC
+ORDER BY total_exec_time DESC
 LIMIT 20;
 ```
 
-Топ по времени.
+Топ запросов по суммарному времени — обычно оптимизация одного из них даёт больший эффект чем оптимизация десятка редких. Дальше — `EXPLAIN ANALYZE` каждого, добавление индексов (см. файл 88).
 
----
+## Actuator endpoints: живая диагностика Spring Boot
 
-## 9. Actuator endpoints для диагностики
-
-Boot Actuator в живом pod'е — быстрые ответы:
+Boot Actuator даёт HTTP-эндпоинты в живом pod'е. Часто быстрее чем ходить в JVM через jcmd. Port-forward:
 
 ```bash
 kubectl port-forward pod/isnaknpuser-xyz -n knp 8081:8080
 # в другом терминале
 curl localhost:8081/actuator/health
-curl localhost:8081/actuator/metrics
-curl localhost:8081/actuator/prometheus
-curl localhost:8081/actuator/env
 curl localhost:8081/actuator/threaddump
 curl localhost:8081/actuator/heapdump > heap.hprof
 ```
 
-**`/actuator/health`** — общий статус (UP/DOWN) и детали компонентов (db, disk, redis).
+**`/actuator/health`** — общий статус (UP/DOWN) и детали компонентов (db, disk, redis, rabbit). Ключ к пониманию почему readiness падает.
 
-**`/actuator/threaddump`** — то же самое что jstack, но через HTTP.
+**`/actuator/health/liveness`** и **`/actuator/health/readiness`** — то, что бьёт kubelet.
 
-**`/actuator/heapdump`** — heap dump в hprof формате. Открывать в MAT.
+**`/actuator/threaddump`** — то же что jstack, но через HTTP. Формат JSON, можно парсить программно.
 
-**`/actuator/env`** — все прописанные env, propertysources, effective values. Огромный вывод, ищи gruop-by:
-```
+**`/actuator/heapdump`** — heap dump в hprof, скачивается сразу. Открывать в MAT.
+
+**`/actuator/env`** — все прописанные env, propertysources, effective values. Огромный вывод (десятки KB), но можно фильтровать:
+
+```bash
 curl localhost:8081/actuator/env/spring.datasource.url
 ```
 
-**`/actuator/loggers`** — можно **на живую** менять log level:
-```
+Возвращает конкретный ключ с указанием какой PropertySource его дал (application.yml, environment, command line). Полезно когда «почему у меня в приложении не тот URL к БД» — сразу видно кто перебивает.
+
+**`/actuator/loggers`** — можно менять log level **на живую**, без рестарта:
+
+```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{"configuredLevel":"DEBUG"}' \
   localhost:8081/actuator/loggers/kz.example.MyService
 ```
 
-Не надо рестартить pod чтобы включить DEBUG. Не забудь обратно на INFO.
+Проблема воспроизводится редко, нужны debug-логи — включил на конкретный package, воспроизвёл, выключил обратно. Огромная экономия времени по сравнению с rebuild + redeploy ради DEBUG-логов.
 
-Важно: `/actuator` endpoints обычно НЕ выставляются наружу через Ingress. Только localhost port-forward или отдельный internal service.
+Важное правило безопасности: `/actuator` эндпоинты **не выставляются наружу через Ingress**. Только localhost port-forward или отдельный internal service с NetworkPolicy. `/actuator/env` содержит секреты, `/actuator/heapdump` — все данные памяти. Выставлять наружу — прямой путь к утечке всех секретов приложения.
 
----
+## Реальный инцидент: реконструкция
 
-## 10. Пример реального инцидента (реконструкция из КНП)
+**Alert**: `deployment/isnaknpsync exceeded progress deadline`. Deploy зависает уже 40 минут после MR.
 
-**Alert**: `deployment/isnaknpsync exceeded progress deadline`.
+**Шаг 1**: 
 
-**Шаг 1**: `kubectl get pods -n knp | grep sync`
+```bash
+kubectl get pods -n knp | grep sync
+```
+
 ```
 isnaknpsync-cc5bd64d5-ds5km   1/1  Running            0    46h
 isnaknpsync-5d9f56c665-n2sbf  0/1  CrashLoopBackOff   75   6h
 ```
-Старый pod живой, новый не поднимается.
 
-**Шаг 2**: `kubectl describe pod isnaknpsync-5d9f56c665-n2sbf -n knp`
+Старый pod живой (46 часов), новый не поднимается (75 рестартов за 6 часов). Классический rollout stuck.
+
+**Шаг 2**: 
+
+```bash
+kubectl describe pod isnaknpsync-5d9f56c665-n2sbf -n knp
 ```
+
 Events:
-  Pulling ... image "registry.1sc.kz/isnaknpsync:ac01514b"
-  Back-off restarting failed container
 ```
-Образ скачан ok, контейнер стартует и падает.
+Pulling ... image "registry.1sc.kz/isnaknpsync:ac01514b"
+Pulled ... image
+Created container
+Started container
+Back-off restarting failed container
+```
 
-**Шаг 3**: `kubectl logs isnaknpsync-5d9f56c665-n2sbf --previous --tail=200`
+Образ скачан ок, контейнер стартовал и упал. Не image issue, не resource issue. Application-level падение.
+
+**Шаг 3**: 
+
+```bash
+kubectl logs isnaknpsync-5d9f56c665-n2sbf -n knp --previous --tail=200
+```
+
 ```
 ERROR SpringApplication : Application run failed
 Caused by: IllegalStateException: 
   phys_person_capacity_status_history_hash backfill enabled without ENCRYPTION_BLIND_INDEX_KEY
 ```
-Причина найдена: env var не задана в Secret.
 
-**Шаг 4**: `kubectl get secret isna-secret -n knp -o yaml | grep ENCRYPTION`
+Причина найдена: env variable не задана. В коде — новая функциональность, требующая ключа шифрования, которого нет в проде.
+
+**Шаг 4**: подтвердить в Secret:
+
+```bash
+kubectl get secret isna-secret -n knp -o yaml | grep -i ENCRYPTION
+```
+
 Ключа нет.
 
-**Действие**: DevOps добавляет ключ в Secret, restart pod. Deploy проходит.
+**Действие**: DevOps добавляет `ENCRYPTION_BLIND_INDEX_KEY` в Secret, `kubectl rollout restart deployment/isnaknpsync -n knp`. Через минуту новый pod Ready.
 
-Итог: диагностика заняла 5 минут. Без workflow — часы.
+Итог: диагностика 5 минут. Ключевой момент — `--previous` в logs, без него ничего бы не увидели, потому что контейнер уже упал к моменту команды.
 
----
-
-## 11. Пре-написанные bash scripts, которые полезно иметь
+## Полезные bash-обёртки
 
 **`k8s-diag.sh` — быстрый обзор одного pod'а**:
+
 ```bash
 #!/bin/bash
 POD=$1
 NS=${2:-knp}
-echo "=== DESCRIBE ==="
+echo "=== DESCRIBE (tail) ==="
 kubectl describe pod $POD -n $NS | tail -60
 echo "=== LOGS (previous) ==="
 kubectl logs $POD -n $NS --previous --tail=100 2>/dev/null || echo "no previous"
 echo "=== LOGS (current) ==="
 kubectl logs $POD -n $NS --tail=50
-echo "=== EVENTS ==="
-kubectl get events -n $NS --sort-by='.lastTimestamp' --field-selector involvedObject.name=$POD | tail -10
+echo "=== POD EVENTS ==="
+kubectl get events -n $NS --sort-by='.lastTimestamp' \
+  --field-selector involvedObject.name=$POD | tail -10
 ```
 
-**`k8s-top.sh` — top pod'ов по CPU/memory**:
-```bash
-kubectl top pods -n knp --sort-by=memory | head -20
-```
+Одна команда — всё что нужно для первого взгляда.
 
-**Alias'ы**:
+**Полезные alias'ы в `.bashrc`/`.zshrc`**:
+
 ```bash
 alias k=kubectl
 alias kdp='kubectl describe pod'
 alias kgpo='kubectl get pods -o wide'
 alias klf='kubectl logs -f'
 alias klp='kubectl logs --previous --tail=200'
+alias ktp='kubectl top pods --sort-by=memory'
 ```
 
----
+Секунды экономятся, а на инциденте секунды складываются в минуты.
 
-## 12. Что не делать в проде
+## Чего не делать в проде
 
-- **`kubectl edit` для быстрого fix'а конфигурации**. Изменения потеряются при следующем deploy. Меняй в Helm/Kustomize/gitops.
-- **`kubectl delete pod X --force --grace-period=0`** без понимания последствий. Force delete не даёт shutdown, может остаться повреждённое состояние на диске (для БД — жирный минус).
-- **`kubectl scale` для quick fix**. Так же не в git → откат при следующем deploy.
-- **Локально работающий `kubectl exec ... -- rm -rf ...`** — я видел как убирали "лишние" файлы у Postgres.
-- **`kubectl cp` больших файлов** — забьёт network, timeout. Для heap dumps — маленькие или через objectstorage.
+**`kubectl edit` для быстрого fix'а конфигурации.** Изменения теряются при следующем deploy из CI. Правильно — менять в Helm/Kustomize/GitOps, катать через pipeline. Единственное исключение — экстренный workaround, но с обязательным follow-up тикетом «зафиксировать в git».
 
----
+**`kubectl delete pod X --force --grace-period=0`** без понимания последствий. Force delete не даёт SIGTERM и graceful period, kubelet просто убивает и удаляет запись из API. Для БД или stateful сервиса — риск повреждения данных. Для application pod'а — потеря in-flight requests. Использовать только когда pod застрял в Terminating часами (обычно finalizer issue) и осознанно.
 
-## 13. Кратко: чек-лист расследования
+**`kubectl scale`** для quick fix. Так же не в git, откатится при следующем deploy. Правильно — менять в манифесте, катать через CI. Если срочно надо больше реплик — сначала `kubectl scale`, потом сразу коммит в git.
 
-Любой прод-алерт:
-1. `kubectl get pods` → есть ли новые pod'ы, какой статус.
-2. `kubectl describe pod` → Events, Last State, Reason.
-3. `kubectl logs --previous` → фактическая ошибка.
-4. `kubectl get events` → контекст кластера.
-5. **Метрики** (Grafana): нагрузка, memory, CPU trend.
-6. **Логи по correlation_id** — если функциональная проблема.
-7. **Thread dump** — если приложение висит.
-8. **Postgres pg_stat_activity** — если БД узкое место.
-9. **Actuator /env** — проверить пропущенные env.
-10. Fix → deploy → мониторь метрики.
+**Локально работающий `kubectl exec ... -- rm -rf ...`**. Классика падений: удалили «лишние» файлы у Postgres pod'а и получили corrupted database. Любые изменения в pod через exec — временные и опасные.
 
-Держи это чек-листом рядом. Первые 5 минут инцидента — самое дорогое время, привычка выработать заранее.
+**`kubectl cp` больших файлов** (десятки MB и больше). Может забить network, timeout, оставить частично скопированные файлы. Для heap dumps лучше сначала архивировать (`gzip`) внутри pod'а, потом cp, или использовать S3/MinIO как intermediate storage.
+
+**Апгрейд production namespace без backup.** Даже helm upgrade может неожиданно снести PVC при нестандартных манифестах. Правило — перед любым upgrade production снять backup БД и убедиться что PV/PVC не удалятся.
+
+**Изменения через `kubectl patch` без записи в git.** То же правило — теряется при deploy.
+
+## Чек-лист расследования
+
+Стандартный алгоритм для любого прод-алерта:
+
+1. `kubectl get pods` — состояние pod'ов, кто не Ready.
+2. `kubectl describe pod` — Events, Last State, Reason, Conditions.
+3. `kubectl logs --previous` — фактическая ошибка приложения.
+4. `kubectl get events` — контекст namespace.
+5. Метрики (Grafana) — тренды нагрузки, memory, CPU, latency за последние часы.
+6. Логи по correlation_id — если проблема функциональная.
+7. Thread dump — если приложение висит.
+8. `pg_stat_activity` — если БД узкое место (см. также файлы 88, 107).
+9. Actuator `/env`, `/health` — проверка конфигурации в живую.
+10. Fix → deploy → мониторить метрики после.
+
+Первые 5 минут инцидента — самое дорогое время. Держать этот чек-лист под рукой и тренироваться на не-инцидентах, чтобы в стрессовой ситуации руки шли по алгоритму автоматически.
+
+## Заключение
+
+Прод-диагностика — это набор навыков, а не одна волшебная команда. `kubectl get pods` даёт первый взгляд, `describe` — 90% ответов, `logs --previous` — фактическая причина падения в crash-loop. Events показывают контекст выше pod'а: scheduling, storage, network. Exit codes несут смысл (137 = OOMKilled/SIGKILL, 143 = SIGTERM/graceful, 1 = application error).
+
+Типовые сценарии знакомы: CrashLoopBackOff с exit=1 идёт в logs; OOMKilled — в top + heap dump + анализ Xmx vs limits; ImagePullBackOff — в registry/secrets; deployment stuck — в pod'ы новой ReplicaSet, почему не Ready.
+
+Thread dump снимается за миллисекунды и открывает внутренности JVM: BLOCKED на synchronized (bottleneck), WAITING в getConnection (пул исчерпан), RUNNABLE в SocketDispatcher.read0 (ждёт сеть, не CPU). fastthread.io ускоряет визуальный анализ.
+
+PostgreSQL диагностируется через `pg_stat_activity` + `pg_blocking_pids`: находятся долгие запросы, ожидания блокировок, `idle in transaction`, `wait_event` для понимания природы (диск, сеть, лок). Медленные запросы через `pg_stat_statements`, дальше — `EXPLAIN ANALYZE` и индексы (файл 88).
+
+Actuator в живом pod'е даёт `/health` для причины readiness fail, `/env` для проверки конфигурации, `/loggers` для включения DEBUG без рестарта, `/threaddump` и `/heapdump` через HTTP. Не выставлять наружу — секреты и полная память в открытом доступе.
+
+Не делать в проде: `kubectl edit`/`scale` без git, `--force --grace-period=0` для БД, `kubectl exec ... -- rm -rf`, `kubectl cp` мегабайтами. Все изменения через CI/GitOps, экстренные обходы — с follow-up на записать в git.
+
+Первые 5 минут инцидента — самые дорогие. Алгоритм из 10 шагов, наработанный на нескольких десятках инцидентов, превращает панику в методичную работу и сокращает MTTR в разы.

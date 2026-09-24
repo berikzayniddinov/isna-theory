@@ -1,218 +1,50 @@
-# 77. Kubernetes deep: workloads, network, disruption, graceful shutdown
+# 77. Kubernetes для микросервисов: workloads, network, disruption, graceful shutdown
 
-Продвинутые k8s-концепции которые нужно знать когда у тебя больше пары микросервисов. StatefulSet vs Deployment, Ingress, NetworkPolicy, PDB, PodPriority, graceful shutdown в Boot, init/sidecar containers.
+## Зачем это знать
 
-Базовые концепции (Pod, Deployment, Service) — в `10-kubernetes-detailed.md`.
+Kubernetes для одного сервиса — это `kubectl apply -f deployment.yaml` и всё. Kubernetes для десяти микросервисов — это уже вопрос: как их правильно раскладывать по типам workload'ов, как контролировать сетевые связи, как переживать node drain без даунтайма, как правильно останавливаться, как раздавать приоритеты когда кластер тесно. Ответы на эти вопросы формируют разницу между «прод пятилетней давности» (руками кубик подпираем) и «прод который перезапускается сам и о котором не думаешь ночью».
 
----
+Базовые концепции (Pod, Deployment, Service) — в `10-kubernetes-detailed.md`. Здесь — продвинутый пласт, который начинает быть нужен когда сервисов больше пары и SRE-практики становятся обязательными.
 
-## 1. Workloads: Deployment vs StatefulSet vs DaemonSet vs Job
+Разберём workloads: почему `Deployment` не подходит базе, зачем `StatefulSet` даёт стабильные имена, чем отличается `DaemonSet` и когда нужен `Job` — со сценариями где выбор неправильного типа стоит инцидента. Пройдёмся по storage: PV, PVC, StorageClass, access modes, reclaim policy — с историей как `reclaimPolicy: Delete` на базе стоил компаниям данных. Сеть: Service, Ingress, NetworkPolicy — как ограничивать pod-to-pod трафик так, чтобы взлом одного сервиса не превращался во взлом всего кластера. PodDisruptionBudget и Priority — про переживание обслуживания нод и приоритезацию при перегрузке. QoS classes — почему `requests == limits` для критичных сервисов. Graceful shutdown — где именно race condition, как правильно ставить preStop, как согласовывать `terminationGracePeriodSeconds` с Spring Boot `shutdown-timeout`. Probes: разница liveness / readiness / startup, типичный анти-паттерн когда liveness тянет за собой каскадный отказ. И полный шаблон deployment'а, собирающий всё.
 
-### 1.1 Deployment (стандартное)
+## Workloads: почему тип имеет значение
 
-- Реплики **взаимозаменяемые**. `pod-a-xyz`, `pod-a-abc` — одинаковые, случайный IP, случайное имя.
-- Работает для 90% микросервисов: stateless HTTP-сервис, обрабатывает запрос и забыл.
-- Rolling update: убивает старые поды, поднимает новые, по одному.
+Kubernetes даёт четыре основных типа workload'ов, каждый под свой класс приложений. Ошибка на этом уровне не всегда сразу бьёт по проду, но становится больной когда доходит до масштабирования или инцидента.
 
-### 1.2 StatefulSet
+**Deployment** — про stateless. Реплики полностью взаимозаменяемы: `pod-a-xyz`, `pod-a-abc`, IP меняются, имена — хеши. Rolling update убивает старые поды и поднимает новые в любом порядке, потому что «первый» и «второй» ничем не отличаются. Работает для 90% микросервисов: обработал HTTP-запрос, забыл всё, следующий может уйти в другой pod. Никаких persistent данных на самом pod'е — всё что нужно, хранится в базе или объектном хранилище снаружи.
 
-Когда **порядок и идентичность** важны. Примеры: Postgres, Kafka, Elasticsearch, Redis Cluster, Zookeeper — всё что имеет **shared state** между репликами.
+**StatefulSet** — когда identity и порядок важны. Классические примеры: PostgreSQL, Kafka, Elasticsearch, Redis Cluster, Zookeeper. Не потому что «это базы», а потому что реплики этих систем **не взаимозаменяемы** — они делят состояние, у каждой своя роль (лидер/реплика), у каждой свой отдельный кусок данных. StatefulSet даёт стабильные имена (`postgres-0`, `postgres-1`, `postgres-2`), упорядоченный старт (postgres-1 не запустится пока postgres-0 не Ready) и упорядоченный shutdown (в обратном порядке). Каждый pod получает свой персональный PVC через `volumeClaimTemplates` — при удалении pod'а том остаётся, при пересоздании pod'а с тем же именем прицепится тот же том. Плюс headless Service даёт DNS до конкретного pod'а: `postgres-0.postgres.default.svc.cluster.local`.
 
-Что даёт:
-- **Stable pod names**: `postgres-0`, `postgres-1`, `postgres-2` (не хеши).
-- **Ordered startup/shutdown**: `postgres-1` не стартует пока `postgres-0` не Ready. При shutdown — в обратном порядке.
-- **Persistent volume per pod**: каждый pod получает СВОЙ PVC (не shared). Даже после удаления pod'а — том остаётся, привяжется к новому pod'у с тем же именем.
-- **Headless Service**: `postgres-0.postgres.default.svc.cluster.local` — прямой DNS до конкретного pod'а.
+Что критично понимать: **StatefulSet ≠ автоматическая кластеризация**. Ты получаешь только стабильную идентичность и приватные тома. Streaming replication в PostgreSQL, broker discovery в Kafka, cluster.conf в Redis — это всё ты сам настраиваешь в приложении/конфигурации. StatefulSet — это лишь фундамент, поверх которого твоё приложение может опираться на факт «я знаю кто я, у меня стабильное имя, мой диск не убежит».
 
-Пример:
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: postgres
-spec:
-  serviceName: postgres
-  replicas: 3
-  selector:
-    matchLabels: {app: postgres}
-  template:
-    metadata:
-      labels: {app: postgres}
-    spec:
-      containers:
-      - name: postgres
-        image: postgres:17
-        volumeMounts:
-        - name: data
-          mountPath: /var/lib/postgresql/data
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: [ReadWriteOnce]
-      resources:
-        requests:
-          storage: 100Gi
-      storageClassName: fast-ssd
-```
+**DaemonSet** — по одному pod'у на каждой ноде. Инфраструктурная штука: Fluent Bit собирает логи со всех нод, node-exporter снимает метрики железа, kube-proxy и CNI-плагин обеспечивают сеть. Когда добавляется новая нода — DaemonSet автоматически шедулит на неё pod. Это единственный корректный способ развернуть «агента на каждой ноде», потому что Deployment не знает про топологию, а вручную считать реплики под каждый scale-up кластера — путь в никуда.
 
-Каждый pod получит свой PVC `data-postgres-0`, `data-postgres-1`, `data-postgres-2`. При delete pod'а PVC остаётся, при пересоздании тот же PVC монтируется.
+**Job и CronJob** — для одноразовых или расписанных задач. Job запускает pod, ждёт `exit 0`, считает готово. Классика: миграции Liquibase/Flyway перед деплоем, backfill данных, ротация ключей. CronJob — тот же Job, но по крону. Важная деталь: Job без `restartPolicy: OnFailure` не будет перезапускать pod при падении, а `backoffLimit` (по умолчанию 6) ограничивает попытки. `activeDeadlineSeconds` защищает от зависших Job'ов, которые могут крутиться днями.
 
-Важно: StatefulSet ≠ auto-clustering. Ты только получаешь стабильную идентичность. Кластеризация (Postgres streaming replication, Kafka broker discovery) — надо настраивать в приложении.
+Типовая ошибка: разворачивать миграции как `initContainer` в основном Deployment'е. При replicas > 1 все поды параллельно попытаются применить миграции — Liquibase возьмёт advisory lock, но остальные всё равно будут ждать, старт растянется. Правильно — вынести миграции в отдельный Job, а Deployment запускать после успешного завершения (через Argo Workflows, Helm hooks или CI-пайплайн).
 
-### 1.3 DaemonSet
+## Storage: PV, PVC, StorageClass и цена ошибки
 
-**По одному pod'у на каждой ноде** кластера. Используется для инфраструктурных нужд:
-- Fluent Bit (сборка логов).
-- Node Exporter (метрики ноды в Prometheus).
-- kube-proxy, CNI plugin.
+Kubernetes абстрагирует диски через три слоя. **PersistentVolume (PV)** — реальный кусок диска: EBS-том в AWS, disk в Azure/GCP, локальный SSD ноды, NFS-шара. Живёт вне pod'а, ресурс кластерного уровня. **PersistentVolumeClaim (PVC)** — запрос от pod'а: «мне 100Gi, RWO, класс fast-ssd». Kubernetes находит подходящий PV и связывает. **StorageClass** — шаблон для динамического provisioning: не заранее выделенный PV, а параметры «как создать» — тип диска в облаке, репликация, шифрование. При создании PVC под StorageClass кластер сам провизионит PV нужного размера.
 
-При добавлении новой ноды k8s автоматически шедулит на неё pod из DaemonSet.
+Access modes определяют, кто может писать. **ReadWriteOnce (RWO)** — один pod на конкретной ноде. Это тот случай, когда AWS EBS или Azure Disk может быть примонтирован только к одному инстансу. Стандарт для баз. **ReadOnlyMany (ROX)** — много pod'ов могут читать. Редкий кейс, например shared reference data. **ReadWriteMany (RWX)** — много pod'ов пишут и читают. Требует shared filesystem: NFS, CephFS, EFS. Медленно, дорого, эксплуатационно сложно. Обычно если хочется RWX — надо задать вопрос «а точно нельзя переложить на объектное хранилище S3/MinIO?».
 
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: fluent-bit
-spec:
-  selector:
-    matchLabels: {app: fluent-bit}
-  template:
-    metadata:
-      labels: {app: fluent-bit}
-    spec:
-      containers:
-      - name: fluent-bit
-        image: fluent/fluent-bit:2.2
-        volumeMounts:
-        - name: varlog
-          mountPath: /var/log
-      volumes:
-      - name: varlog
-        hostPath:
-          path: /var/log
-```
+Reclaim policy определяет что случится с реальным диском при удалении PVC. **Retain** — PV и диск остаются, надо чистить руками. Для важных данных. **Delete** — PV и реальный диск исчезают. Для эфемерных.
 
-### 1.4 Job / CronJob
+И вот здесь — классика продовой катастрофы. Разработчик написал Helm chart для PostgreSQL, поставил StorageClass с `reclaimPolicy: Delete` (потому что дефолт AWS — Delete). Год работы, база наполнилась. Кто-то делает `helm uninstall` (например, чтобы переустановить с новой конфигурацией). Helm сносит все ресурсы, включая PVC. Kubernetes видит `reclaimPolicy: Delete` и удаляет и PV, и реальный EBS-том. Данные ушли. Backup был вчера, потерян день.
 
-**Job** — одноразовая задача. Запусти pod, дождись exit 0, удали.
-- Миграция БД (Liquibase, Flyway).
-- Backfill данных.
+Правило: **для любых persistent данных — `reclaimPolicy: Retain`**. Всегда. Даже если это стейджинг — привычка одна. Восстановление тома при неправильной policy — не всегда возможно даже через AWS support.
 
-**CronJob** — Job по расписанию.
-- Ротация ключей.
-- Ежедневный отчёт.
+Помимо PV есть тома, не требующие persistent хранения. `emptyDir` — временный диск на ноде, живёт пока pod живёт, используется для scratch и кэшей. `hostPath` — том прямо с файловой системы ноды (`/var/log`, `/var/run/docker.sock`). Опасен: pod получает доступ к хосту, риск escape'а. Использовать только в infra DaemonSet'ах. `configMap` и `secret` монтируются как файлы с содержимым из соответствующего объекта Kubernetes — конфиги и секреты приложение читает как обычные файлы, без специального SDK.
 
-```yaml
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: cleanup-old-logs
-spec:
-  schedule: "0 2 * * *"
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          restartPolicy: OnFailure
-          containers:
-          - name: cleanup
-            image: my-cleanup:1.0
-            args: ["--retention-days=30"]
-```
+## Network: Service, Ingress, NetworkPolicy
 
----
+Внутрикластерная связность — через Service. `ClusterIP` даёт виртуальный IP + DNS `<name>.<ns>.svc.cluster.local`, балансирует запросы между pod'ами по selector. `NodePort` открывает порт на каждой ноде — для debug/dev, в проде обычно избегается. `LoadBalancer` заказывает внешний балансировщик у облака (AWS ELB, GCP LB, MetalLB в on-prem). `Headless Service` (`clusterIP: None`) — не даёт виртуального IP, DNS-запрос возвращает список IP всех pod'ов напрямую; нужен для StatefulSet, где приложение хочет обращаться к конкретному pod'у.
 
-## 2. Storage: PV, PVC, StorageClass
+Внешний вход в кластер идёт через **Ingress** — L7 роутер поверх nginx/Traefik/HAProxy. Один Ingress Controller висит на 80/443 всей ноды или в LoadBalancer'е, роутит запросы по host/path в нужные Services. Так один IP и один TLS-сертификат обслуживают десятки сервисов через разные хосты. С cert-manager сертификаты Let's Encrypt обновляются автоматически. У nginx-ingress традиционно больше настроек через аннотации; у Traefik — конфигурация ближе к декларативной и удобнее с CRD; выбор проектный, оба production-ready.
 
-Абстракция k8s поверх реальных дисков.
-
-### 2.1 Терминология
-
-- **PersistentVolume (PV)** — реальный кусок диска (EBS volume в AWS, disk в Azure/GCP, локальный SSD, NFS). Кластерный ресурс, живёт вне pod'а.
-- **PersistentVolumeClaim (PVC)** — request на диск от pod'а: "мне нужно 100Gi RWO, класс fast-ssd". k8s находит подходящий PV и связывает.
-- **StorageClass** — шаблон динамического provisioning'а. `fast-ssd`, `slow-hdd`, `nfs`. При создании PVC k8s провизионит PV сам согласно классу.
-
-### 2.2 Access modes
-
-- **ReadWriteOnce (RWO)** — один pod пишет/читает. Стандарт для БД (EBS, standard SSD).
-- **ReadOnlyMany (ROX)** — много pod'ов читают. Редко.
-- **ReadWriteMany (RWX)** — много pod'ов пишут/читают. Требует NFS/CephFS/EFS. Медленно, дорого. Обычно избегается.
-
-### 2.3 Reclaim policy
-
-- **Retain** — при удалении PVC PV остаётся, надо чистить руками. Для важных данных.
-- **Delete** — при удалении PVC удаляется и PV (и реальный диск!). Для эфемерных.
-
-Пример misconfig: `reclaimPolicy: Delete` для базы → удалили deployment → ушёл PVC → drop of database. Классика продовой катастрофы.
-
-### 2.4 emptyDir vs hostPath vs configMap/secret
-
-Мимо PV:
-- **emptyDir** — временный том на диске ноды. Живёт пока pod живёт. Для scratch/cache.
-- **hostPath** — том с ноды host (`/var/log`, `/var/run/docker.sock`). Опасно, обычно только для infra DaemonSet'ов.
-- **configMap / secret** — файлы с содержимым из объекта k8s. Читай в контейнере как обычные файлы.
-
----
-
-## 3. Network: Service, Ingress, NetworkPolicy
-
-### 3.1 Service — cluster-internal LB
-
-Уже разобрано в `10-kubernetes-detailed.md`. Кратко:
-- **ClusterIP** — виртуальный IP + DNS `<service>.<ns>.svc.cluster.local`. Пробуют pod'ы по selector.
-- **NodePort** — открывает порт на каждой ноде. Debug/dev.
-- **LoadBalancer** — просит внешний LB (AWS ELB, MetalLB). Прод-точка входа для одного сервиса.
-
-**Headless Service** (`clusterIP: None`) — без LB, DNS возвращает список pod IP напрямую. Для StatefulSet: `postgres-0.postgres.default.svc.cluster.local`.
-
-### 3.2 Ingress — HTTP L7 роутер
-
-Один Ingress Controller (nginx-ingress, Traefik, HAProxy Ingress) слушает на 80/443 всей cluster, роутит запросы по host/path в Services.
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: knp-ingress
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-    cert-manager.io/cluster-issuer: letsencrypt-prod
-spec:
-  ingressClassName: nginx
-  tls:
-  - hosts: [knp.kgd.gov.kz]
-    secretName: knp-tls
-  rules:
-  - host: knp.kgd.gov.kz
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: isnaknpgateway
-            port:
-              number: 80
-      - path: /api/user
-        pathType: Prefix
-        backend:
-          service:
-            name: isnaknpuser
-            port:
-              number: 80
-```
-
-Один IP + один TLS-cert для многих сервисов. С `cert-manager` — автоматическое обновление Let's Encrypt.
-
-**nginx-ingress** — самый популярный. Traefik — легче конфигурируется через labels, поддерживает CRD. Выбор проектный.
-
-### 3.3 NetworkPolicy — L3/L4 firewall
-
-По умолчанию в k8s любой pod может ходить в любой другой pod. Плохо для безопасности: если один сервис взломан → доступ ко всем.
-
-NetworkPolicy — правила "кто с кем может общаться".
+**NetworkPolicy** — L3/L4 firewall между pod'ами. По умолчанию Kubernetes даёт полный mesh: любой pod может ходить в любой pod. Это удобно для разработки и катастрофа для безопасности. Взломали один сервис — атакующий сразу может сканировать всю сеть кластера. NetworkPolicy позволяет описать: «pod'ы с меткой app=postgres принимают TCP:5432 только от pod'ов с метками app=isnaknpuser или app=isnaknpsync, всё остальное drop». Аналогично для egress.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -226,30 +58,22 @@ spec:
   policyTypes: [Ingress]
   ingress:
   - from:
-    - podSelector:
-        matchLabels: {app: isnaknpuser}
-    - podSelector:
-        matchLabels: {app: isnaknpsync}
+    - podSelector: {matchLabels: {app: isnaknpuser}}
+    - podSelector: {matchLabels: {app: isnaknpsync}}
     ports:
     - protocol: TCP
       port: 5432
 ```
 
-Что говорит: pod'ы с label `app=postgres` принимают входящие соединения на порт 5432 **только** от pod'ов с label `app=isnaknpuser` или `app=isnaknpsync`. Всё остальное — reject.
+Критическое ограничение: NetworkPolicy требует CNI-плагина с поддержкой. Calico, Cilium, Weave — работают. Стандартный kubenet или flannel в базовом режиме — игнорируют NetworkPolicy молча, правила «применяются» но ничего не блокируют. Первое что проверить в новом кластере: `kubectl get pods -n kube-system | grep -E 'calico|cilium|weave'`.
 
-**Важно**: NetworkPolicy требует **CNI plugin с поддержкой** (Calico, Cilium, Weave). Стандартный kubenet не умеет.
+Правильная security-практика: **default-deny** в каждом namespace (пустой ingress = никто не может войти), плюс явные разрешения. Так каждый новый сервис обязан объявить кому он даёт доступ, и любой пропущенный default-allow становится видимым.
 
-Хорошая практика:
-1. Default deny all ingress в namespace.
-2. Явные rules для конкретных пар "источник → назначение".
+## PodDisruptionBudget: пережить node drain
 
----
+Ноды кластера периодически надо обслуживать: обновление kernel, апгрейд kubelet, замена железа. Kubernetes для этого делает `drain` — эвакуирует все pod'ы с ноды на другие. Если у тебя `replicas: 3` и все три случайно оказались на одной ноде — drain убьёт все три одновременно, downtime гарантирован.
 
-## 4. PodDisruptionBudget (PDB) — защита от массового перезапуска
-
-Проблема: node drain (обслуживание, апгрейд). k8s хочет эвакуировать pod'ы с ноды. Если у тебя `replicas: 3` и все на одной ноде — ты потеряешь все 3 разом, downtime.
-
-PDB говорит: "минимум 2 из 3 pod'ов моего приложения должны быть Available всегда, даже во время drain".
+**PodDisruptionBudget (PDB)** — контракт «минимум N pod'ов моего приложения должны быть Available всегда, даже во время voluntary disruption». Когда kube-controller хочет эвакуировать pod, он спрашивает у PDB: «можно?». Если убийство pod'а нарушит PDB — drain ждёт.
 
 ```yaml
 apiVersion: policy/v1
@@ -257,24 +81,18 @@ kind: PodDisruptionBudget
 metadata:
   name: isnaknpuser-pdb
 spec:
-  minAvailable: 2      # или maxUnavailable: 1
+  minAvailable: 2
   selector:
     matchLabels: {app: isnaknpuser}
 ```
 
-Kubernetes при drain'е ноды спросит: "могу ли я убить этот pod, не нарушив PDB?" — если нет, drain ждёт.
+Стандартная формула — `minAvailable: N-1` где N = replicas. Три реплики = минимум две доступны. Одна реплика — PDB невозможен: `minAvailable: 0` разрешает всё, `minAvailable: 1` навсегда блокирует drain. Отсюда правило: **для критичных сервисов всегда 2+ replicas**, иначе PDB не защитит.
 
-**Правило прода**: PDB для каждого критичного сервиса. Обычно `minAvailable: N-1` где N = replicas.
+Есть ещё «involuntary» disruptions — падение ноды, OOM ядра, hardware failure. PDB против них бессилен, потому что pod уже мёртв к моменту принятия решения. Защита от них — anti-affinity (см. дальше) и запас реплик.
 
-**Гоча**: если у тебя всего 1 replica → PDB нельзя настроить (drain никогда не пройдёт). Для важных сервисов **всегда 2+ replicas**.
+## Priority и preemption: кого вытеснить
 
----
-
-## 5. Priority и Preemption
-
-Кластер переполнен, надо запустить критичный сервис. Что вытеснить?
-
-**PriorityClass** — численный приоритет pod'а.
+Кластер переполнен, новый critical pod не помещается. Что делает scheduler? По умолчанию — не шедулит, pod остаётся в Pending. С PriorityClass — может вытеснить (preempt) pod'ы с меньшим приоритетом, освободить место.
 
 ```yaml
 apiVersion: scheduling.k8s.io/v1
@@ -282,105 +100,43 @@ kind: PriorityClass
 metadata:
   name: high-priority
 value: 1000
-globalDefault: false
-description: "Для критичных сервисов knp"
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: isnaknpgateway
-spec:
-  template:
-    spec:
-      priorityClassName: high-priority
 ```
 
-Если новый pod с priority 1000 не помещается — scheduler ищет pod'ы с меньшим priority на нодах, вытесняет (evicts) их.
+Pod с высоким priority, для которого нет места, заставляет scheduler искать pod'ы с меньшим priority на нодах, evict'ить их (по факту убивать через SIGTERM с graceful period, а не SIGKILL) и запускать высокоприоритетный на освобождённое место. Вытесненные pod'ы попадают обратно в очередь scheduler'а и шедулятся туда где есть место — или ждут если места нет.
 
-**Правило прода**: критичные — high, обычные — medium, batch/cron — low.
+Стандартная иерархия: `system-cluster-critical` (2 000 000 000, для kube-system pod'ов), `high` (1000, критичные бизнес-сервисы), `medium` (500, обычные сервисы), `low` (100, batch/cron). Никогда не давать высокий приоритет всем — тогда система деградирует до состояния «никого нельзя вытеснить».
 
-Стандартные k8s имеет `system-cluster-critical` (2 000 000 000) для kube-system pod'ов.
+## QoS classes: кого убивать при OOM ноды
 
----
+Каждый pod автоматически получает QoS class на основе того, как описаны его requests и limits. Kubernetes не спрашивает — вычисляет.
 
-## 6. QoS classes
+**Guaranteed** — `requests == limits` для всех контейнеров, всех ресурсов (memory и cpu). При OOM ноды (когда суммарное потребление pod'ов превысило доступную память) — таких убивают в последнюю очередь.
 
-Каждый pod автоматически получает QoS class на основе `requests/limits`:
+**Burstable** — где-то `requests < limits`. Обычная категория для сервисов, у которых пиковое потребление выше среднего. При OOM убивают после BestEffort, до Guaranteed.
 
-- **Guaranteed** — requests == limits для всех контейнеров, всех ресурсов. При OOM или nodetension — убивают в последнюю очередь.
-- **Burstable** — requests < limits хоть где-то. Обычная категория.
-- **BestEffort** — requests не указаны нигде. Убивают первыми при пресcении.
+**BestEffort** — requests не указаны нигде. Убивают первыми. По сути «я не гарантирую своих потребностей, съем что дадут».
 
-Проверить: `kubectl describe pod X | grep QoS`.
-
-Правило прода: **все критичные — Guaranteed**, `requests=limits`. Batch — Burstable ок. Никогда BestEffort в prod.
+Правило для прода: **все критичные сервисы — Guaranteed** с `requests == limits`. Так kubelet не будет их трогать при пресcении памяти ноды. Batch-джобы — Burstable нормально. BestEffort в проде — почти всегда неправильно, разве что для настоящих fire-and-forget задач которых не жалко.
 
 ```yaml
 resources:
   requests:
-    memory: "1Gi"
+    memory: "2Gi"
     cpu: "500m"
   limits:
-    memory: "1Gi"
+    memory: "2Gi"
     cpu: "500m"
 ```
 
-Такой pod = Guaranteed. При OOM ноды — убивают в последнюю очередь.
+Отдельный tricky момент — CPU limits. `cpu: 500m` = 0.5 vCPU. Но `limits.cpu` реализуется через CFS quota в Linux и вводит throttling: если сервис попытался использовать больше — его ядро притормаживает даже если CPU свободен. Для латентно-чувствительных JVM-приложений это плохо: GC-паузы и warmup могут не влезать в quota. Многие в проде оставляют `requests.cpu` и **убирают `limits.cpu` вообще**, доверяя PriorityClass'у и affinity'ю распределять нагрузку.
 
----
+## Graceful shutdown: где именно race condition
 
-## 7. Graceful shutdown: SIGTERM → preStop → terminationGracePeriod
+Когда k8s хочет убить pod, происходит примерно следующее. Kubelet помечает pod как `Terminating`. Endpoints-controller удаляет pod из endpoints Service — но это распространяется асинхронно, kube-proxy на каждой ноде обновит iptables/IPVS через 1-5 секунд. Одновременно kubelet выполняет `preStop` hook (если настроен) и посылает SIGTERM основному процессу. Дальше идёт отсчёт `terminationGracePeriodSeconds` (по умолчанию 30 сек). Если контейнер за это время не завершился — SIGKILL, никаких вопросов.
 
-Что происходит когда k8s хочет убить pod:
+Race condition — между «удалили из endpoints» и «kube-proxy обновил правила». В этом окне (пара секунд) новые запросы всё ещё могут прилететь на умирающий pod, а он уже начал graceful shutdown, отказывается принимать. Клиент получает `Connection refused` или зависание, retry-логика балансировщика может перевести на другой pod, но лишний хвост ошибок в логах и пятисоток на графике обеспечен.
 
-```
-1. kubectl delete pod X (или rolling update / eviction)
-2. k8s помечает pod как "Terminating"
-3. Pod удаляется из endpoints Service'а
-   → Новые запросы не идут больше в этот pod
-4. Одновременно:
-   - Выполняется preStop hook (если настроен)
-   - SIGTERM летит в контейнер
-5. terminationGracePeriodSeconds (default 30s) отсчитывается
-6. Если контейнер не завершился — SIGKILL
-```
-
-### 7.1 Правильный Spring Boot graceful shutdown
-
-Boot 2.3+ поддерживает graceful shutdown нативно:
-
-```yaml
-server:
-  shutdown: graceful
-
-spring:
-  lifecycle:
-    timeout-per-shutdown-phase: 25s
-```
-
-При SIGTERM:
-1. Boot прекращает принимать новые HTTP-запросы.
-2. Ждёт до `timeout-per-shutdown-phase` пока in-flight запросы завершатся.
-3. Закрывает контекст (destroys beans в правильном порядке).
-4. Exits 0.
-
-Важно: `terminationGracePeriodSeconds` в k8s **больше** чем `timeout-per-shutdown-phase` в Boot. Иначе SIGKILL прибьёт middle-shutdown.
-
-```yaml
-spec:
-  template:
-    spec:
-      terminationGracePeriodSeconds: 45  # > 25 из Boot config
-      containers:
-      - name: app
-        # ...
-```
-
-### 7.2 preStop hook — задержка перед SIGTERM
-
-Race condition в k8s: между "pod удалён из endpoints" и "kube-proxy на всех нодах обновил iptables" — 1-5 секунд. В это время новый запрос всё ещё может прилететь, но Boot уже закрылся.
-
-preStop `sleep 5` даёт время iptables обновиться, ПОТОМ SIGTERM:
+Правильный паттерн: **preStop hook с `sleep 5`**, потом SIGTERM. Порядок такой:
 
 ```yaml
 lifecycle:
@@ -389,185 +145,131 @@ lifecycle:
       command: ["/bin/sh", "-c", "sleep 5"]
 ```
 
-Порядок:
-1. `pod → Terminating`, удаляется из endpoints.
-2. **preStop `sleep 5`** — окно чтобы kube-proxy на всех нодах обновил правила.
-3. SIGTERM в контейнер.
-4. Boot начинает graceful shutdown.
-5. Boot exits, контейнер done.
+Kubelet сначала полностью выполнит preStop (5 секунд простоя), только потом пошлёт SIGTERM. За эти 5 секунд kube-proxy на всех нодах успевает обновить правила, новые запросы перестают попадать на этот pod. Дальше идёт честный graceful shutdown.
 
----
-
-## 8. Health probes: liveness, readiness, startup
-
-Boot Actuator даёт эндпоинты, k8s опрашивает.
-
-### 8.1 Liveness
-
-"Приложение живое или зависло?". Если fail → k8s **перезапускает** pod.
+Spring Boot 2.3+ поддерживает graceful shutdown нативно:
 
 ```yaml
-livenessProbe:
-  httpGet:
-    path: /actuator/health/liveness
-    port: 8080
-  initialDelaySeconds: 30
-  periodSeconds: 10
-  failureThreshold: 3
+server:
+  shutdown: graceful
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
 ```
 
-**Правило**: liveness никогда не должен зависеть от внешних систем (БД, других сервисов). Иначе временный сбой БД → k8s начинает перезапускать все pod'ы → каскадный отказ.
+При SIGTERM Boot прекращает принимать новые HTTP-запросы, ждёт до 25 секунд пока текущие завершатся, потом закрывает контекст в правильном порядке (сначала веб, потом DataSource, потом остальное) и выходит с кодом 0.
 
-### 8.2 Readiness
+Критическая арифметика: `terminationGracePeriodSeconds` в манифесте должен быть **больше** `timeout-per-shutdown-phase` в Boot + preStop sleep. Иначе SIGKILL прибьёт Boot посередине shutdown'а. Формула: `terminationGracePeriodSeconds ≥ preStop_sleep + Boot_shutdown_timeout + запас`. Для нашего примера: 5 + 25 + 15 = 45 секунд.
 
-"Готов ли pod принимать трафик?". Если fail → pod остаётся Running, но **удаляется из endpoints Service'а**.
+Что реально делать во время graceful shutdown в приложении: дождаться in-flight HTTP-запросов, отменить или дожать consumer'ы RabbitMQ/Kafka (ack то что успело, не подхватывать новое), закрыть connection pool JDBC (см. файл 107), закрыть коннекты к другим сервисам. Всё это Boot делает сам через SmartLifecycle-порядок бинов, но если у тебя своя логика (свой executor, свой WebSocket-сервер) — надо руками имплементить `SmartLifecycle`.
 
-```yaml
-readinessProbe:
-  httpGet:
-    path: /actuator/health/readiness
-    port: 8080
-  initialDelaySeconds: 10
-  periodSeconds: 5
-  failureThreshold: 3
-```
+## Probes: liveness, readiness, startup — тонкости
 
-**Правило**: readiness МОЖЕТ зависеть от внешних систем (БД). Если БД недоступна — pod удаляется из балансировки, трафик идёт на другие replicas.
+Три probe с разными семантиками, и типовой анти-паттерн когда путают liveness и readiness — стоит инцидентов.
 
-Boot Actuator по умолчанию имеет `ReadinessStateHealthIndicator` — с БД в составе.
+**Liveness** отвечает на вопрос «приложение живое или намертво зависло?». Если fail — kubelet **перезапускает контейнер**. Не pod, а именно контейнер (pod остаётся, restart count растёт). Правильный liveness проверяет **только** внутреннее состояние: JVM отвечает, event loop не заблокирован, deadlock не наступил.
 
-### 8.3 Startup probe
+Классическая ошибка — включить в liveness проверку зависимостей (БД, других сервисов). Что происходит при кратковременном сбое БД: readiness на всех pod'ах приложения красный (это правильно), liveness тоже красный (это неправильно) — kubelet начинает перезапускать все pod'ы. БД восстанавливается, но приложения все Restarting, каскадный отказ длиной в минуты. Правило: **liveness не зависит от внешних систем**. Только «сам процесс жив и отвечает».
 
-Для медленно стартующих приложений (JVM warmup, cache initialization).
+**Readiness** — «готов ли pod принимать трафик?». Если fail — pod остаётся Running (не перезапускается!), но **удаляется из endpoints Service'а**. Балансировщик не шлёт на него новых запросов до восстановления. Readiness **может и должен** зависеть от внешних систем: БД недоступна — pod не готов, LB перенаправляет на другие реплики. Как только БД вернулась — readiness зелёный, pod снова в endpoints.
+
+Spring Boot Actuator из коробки даёт `/actuator/health/liveness` и `/actuator/health/readiness`. Liveness по умолчанию отдаёт `LivenessState` (простой enum «жив/мёртв»). Readiness тянет `ReadinessStateHealthIndicator` + внешние indicators (по дефолту `DataSourceHealthIndicator` — проверка БД, `RedisHealthIndicator` и т.д.).
+
+**Startup** — для медленно стартующих приложений. Пока startup не Ok — liveness и readiness не проверяются вообще. Даёт JVM время прогреться, кэши прогрузиться, JIT скомпилиться. `failureThreshold: 30, periodSeconds: 10` = 5 минут на старт. Без startup probe пришлось бы ставить огромный `initialDelaySeconds` на liveness — плохо, потому что если приложение реально зависло через минуту работы, liveness не сработает пока не пройдёт initial delay.
 
 ```yaml
 startupProbe:
-  httpGet:
-    path: /actuator/health/liveness
-    port: 8080
+  httpGet: {path: /actuator/health/liveness, port: 8080}
   failureThreshold: 30
   periodSeconds: 10
+livenessProbe:
+  httpGet: {path: /actuator/health/liveness, port: 8080}
+  periodSeconds: 15
+  failureThreshold: 3
+readinessProbe:
+  httpGet: {path: /actuator/health/readiness, port: 8080}
+  periodSeconds: 5
+  failureThreshold: 2
 ```
 
-Пока startup не Ok — liveness/readiness не проверяются. Даёт 30 x 10 = 5 минут на старт.
+## Init containers и sidecars
 
----
+**Init container** — специальный контейнер в pod'е, который запускается **до** основного и должен выйти с exit 0, иначе основной не стартует. Init'ы выполняются последовательно один за другим. Классические применения:
 
-## 9. Init containers и sidecars
+- **wait-for-dependency**: `until nc -z postgres 5432; do sleep 1; done`. Не пускать приложение пока БД не отвечает. Полезно при холодном старте кластера.
+- **fetch-secret**: сходить в Vault/AWS Secrets Manager, положить секрет на shared emptyDir, приложение потом читает файл.
+- **run-migrations**: применить Liquibase/Flyway до того как приложение попытается работать со схемой.
 
-### 9.1 Init container
+Init для миграций проблематичен при replicas > 1: все pod'ы параллельно попытаются запустить миграции. Liquibase возьмёт advisory lock, но старт всё равно растянется, а если миграция сломается — все pod'ы в Init crashloop. Правильный подход — миграции отдельным Job'ом до раскатки Deployment'а.
 
-Контейнер, который **запускается ДО главного**, должен exit 0 чтобы главный стартовал. Sequential.
+**Sidecar** — второй (третий, четвёртый) контейнер в том же pod'е, работающий параллельно. Общий network namespace (localhost между контейнерами), общие volumes. Классические примеры:
 
-Применения:
-- Ждать пока БД доступна (`while ! nc -z db 5432; do sleep 1; done`).
-- Скачать конфиг/секрет из Vault и положить на shared volume.
-- Прогнать миграции Liquibase перед стартом сервиса.
+- **Service mesh proxy** — Envoy/Istio-sidecar перехватывает исходящий трафик приложения, добавляет mTLS, retry, timeout, distributed tracing. Приложение шлёт plain HTTP на localhost, sidecar шифрует и отправляет дальше.
+- **Config-reloader** — следит за ConfigMap через shared volume, шлёт SIGHUP главному контейнеру когда конфиг изменился.
+- **Backup-agent** — раз в час снимает snapshot тома главного, льёт в S3.
 
-```yaml
-spec:
-  initContainers:
-  - name: wait-for-db
-    image: busybox
-    command: ['sh', '-c', 'until nc -z postgres 5432; do sleep 1; done']
-  - name: run-migrations
-    image: my-liquibase:1.0
-  containers:
-  - name: app
-    image: my-app:1.0
-```
+Анти-паттерн: пихать всё в один pod через sidecar'ы «чтобы вместе жили». Sidecar — это когда два процесса **логически неразделимы**, должны стартовать и умирать вместе, делят локальные ресурсы. Если два процесса могут работать независимо — это два разных Deployment'а. Sidecar'ы усложняют graceful shutdown (все контейнеры получают SIGTERM одновременно, порядок остановки — с ловушками), увеличивают memory footprint и добавляют возможности отказов.
 
-### 9.2 Sidecar
+Kubernetes 1.28+ добавил `restartPolicy: Always` для init container'ов — это «нативные» sidecar'ы: запускаются до основных, живут параллельно, ждут окончания основных при shutdown. До этого приходилось эмулировать через обычные containers с ручной синхронизацией.
 
-Второй контейнер в том же pod'е, **параллельно** с главным. Общий network namespace (localhost) и volumes.
+## Rolling update: как безопасно катить
 
-Примеры:
-- **Log-forwarder**: контейнер читает логи главного, отправляет в удалённое место. Устарел с DaemonSet Fluent Bit.
-- **Proxy**: Envoy / Istio-sidecar перехватывает исходящий трафик, добавляет mTLS, retry, tracing.
-- **Config-reloader**: следит за ConfigMap, перегружает главный при изменении.
-- **Backup-agent**: раз в час снимает snapshot тома главного.
+Дефолтная стратегия Deployment — RollingUpdate: постепенное замещение старых pod'ов новыми, без даунтайма.
 
-Anti-pattern: **всё в один pod через sidecar**. Разделяй по границе жизненного цикла: если два процесса должны стартовать/умирать вместе → один pod. Если независимо → разные Deployment'ы.
-
----
-
-## 10. Rolling update: как безопасно катить новую версию
-
-Default стратегия Deployment:
 ```yaml
 strategy:
   type: RollingUpdate
   rollingUpdate:
-    maxSurge: 25%          # сколько новых можно поднять сверху (round up)
-    maxUnavailable: 25%    # сколько старых можно убить (round down)
+    maxSurge: 25%
+    maxUnavailable: 25%
 ```
 
-Пример при `replicas: 4`:
-- `maxSurge: 25%` = 1 → на пике = 5 pod'ов.
-- `maxUnavailable: 25%` = 1 → в моменте не меньше 3 Ready.
+`maxSurge` — сколько pod'ов сверх желаемого количества можно поднять во время update. `maxUnavailable` — сколько pod'ов ниже желаемого можно опустить. При `replicas: 4`, `maxSurge: 25%` = 1, `maxUnavailable: 25%` = 1: на пике 5 pod'ов, в моменте минимум 3 Ready.
 
-Шаги:
-1. Создать 1 новый pod (v2). Ждать Ready.
-2. Убить 1 старый (v1).
-3. Повторять пока все не v2.
+Для zero-downtime часто ставят `maxUnavailable: 0, maxSurge: 1`: никогда не опускаемся ниже желаемого количества, поднимаем по одному новому, ждём Ready, только потом убиваем старый. Медленнее, но безопаснее для критичных сервисов.
 
-Если новый pod не становится Ready — rollout зависает. `kubectl rollout status deployment/X` покажет.
+Если новый pod не становится Ready (сломанная readiness probe, ошибка старта) — rollout зависает. `kubectl rollout status deployment/X` покажет. `kubectl rollout undo deployment/X` откатывает на предыдущую версию (или `--to-revision=N` на конкретную). `kubectl rollout history deployment/X` показывает историю.
 
-**Rollback**:
-```bash
-kubectl rollout undo deployment/isnaknpuser
-kubectl rollout undo deployment/isnaknpuser --to-revision=3
-```
+Есть ещё стратегия `Recreate`: убить все старые pod'ы, потом запустить все новые. Даунтайм гарантирован. Используется только когда версии несовместимы одновременно (например, изменения схемы БД, требующие остановки всех старых). В обычной работе — не для прода.
 
-**История**:
-```bash
-kubectl rollout history deployment/isnaknpuser
-```
+Более продвинутые схемы (blue/green, canary) реализуются через Argo Rollouts, Flagger, или руками через два Deployment'а + переключение Service'а. Дают возможность катать 5% трафика на новую версию, смотреть метрики, потом 20%, 50%, 100%. Или держать два полных парка (blue/green) и переключаться атомарно.
 
-### 10.1 Recreate strategy — не для прод
+## OOMKilled: расследование
 
-```yaml
-strategy:
-  type: Recreate
-```
+Pod вышел с exit code 137. `kubectl describe pod X`:
 
-Убьёт ВСЕ старые, потом создаст новые. Даунтайм гарантирован. Только для dev/staging.
-
----
-
-## 11. Resource management — что происходит при OOM
-
-Когда pod превышает memory limit → **OOMKilled**.
-
-`kubectl describe pod X | grep -A5 "Last State"`:
 ```
 Last State:     Terminated
   Reason:       OOMKilled
   Exit Code:    137
 ```
 
-- Exit 137 = 128 + 9 (SIGKILL).
-- Убивает **node kernel** (cgroup OOM), не k8s.
-- Kubelet видит exit, применяет restart policy (обычно Always → перезапуск).
+Exit 137 = 128 + 9 (SIGKILL). Убил не Kubernetes, а Linux kernel через cgroup OOM killer — pod превысил `limits.memory`, kernel убил самый жирный процесс в cgroup'е. Kubelet видит exit, применяет restart policy (Always по умолчанию), pod перезапускается.
 
-Как расследовать:
-1. `kubectl top pod X` — сколько ест сейчас.
-2. `kubectl describe pod X` — есть ли `Reason: OOMKilled` в last state.
-3. Heap dump через `jcmd`:
-   ```
-   kubectl exec pod-x -- jcmd 1 GC.heap_dump /tmp/heap.hprof
-   kubectl cp pod-x:/tmp/heap.hprof ./heap.hprof
-   ```
-   Открывать Eclipse MAT — искать leaked objects.
-4. Разобрать в MAT: "Dominator Tree", ищи очень большие retained sizes.
+Первые шаги диагностики:
 
-Правило: **JVM heap < container memory limit**. Обычно `-Xmx` = 70-80% от `limit`. Пример: `limits.memory: 2Gi`, `-Xmx1500m`. Оставь запас для metaspace, direct memory, stacks.
+`kubectl top pod X` — сколько ест сейчас (после рестарта, свежая копия). Если после старта уже под limit — приложение растёт быстро. Если ест мало — рост был постепенный, ищи memory leak.
 
----
+`kubectl describe pod X | grep -A5 "Last State"` — подтверждение что причина именно OOM, а не что-то другое (exit code 143 — SIGTERM, значит graceful shutdown; exit 1 — приложение упало само).
 
-## 12. Как всё это связано на реальном проде
+Heap dump в JVM — самая ценная диагностика. Пока pod жив:
 
-Полный шаблон deployment для типичного микросервиса на КНП:
+```bash
+kubectl exec pod-x -- jcmd 1 GC.heap_dump /tmp/heap.hprof
+kubectl cp pod-x:/tmp/heap.hprof ./heap.hprof
+```
+
+Открывать в Eclipse MAT. Смотреть Dominator Tree — какой объект удерживает больше всего памяти. Классика: HashMap-кэш без TTL, ThreadLocal без cleanup, connection pool с открытыми ResultSet'ами, EhCache/Caffeine с неограниченной емкостью.
+
+Правило по heap: **`-Xmx` должен быть меньше `limits.memory`**, обычно 70-80%. Пример: `limits.memory: 2Gi`, `-Xmx1500m`. Разница уходит на metaspace, direct memory (Netty, JDBC-драйверы), thread stacks (по 1MB на тред), JIT code cache, native libraries. Если поставить `-Xmx2G` = `limits.memory: 2Gi` — heap заполнится, JVM попытается взять ещё на metaspace, cgroup убьёт.
+
+Полезная опция: `-XX:+ExitOnOutOfMemoryError` — при OOM внутри JVM (heap exhausted, не cgroup) выйти сразу с ошибкой вместо попыток продолжить с полумёртвой памятью. Kubernetes перезапустит, а не будет сервить сломанные ответы.
+
+`-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/oom.hprof` — писать heap dump при OOM автоматически. Часто ставят на shared volume чтобы после рестарта dump остался и его можно было забрать для анализа.
+
+## Полный шаблон для прод-сервиса
+
+Собранный воедино манифест, отражающий все обсуждённые практики:
 
 ```yaml
 apiVersion: apps/v1
@@ -594,6 +296,14 @@ spec:
     spec:
       priorityClassName: high-priority
       terminationGracePeriodSeconds: 45
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels: {app: isnaknpuser}
+              topologyKey: kubernetes.io/hostname
       containers:
       - name: app
         image: registry.1sc.kz/isnaknpuser:v1.2.3
@@ -603,10 +313,10 @@ spec:
         - name: SPRING_PROFILES_ACTIVE
           value: prod
         - name: JAVA_TOOL_OPTIONS
-          value: "-Xmx1500m -XX:+ExitOnOutOfMemoryError"
+          value: "-Xmx1500m -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/oom.hprof"
         resources:
           requests: {memory: 2Gi, cpu: 500m}
-          limits: {memory: 2Gi, cpu: 2000m}
+          limits:   {memory: 2Gi, cpu: 2000m}
         lifecycle:
           preStop:
             exec:
@@ -661,19 +371,32 @@ spec:
       port: 8080
 ```
 
----
+Здесь всё что мы обсудили: 3 replicas + PDB(minAvailable=2) для zero-downtime при drain, priorityClass high, memory Guaranteed, cpu Burstable, anti-affinity для распределения по разным нодам, preStop sleep + большой terminationGracePeriod, все три probe, метки для Prometheus scrape, NetworkPolicy разрешает трафик только от gateway.
 
-## 13. Кратко
+## Как это всё диагностировать в проде
 
-- **Workloads**: Deployment (stateless), StatefulSet (identity+PV), DaemonSet (per-node), Job/CronJob (batch).
-- **Storage**: PV/PVC/StorageClass. RWO для БД, reclaim=Retain для важного.
-- **Network**: Service (internal), Ingress (external L7), NetworkPolicy (firewall).
-- **PDB**: минимум N-1 pod доступен при drain. Обязательно для критичных.
-- **QoS**: Guaranteed для критичных (requests==limits).
-- **Priority**: high для критичных, чтобы вытеснять при переполнении.
-- **Graceful shutdown**: preStop sleep 5 → SIGTERM → Boot shutdown → exit. `terminationGracePeriodSeconds` больше чем shutdown-timeout Boot.
-- **Probes**: startup (для медленного старта), liveness (авторестарт), readiness (LB кнопка).
-- **Init containers**: миграции, wait-for-db, config-fetch.
-- **Sidecars**: envoy proxy, config-reloader. Не пихай всё в один pod.
-- **Rolling update**: `maxUnavailable: 0` для zero-downtime. Rollback: `kubectl rollout undo`.
-- **OOM**: -Xmx < limit. Heap dump через jcmd + MAT.
+Симптомы часто одинаковые (сервис отвечает 5xx, задержка растёт), а причины разные. Быстрый чек-лист:
+
+**Pod'ы не Ready.** `kubectl get pods -n knp -l app=isnaknpuser` — смотрим READY колонку. `0/1` — контейнер не Ready. `kubectl describe pod X` — раздел Events покажет причину: pull error, probe failure, OOMKilled. `kubectl logs X --previous` — логи предыдущего инстанса перед рестартом (часто там причина).
+
+**Rolling update завис.** `kubectl rollout status deployment/X` — покажет «waiting for rollout to finish: N of M new replicas have been updated». Скорее всего новый pod не становится Ready. `kubectl get pods -l app=X --sort-by=.metadata.creationTimestamp` — новый pod внизу списка, смотреть его describe и logs.
+
+**Один pod ест 100% CPU, остальные простаивают.** Проверить какой pod: `kubectl top pods -n knp --sort-by=cpu`. Стандартная причина — залипший процесс/deadlock/бесконечный цикл. `kubectl exec pod-x -- jstack 1 > threads.txt` — thread dump, искать `RUNNABLE` треды в цикле.
+
+**Все pod'ы Ready, но 5xx летят.** Смотреть с точки зрения балансировщика. `kubectl get endpoints isnaknpuser` — какие IP входят в endpoints. Если pod Terminating но ещё в endpoints — race condition, нужен preStop sleep. Если pod Running но не в endpoints — что-то сломано с Service selector.
+
+**Node drain не проходит.** `kubectl describe node X` — покажет pod'ы, которые нельзя эвакуировать. Обычно причина — `Cannot evict pod as it would violate the pod's disruption budget`. Проверить PDB: `kubectl get pdb -A`. Если PDB требует больше available чем есть реплик — либо увеличить replicas, либо ослабить PDB.
+
+**Pod'ы не могут ходить к базе после включения NetworkPolicy.** `kubectl run tmp --rm -it --image=busybox -- nc -zv postgres 5432`. Если timeout — NetworkPolicy режет. `kubectl get networkpolicy -A` — что применено. Часто причина — default deny, но забыли добавить разрешение конкретному сервису.
+
+## Заключение
+
+Kubernetes для микросервисов — это набор примитивов, которые надо собирать в правильные комбинации. Workload'ы выбираются по природе приложения (Deployment для stateless, StatefulSet для identity, DaemonSet для per-node, Job для одноразовых). Storage требует внимания к reclaim policy — Delete на persistent томе стоит данных. NetworkPolicy обязательна в проде, но требует поддерживающего CNI. PDB защищает от voluntary disruptions, но только если реплик хотя бы две. QoS Guaranteed для критичных сервисов через `requests == limits`. Priority — иерархия для случаев переполнения.
+
+Graceful shutdown — это цепочка, где ошибка на любом этапе даёт хвост ошибок клиентам: preStop sleep для окна iptables, Spring Boot graceful mode для ожидания in-flight запросов, `terminationGracePeriodSeconds` больше суммы. Probes с чётким разделением: liveness не зависит от внешних систем (иначе каскад), readiness зависит и служит кнопкой балансировщика, startup для медленного прогрева.
+
+Rolling update с `maxUnavailable: 0` для zero-downtime; blue/green и canary через специализированные инструменты. OOMKilled лечится анализом heap dump в MAT + правильным соотношением `-Xmx` к `limits.memory`.
+
+Полный шаблон deployment'а собирает всё: три реплики, PDB, priority, anti-affinity, ресурсы, preStop, три probe, метки Prometheus, NetworkPolicy. Такой манифест — базовая единица для любого микросервиса в проде, дальше только доработки под специфику.
+
+Диагностика в проде идёт через несколько инструментов: `kubectl get`/`describe`/`logs`, `kubectl rollout status`, `kubectl top`, `kubectl exec` с jstack/jcmd для JVM. Каждый симптом — своя цепочка команд, набирается практикой и повторяется от инцидента к инциденту.
