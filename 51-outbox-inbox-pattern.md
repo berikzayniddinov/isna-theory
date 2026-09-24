@@ -1,20 +1,21 @@
-# 51. Outbox, Inbox, Idempotency patterns
+# 51. Outbox, Inbox и идемпотентность: надёжный обмен сообщениями между сервисами
 
-## Зачем нужны эти patterns
+## Зачем это знать
 
-Разработчик впервые encountering microservices обычно пишет event publishing простым способом. Save entity к database, then send event to Kafka. Если работает в testing environments — считает done. Production reality приносит неожиданности. Что если process crashed между database commit и Kafka send? Что если Kafka available но temporarily slow — publish times out после commit already succeeded? Что если consumer processed message but crashed before offset committed — message re-delivered, business operation duplicated?
+Разработчик, впервые столкнувшийся с микросервисами, обычно пишет публикацию событий самым простым способом: сохранил сущность в БД, отправил событие в Kafka. Пока это работает на тестовом стенде — считает задачу завершённой. Но production приносит неожиданности. Что происходит если процесс упал между `commit` базы и `send` в Kafka? Что если Kafka доступна, но временно медленная — `send` истекает по таймауту после того как коммит уже прошёл? Что если consumer обработал сообщение, но упал до того как закоммитил offset — сообщение приходит повторно, бизнес-операция дублируется?
 
-Разница между разработчиком «пишущим event publishing» и «понимающим reliable messaging» проявляется в production incident postmortems. Первый видит «событие потерялось между сервисами» и пишет ticket «investigate». Второй знает fundamental problem — atomic write across database и message broker impossible без 2PC/XA (unavailable для Kafka, undesirable для performance). Знает что Outbox pattern решает через shifting problem — write event к database в same transaction as business data, separate publisher reads outbox и publishes к broker. Гарантия — если DB commit прошёл то event будет published eventually. Знает что consumer duplicates возможны из-за at-least-once semantics broker — Inbox pattern (или equivalent idempotency mechanism) обязателен для safe processing.
+Разница между «пишу publishing событий» и «понимаю reliable messaging» проявляется в postmortem'ах после инцидентов. Первый видит «событие пропало между сервисами» и заводит тикет «расследовать». Второй знает фундаментальную проблему: атомарная запись в БД **и** брокер сообщений невозможна без 2PC/XA — а XA для Kafka недоступна и вредна для performance. Знает что **Outbox pattern** решает это переносом проблемы: событие пишется в БД в той же транзакции что и бизнес-данные, отдельный publisher читает outbox и публикует в брокер. Гарантия — если БД закоммитила, событие будет опубликовано eventually. Знает что дубликаты у consumer'а неизбежны из-за at-least-once семантики брокера — и **Inbox pattern** (или другой механизм идемпотентности) обязателен для безопасной обработки.
 
-В этом файле разберём эти patterns глубоко. Fundamental problem — атомарность БД plus broker невозможна прямо. Outbox pattern механика — struct таблицы, producer logic, publisher polling loop. Debezium/CDC как alternative подход. Inbox pattern для consumer side deduplication. Combined Outbox plus Inbox = effectively exactly-once. Broader idempotency approaches — идемпотентные UPDATE, UPSERT, optimistic version, Idempotency-Key header для HTTP APIs. Complete Spring implementation с ShedLock для multi-instance publisher. Realistic issues — outbox growth, publisher lag, ordering, dead-letter, schema evolution. Alternatives и their limitations.
+Разберём эти паттерны глубоко. Фундаментальная проблема — почему атомарность БД + брокер невозможна напрямую. Механика Outbox: структура таблицы, логика producer'а, publisher polling loop. Debezium/CDC как альтернативный подход. Inbox pattern для дедупликации на стороне consumer'а. Комбинация Outbox + Inbox = effectively exactly-once. Другие подходы к идемпотентности — идемпотентный UPDATE, UPSERT, optimistic version, Idempotency-Key header для HTTP API. Полная реализация в Spring с ShedLock для multi-instance publisher. Реальные проблемы прода — рост outbox, лаг publisher'а, ordering, dead-letter, эволюция схемы. Альтернативы и их ограничения.
 
-## Fundamental problem
+## Фундаментальная проблема
 
-Пример. OrderService.createOrder должен. Сохранить Order в PostgreSQL. Опубликовать OrderCreated event в Kafka или RabbitMQ.
+Простой пример. `OrderService.createOrder` должен: сохранить Order в PostgreSQL и опубликовать `OrderCreated` в Kafka или RabbitMQ.
 
-Что если между шагами что-то падает? Multiple failure modes.
+Что произойдёт если между этими шагами что-то упадёт? Несколько failure modes.
 
-Вариант А. Сначала БД, потом broker:
+**Вариант А. Сначала БД, потом broker**:
+
 ```java
 @Transactional
 public void createOrder(OrderRequest req) {
@@ -25,51 +26,55 @@ public void createOrder(OrderRequest req) {
 }
 ```
 
-Заказ сохранён в database. Событие не опубликовано. Downstream не узнает про новый order. Inventory не забронирует. Payment не будет charged. Lost update — business process incomplete.
+Заказ сохранён в БД. Событие не опубликовано. Downstream-сервисы не узнают про новый order. Inventory не забронирует товар. Payment не будет charged. Бизнес-процесс остался незавершённым.
 
-Вариант Б. Сначала broker, потом БД:
+**Вариант Б. Сначала broker, потом БД**:
+
 ```java
 public void createOrder(OrderRequest req) {
-    kafka.send("orders", ...);   // published
+    kafka.send("orders", ...);   // опубликовано
     // CRASH здесь
     orderRepo.save(o);            // не сохранено
 }
 ```
 
-Событие опубликовано. Order в database не создан. Downstream believes order exists. Inventory reserves goods для несуществующего order. Data inconsistency.
+Событие опубликовано. Order в БД не создан. Downstream считает что заказ существует. Inventory резервирует товар для несуществующего заказа. Data inconsistency, которую придётся руками разгребать.
 
-Both approaches fail при process crashes. Neither reliable.
+Оба подхода падают при крашах процесса. Ни один не reliable.
 
-XA/2PC теоретически решает — distributed transaction spanning database и Kafka. Practically не работает. Kafka не supports XA. Performance overhead massive. Coordinator SPOF. Discussed в файле 50 saga-pattern подробно.
+**XA / 2PC** теоретически решает — распределённая транзакция, включающая и БД и Kafka. Практически не работает: Kafka не поддерживает XA, overhead на performance огромный, coordinator — single point of failure. Подробнее в файле 50 про saga-pattern.
 
-Решение — Outbox pattern. Shifts problem от «atomic write across two systems» к «atomic write within one system plus eventually publish».
+Решение — **Outbox pattern**. Сдвигает проблему от «atomic write across two systems» к «atomic write within one system + eventual publish».
 
-## Outbox pattern механика
+## Механика Outbox
 
-Идея. Сохранить и бизнес-данные, и описание события в одной DB-транзакции. Отдельный процесс потом читает outbox таблицу, публикует к broker, отмечает как processed.
+Идея простая. Сохранить и бизнес-данные, и описание события — в одной DB-транзакции. Отдельный процесс потом читает outbox-таблицу, публикует в брокер, отмечает как processed.
 
-Гарантия. Если DB commit прошёл — outbox запись есть — event рано или поздно опубликуется. Publisher retry обеспечивает eventual delivery.
+Гарантия: если DB commit прошёл — outbox-запись существует — событие рано или поздно опубликуется. Retry в publisher'е обеспечивает eventual delivery.
 
-Структура таблицы:
+**Структура таблицы**:
+
 ```sql
 CREATE TABLE outbox (
     id BIGSERIAL PRIMARY KEY,
     aggregate_type TEXT NOT NULL,          -- 'Order', 'Payment'
     aggregate_id TEXT NOT NULL,             -- '42'
     event_type TEXT NOT NULL,               -- 'OrderCreated'
-    payload JSONB NOT NULL,                 -- serialized event
+    payload JSONB NOT NULL,                 -- сериализованное событие
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    processed_at TIMESTAMPTZ                -- NULL если не published
+    processed_at TIMESTAMPTZ                -- NULL если не опубликовано
 );
 
-CREATE INDEX idx_outbox_unprocessed ON outbox(created_at) WHERE processed_at IS NULL;
+CREATE INDEX idx_outbox_unprocessed 
+    ON outbox(created_at) WHERE processed_at IS NULL;
 ```
 
-aggregate_type identifies тип entity (Order, Payment). Used often as topic name или routing key. aggregate_id это ID сущности. Used как partition key для preserving ordering per entity. event_type это тип события — OrderCreated, OrderCancelled. Determines consumer handling. payload это сериализованное event body (typically JSON). created_at plus processed_at track lifecycle.
+`aggregate_type` определяет тип сущности (Order, Payment). Часто используется как имя топика или routing key. `aggregate_id` — ID сущности, используется как partition key для сохранения порядка событий per entity. `event_type` — тип события (OrderCreated, OrderCancelled), определяет обработку consumer'ом. `payload` — сериализованное тело события (обычно JSON). `created_at` + `processed_at` отслеживают жизненный цикл.
 
-Partial index на unprocessed events makes queries fast. Publisher queries WHERE processed_at IS NULL — index dramatically speeds this up especially при large outbox.
+**Partial index на unprocessed events** — критически важен. Publisher делает `WHERE processed_at IS NULL` — обычный индекс покроет всю таблицу (миллионы строк), partial индекс — только неопубликованные (тысячи в моменте). Разница в производительности на большой outbox — десятки раз.
 
-Producer в service делает атомарную запись:
+**Producer в сервисе делает атомарную запись**:
+
 ```java
 @Service
 class OrderService {
@@ -91,14 +96,15 @@ class OrderService {
         outboxRepo.save(entry);
 
         return o;
-        // на commit — и Order, и OutboxEntry атомарно
+        // на commit — и Order, и OutboxEntry сохраняются атомарно
     }
 }
 ```
 
-Все в одной transaction. Если commit failed — оба откатились. Если commit прошёл — оба persisted. Никогда partial states.
+Всё в одной транзакции. Если commit упал — обе записи откатились. Если прошёл — обе persisted. Никогда не бывает частичного состояния.
 
-Publisher (polling) периодически reads unprocessed:
+**Publisher (polling)** периодически читает неопубликованные:
+
 ```java
 @Component
 class OutboxPublisher {
@@ -110,68 +116,76 @@ class OutboxPublisher {
     @Scheduled(fixedDelay = 500)
     @Transactional
     public void publish() {
-        List<OutboxEntry> pending = outboxRepo.findTop100ByProcessedAtIsNullOrderByCreatedAt();
+        List<OutboxEntry> pending = 
+            outboxRepo.findTop100ByProcessedAtIsNullOrderByCreatedAt();
+            
         for (OutboxEntry entry : pending) {
             try {
-                Object event = mapper.readValue(entry.getPayload(),
-                    Class.forName(entry.getEventType()));
-                template.send(entry.getAggregateType().toLowerCase() + "s",
-                    entry.getAggregateId(), event).get();
+                template.send(
+                    entry.getAggregateType().toLowerCase() + "s",
+                    entry.getAggregateId(),
+                    entry.getPayload()
+                ).get(5, TimeUnit.SECONDS);
+                
                 entry.setProcessedAt(Instant.now());
                 outboxRepo.save(entry);
             } catch (Exception e) {
-                log.error("Failed to publish outbox entry {}", entry.getId(), e);
-                // не отмечаем как processed → повторим следующий цикл
+                log.error("Не удалось опубликовать outbox {}", entry.getId(), e);
+                // не отмечаем как processed — повторим на следующей итерации
             }
         }
     }
 }
 ```
 
-Периодический fetch batch of unprocessed. Publish each. Mark processed. On failure — leave marked unprocessed, retry next iteration.
+Периодический fetch пачки неопубликованных, publish каждого, отметка processed. При ошибке — оставляем неотмеченным, следующий цикл повторит.
 
-Caveat — дубли возможны. Если publish прошёл к broker но processed_at не обновился (crash between operations) — следующий цикл опубликует снова. At-least-once delivery. Consumer must быть идемпотентен.
+**Важный caveat — дубли возможны**. Если publish в брокер прошёл, но `processed_at` не обновился (краш между операциями) — следующий цикл опубликует ещё раз. Это **at-least-once delivery**. Consumer обязательно должен быть идемпотентным.
 
-Batching через LIMIT 100. Prevents overwhelming publisher при massive outbox. Multiple iterations process backlog gradually.
+**Batching через LIMIT 100** предотвращает overwhelming publisher'а при массивной outbox. Множественные итерации постепенно обрабатывают backlog.
 
-Ordering. Ordered by created_at plus aggregate_id как partition key. Same aggregate events preserve order через partition. Different aggregates могут reorder что typically OK — different business entities independent.
+**Ordering**. Сортировка по `created_at`, `aggregate_id` как partition key в Kafka. События одной сущности сохраняют порядок через partition. События разных сущностей могут переупорядочиться — это обычно нормально, разные бизнес-сущности независимы.
 
-Retention. Outbox growing indefinitely не acceptable. Periodic cleanup:
+**Retention**. Неограниченный рост outbox неприемлем. Периодическая очистка:
+
 ```sql
 DELETE FROM outbox WHERE processed_at < now() - INTERVAL '7 days';
 ```
 
-Или partitioning по created_at, drop старых partition. More efficient для massive volumes.
+Либо партиционирование по `created_at` с dropping старых партиций — эффективнее для больших объёмов.
 
-## Debezium plus CDC alternative
+## Debezium и CDC — альтернатива polling'у
 
-Вместо polling — Change Data Capture (CDC) через Debezium. Reads database WAL directly, publishes changes to Kafka. Real-time propagation.
+Вместо периодического опроса — **Change Data Capture** через Debezium. Читает WAL PostgreSQL напрямую, публикует изменения в Kafka в реальном времени.
 
-Как работает. Debezium reads WAL PostgreSQL через logical replication. Every change (INSERT/UPDATE/DELETE) becomes event. Streamed to Kafka topics. Consumers read normally.
+**Как работает**. Debezium подключается к PostgreSQL через logical replication (нужен `wal_level=logical` и созданный replication slot). Каждое изменение (INSERT/UPDATE/DELETE) становится событием в Kafka. Consumers читают как обычно.
 
-Setup requires. wal_level=logical в PostgreSQL configuration. Replication slot created для Debezium. Debezium connector configured в Kafka Connect. Кто-то needs Kafka Connect infrastructure.
+**Setup требует**: `wal_level=logical` в конфигурации PostgreSQL; replication slot созданный для Debezium; Debezium connector сконфигурированный в Kafka Connect; кому-то надо поддерживать Kafka Connect infrastructure.
 
-Outbox с Debezium через specific SMT (Single Message Transform). Пишешь в outbox таблицу — Debezium automatically публикует. Готовый Outbox Event Router — reads outbox rows, publishes к topics based on aggregate_type.
+**Outbox с Debezium** — через специальный SMT (Single Message Transform) — **Outbox Event Router**. Пишешь в outbox-таблицу — Debezium автоматически публикует в топик, определяемый через `aggregate_type`. Custom publisher не нужен вовсе.
 
-Плюсы. Никакого polling — real-time propagation. Никакого custom publisher — Debezium handles. Ordering через partition key. Легко масштабировать.
+**Плюсы**: никакого polling — real-time propagation с задержкой в миллисекунды; никакого custom publisher — Debezium делает всё; ordering через partition key; легко масштабируется.
 
-Минусы. Требует Kafka Connect plus Debezium infrastructure. Настройка logical replication PostgreSQL. Ещё одна infra piece to manage.
+**Минусы**: требует Kafka Connect + Debezium infrastructure; настройка logical replication PostgreSQL; ещё один компонент, который надо мониторить и обновлять.
 
-Прямой CDC без outbox. Debezium читать напрямую бизнес-таблицы Orders, Payments — publishes changes.
+**Прямой CDC без outbox**. Можно натравить Debezium прямо на бизнес-таблицы (Orders, Payments) — публиковать все изменения. Против этого подхода:
 
-Против direct CDC. Broker получает implementation details таблиц — schema, все fields exposed. Coupling — изменение таблицы ломает consumers. Business semantic не clean — technical INSERT/UPDATE events instead of business events (OrderCreated, OrderCancelled).
+- Broker получает **implementation details таблиц** — вся схема, все колонки exposed.
+- Coupling — изменение таблицы ломает consumers.
+- Business semantic не clean — technical INSERT/UPDATE events вместо business events (OrderCreated, OrderCancelled).
 
-Outbox абстрагирует таблицы. Publishes business events (OrderCreated) not technical events (row inserted). Cleaner contract с consumers. Recommended approach когда Debezium chosen.
+**Outbox абстрагирует таблицы**. Публикует business events (`OrderCreated`), не technical events (row inserted в таблицу X). Чистый контракт с consumers. Правильный подход когда выбираешь Debezium.
 
-## Inbox pattern для consumer deduplication
+## Inbox pattern — дедупликация на стороне consumer
 
-Обратная сторона. Как consumer дедуплицирует retries?
+Обратная сторона задачи. Как consumer защищается от повторов?
 
-Producer публикует at-least-once. Consumer может получить сообщение несколько раз. Причины — retry после failure, rebalance triggering re-delivery, restart без committed offset.
+Producer публикует at-least-once (даже с outbox). Consumer может получить одно сообщение несколько раз. Причины: retry после сбоя, rebalance в consumer group триггерит re-delivery, рестарт без закоммиченного offset.
 
-If consumer. Пишет в БД — повторное processing = duplicate records. Вызывает external API — repeat call. Sends email — sends twice.
+Если consumer пишет в БД — повторная обработка = дубликат записи. Вызывает external API — повторный вызов. Отправляет email — email уходит дважды.
 
-Inbox pattern. Consumer maintains таблицу processed message IDs:
+**Inbox pattern**: consumer поддерживает таблицу processed message IDs:
+
 ```sql
 CREATE TABLE inbox (
     message_id TEXT PRIMARY KEY,
@@ -179,113 +193,123 @@ CREATE TABLE inbox (
 );
 ```
 
-Consumer logic:
+**Consumer logic**:
+
 ```java
 @Transactional
 public void handle(OrderCreatedEvent event) {
     if (inboxRepo.existsById(event.getMessageId())) {
-        log.debug("Skip duplicate {}", event.getMessageId());
+        log.debug("Пропускаем дубликат {}", event.getMessageId());
         return;
     }
     processOrder(event);
     inboxRepo.save(new InboxEntry(event.getMessageId()));
-    // на commit — и бизнес-действия, и inbox запись атомарно
+    // на commit — и бизнес-действия, и inbox запись атомарны
 }
 ```
 
-Проверка plus обработка plus запись в inbox — в одной transaction. Atomicity guaranteed by database. If crash between processing и inbox save — на retry checked против inbox, если не там — reprocess. Если saved — skip.
+Проверка + обработка + запись в inbox — в одной транзакции. Атомарность гарантируется базой. Если краш между обработкой и сохранением в inbox — при retry проверяем против inbox, если нет — reprocess. Если saved — skip.
 
-Уникальный messageId requirement. Producer должен генерировать unique ID на каждое сообщение (typically UUID). При retry — тот же messageId. Ensures deduplication работает.
+**Уникальный `messageId` — обязательное требование**. Producer должен генерировать unique ID на каждое сообщение (обычно UUID). При retry — тот же messageId. Иначе дедупликация не работает.
 
-В Kafka producer генерирует автоматически через record metadata. В RabbitMQ — устанавливать вручную через MessageProperties.setMessageId. Explicit control needed.
+В Kafka messageId можно генерировать явно в headers или брать связку `topic-partition-offset` как естественный уникальный ключ. В RabbitMQ — устанавливать вручную через `MessageProperties.setMessageId`. Явный контроль необходим.
 
-Retention inbox. Так же как outbox — periodic cleanup:
+**Retention для inbox**:
+
 ```sql
 DELETE FROM inbox WHERE processed_at < now() - INTERVAL '30 days';
 ```
 
-Ретеншн должен быть больше чем максимально possible time delay duplicate delivery. If Kafka retains 7 days, inbox needs 7+ days. Otherwise duplicate arrival after inbox cleanup — reprocessed as new.
+Retention должен быть **больше** чем максимально возможная задержка повторной доставки. Если Kafka retention 7 дней, inbox должен хранить минимум 7+ дней. Иначе повторное сообщение, пришедшее после cleanup inbox, будет обработано как новое.
 
-## Outbox plus Inbox equal effectively exactly-once
+## Outbox + Inbox = effectively exactly-once
 
-Combination обеспечивает end-to-end reliability:
+Комбинация обеспечивает end-to-end reliability:
+
 ```
-[Service A]                                [Service B]
+[Service A]                              [Service B]
     │                                          │
     │  @Transactional                          │
     │  save Order + save OutboxEntry           │
     │  commit                                  │
     │                                          │
-    │  ────────────────────────────►           │
     │  OutboxPublisher polls                   │
     │  publishes to Kafka                      │
     │                                          │
     │              Kafka                       │
     │              │                            │
     │              ▼                            │
-    │                                          │
-    │  ────────────────────────────►           │
     │                                        [Consumer]
     │                                          │
     │                                          │  @Transactional
     │                                          │  check inbox
-    │                                          │  if not exists:
+    │                                          │  если нет:
     │                                          │      process
     │                                          │      save inbox entry
     │                                          │  commit
 ```
 
-Result. Producer side atomic — БД plus publish (через outbox). Broker at-least-once — может дублировать. Consumer side inbox фильтрует дубли. End-to-end — effectively exactly-once.
+Итог. Producer-side атомарно — БД + publish (через outbox). Broker at-least-once — может дублировать. Consumer-side inbox фильтрует дубли. End-to-end — **effectively exactly-once**.
 
-Not true exactly-once в theoretical CS sense (impossible в distributed systems). But effectively — business observable semantics equivalent к exactly-once. Duplicates detected, ignored, business state consistent.
+Это не «true exactly-once» в теоретическом CS-смысле (математически невозможно в распределённых системах). Но с точки зрения бизнес-наблюдаемой семантики — эквивалентно exactly-once. Дубли обнаружены, проигнорированы, бизнес-состояние согласовано.
 
-## Broader idempotency approaches
+## Другие подходы к идемпотентности
 
-Inbox один specific approach. Другие также работают.
+Inbox — один конкретный подход. Другие тоже работают, каждый в своих сценариях.
 
-Идемпотентный UPDATE через conditional clause:
+**Идемпотентный UPDATE через conditional clause**:
+
 ```sql
-UPDATE orders SET status='PROCESSED' WHERE id=? AND status='NEW';
+UPDATE orders SET status='PROCESSED' 
+WHERE id=? AND status='NEW';
 -- rows affected = 0 → уже обработано
 -- rows affected = 1 → успех
 ```
 
-Работает если операция это state machine transition. Check current status перед update. Only affects if in expected precondition state. Repeat calls no-op after first success.
+Работает если операция — state machine transition. Проверяем текущий статус перед update. Затрагивает только если состояние соответствует ожидаемому precondition. Повторные вызовы после первого успеха — no-op.
 
-UPSERT для inserts:
+**UPSERT для inserts**:
+
 ```sql
 INSERT INTO users (id, email) VALUES (?, ?)
 ON CONFLICT (id) DO NOTHING;
 ```
 
-Or DO UPDATE SET email = EXCLUDED.email для upsert with update semantics. Second call с same ID не duplicates.
+Или `DO UPDATE SET email = EXCLUDED.email` для upsert с семантикой обновления. Второй вызов с тем же ID не создаёт дубликат.
 
-Optimistic version через version columns:
+**Optimistic version через version columns**:
+
 ```sql
 UPDATE orders SET status='X', version=version+1 
 WHERE id=? AND version=?;
 ```
 
-Не сработает если версия уже изменилась — кто-то опередил. Concurrent modification detection.
+Не сработает если версия уже изменилась — кто-то опередил. Обнаружение concurrent modification. Обычно используется в JPA через `@Version`.
 
-Idempotency-Key header для HTTP APIs. Client sends Idempotency-Key: unique-uuid header. Server:
-- Первый вызов с этим key → обрабатывает, сохраняет response.
-- Повторный вызов с тем же key → возвращает saved response.
+**Idempotency-Key header для HTTP API**. Клиент шлёт `Idempotency-Key: <unique-uuid>` в заголовке. Сервер:
 
-Используется Stripe API. Полезно для payments, POST operations. Client responsible для generating и tracking keys. Server maintains key-to-response mapping.
+- Первый вызов с этим ключом → обрабатывает запрос, сохраняет ответ.
+- Повторный вызов с тем же ключом → возвращает сохранённый ответ, не выполняя операцию повторно.
+
+Используется в Stripe API — обязательный паттерн для payment endpoints. Клиент отвечает за генерацию и tracking ключей. Сервер поддерживает key-to-response mapping (обычно с TTL 24 часа).
 
 ## Полная реализация в Spring
 
-Entity plus repository:
+**Entity + repository**:
+
 ```java
 @Entity
 @Table(name = "outbox")
 public class OutboxEntry {
-    @Id @GeneratedValue Long id;
+    @Id @GeneratedValue 
+    Long id;
     String aggregateType;
     String aggregateId;
     String eventType;
-    @Column(columnDefinition = "jsonb") String payload;
+    
+    @Column(columnDefinition = "jsonb") 
+    String payload;
+    
     Instant createdAt = Instant.now();
     Instant processedAt;
     // getters/setters
@@ -296,7 +320,8 @@ interface OutboxRepository extends JpaRepository<OutboxEntry, Long> {
 }
 ```
 
-Service использует:
+**Сервис использует**:
+
 ```java
 @Service
 class OrderService {
@@ -327,7 +352,8 @@ class OrderService {
 }
 ```
 
-Publisher scheduled job:
+**Publisher scheduled job**:
+
 ```java
 @Component
 @Slf4j
@@ -339,12 +365,13 @@ class OutboxPublisher {
     @Scheduled(fixedDelay = 500)
     @Transactional
     public void publish() {
-        List<OutboxEntry> pending = outboxRepo.findTop100ByProcessedAtIsNullOrderByCreatedAt();
+        List<OutboxEntry> pending = 
+            outboxRepo.findTop100ByProcessedAtIsNullOrderByCreatedAt();
 
         for (OutboxEntry entry : pending) {
             try {
                 template.send(
-                    entry.getAggregateType().toLowerCase() + "s",   // topic
+                    entry.getAggregateType().toLowerCase() + "s",   // топик
                     entry.getAggregateId(),                          // key
                     entry.getPayload()                                // JSON
                 ).get(5, TimeUnit.SECONDS);
@@ -352,7 +379,7 @@ class OutboxPublisher {
                 entry.setProcessedAt(Instant.now());
                 outboxRepo.save(entry);
             } catch (Exception e) {
-                log.error("Failed to publish outbox {}", entry.getId(), e);
+                log.error("Не удалось опубликовать outbox {}", entry.getId(), e);
                 // не отмечаем — следующий цикл повторит
             }
         }
@@ -360,13 +387,14 @@ class OutboxPublisher {
 }
 ```
 
-Send с timeout — avoids hanging publisher indefinitely если Kafka slow. Get result triggers actual send и waits synchronously. Failed sends leave records unprocessed для retry.
+Send с timeout — избегает подвисания publisher'а если Kafka медленная. `get()` дожидается фактической отправки синхронно, ошибка отправки бросает exception. Failed sends остаются неотмеченными для retry.
 
 ## ShedLock для multi-instance publisher
 
-Если приложение в K8s с 3 репликами — все 3 будут polling outbox → задвоение publications.
+Если приложение развёрнуто в K8s с 3 репликами — все 3 будут polling outbox → двойные (тройные) публикации. Consumer должен разбираться, но лучше не создавать проблему на producer side.
 
-ShedLock — distributed lock на scheduled jobs:
+**ShedLock** — distributed lock на scheduled jobs через shared БД:
+
 ```gradle
 implementation 'net.javacrumbs.shedlock:shedlock-spring:5.10.0'
 implementation 'net.javacrumbs.shedlock:shedlock-provider-jdbc-template:5.10.0'
@@ -374,33 +402,59 @@ implementation 'net.javacrumbs.shedlock:shedlock-provider-jdbc-template:5.10.0'
 
 ```java
 @Scheduled(fixedDelay = 500)
-@SchedulerLock(name = "OutboxPublisher_publish", 
-               lockAtLeastFor = "PT100MS", 
-               lockAtMostFor = "PT30S")
+@SchedulerLock(
+    name = "OutboxPublisher_publish", 
+    lockAtLeastFor = "PT100MS", 
+    lockAtMostFor = "PT30S"
+)
 public void publish() { ... }
 ```
 
-Только одна реплика будет выполнять в moment. Lock stored in shared database — все instances see same lock table.
+Только одна реплика будет выполнять job в конкретный момент. Lock хранится в shared таблице `shedlock` в БД — все instances видят одну и ту же lock-таблицу через optimistic INSERT/UPDATE.
 
-Реальный кейс из КНП memory knp-fno21-shedlock-stale-image-dup-regnum. Без ShedLock scheduled job лупился параллельно на всех репликах → duplicate INSERTs с same регистрационными номерами. Deploy с ShedLock решил проблему.
+`lockAtLeastFor` — минимальное время удержания lock (защита от clock skew). `lockAtMostFor` — максимальное (страховка если инстанс упал не сняв lock — через это время его освободят автоматически).
 
-## Realistic issues
+**Реальный кейс из КНП** (память `knp-fno21-shedlock-stale-image-dup-regnum`). Без ShedLock scheduled job лупился параллельно на всех репликах → дублирующиеся INSERT'ы с одинаковыми регистрационными номерами. Deploy с ShedLock решил проблему в течение часа.
 
-Outbox таблица растёт быстро. Periodic DELETE старых. Партиционирование по created_at (drop old partitions instantly). Мониторить размер.
+## Реальные проблемы прода
 
-Publisher lag. Если publisher медленный (many sends) → outbox копится → latency событий растёт. Increase scheduled frequency. Batch (multiple sends per iteration). Или Debezium вместо polling для higher throughput.
+**Outbox таблица растёт быстро**. При активной публикации — десятки тысяч записей в час. Без cleanup — гигабайты за неделю, индексы деградируют. Периодический DELETE старых обработанных или партиционирование по `created_at` с drop старых партиций. Мониторить размер таблицы отдельной метрикой.
 
-Ordering. Aggregate_id как partition key preserves ordering per business entity. Same order всё events в одной partition. Different orders могут reorder что usually OK — different aggregates independent.
+**Publisher lag**. Если publisher не успевает (много sends, Kafka медленная) → outbox копится → latency событий растёт. Симптом: growing `count(*) WHERE processed_at IS NULL`. Что делать: увеличить частоту scheduled (был 500ms → 100ms); увеличить batch size (100 → 500); распараллелить (несколько publisher'ов на разные partition ranges); или перейти на Debezium для higher throughput.
 
-Dead-letter. Если событие сериализовалось некорректно или consumer не может обработать. Outbox — пометить error_count, после N попыток — в DLT. Inbox consumer — DLT через error handler.
+**Ordering**. `aggregate_id` как partition key в Kafka сохраняет порядок per business entity. События одного Order всегда в одной partition, читаются в порядке отправки. События разных Order могут переупорядочиться — обычно нормально, они независимы.
 
-Schema evolution. События сохраняются в outbox. При изменении schema — старые события могут быть невалидны при десериализации.
+**Dead-letter обработка**. Если событие сериализовалось некорректно или consumer не может обработать даже после retry — нужен путь для этих сообщений. На стороне outbox — добавить колонку `error_count` и `last_error`, после N попыток перекладывать в DLT (dead-letter topic) или отдельную error-таблицу для ручного разбора. На стороне consumer — Spring Kafka ErrorHandler с DeadLetterPublishingRecoverer.
 
-Правила. Backward compatible изменения. Versioning в event payload. Consumer'ы handle multiple versions.
+**Schema evolution**. События сохраняются в outbox с текущей схемой. При изменении схемы события в БД могут стать невалидными при десериализации consumer'ом. Правила: только backward compatible изменения (добавление nullable полей — ок, удаление или переименование — нет). Versioning в payload (`schemaVersion: 2`). Consumer поддерживает несколько версий одновременно в течение переходного периода.
 
-## Alternatives Outbox
+## Диагностика в проде
 
-Chained saga без outbox. Просто transaction plus publish без outbox:
+Инцидент: consumer жалуется что не приходят события. Или наоборот — получает дубли.
+
+**События не приходят**. Первое — проверить outbox:
+
+```sql
+SELECT count(*) FROM outbox WHERE processed_at IS NULL;
+SELECT id, created_at, aggregate_type, event_type 
+FROM outbox 
+WHERE processed_at IS NULL 
+ORDER BY created_at 
+LIMIT 20;
+```
+
+Растёт `unprocessed`, самые старые — часы назад → publisher не работает или отстаёт. Проверить логи `OutboxPublisher` на ошибки Kafka. Проверить ShedLock: `SELECT * FROM shedlock WHERE name = 'OutboxPublisher_publish'` — не завис ли lock (`locked_until` в будущем далеко, но `locked_by` умерший инстанс).
+
+Если `unprocessed = 0` — publisher работает, значит проблема на стороне брокера или consumer'а. `kafka-consumer-groups.sh --describe --group my-group` покажет lag consumer group. Растущий lag — consumer тормозит или упал.
+
+**События дублируются**. Первое — проверить inbox consumer'а: он вообще проверяет messageId? Если да — проверить что messageId уникален (не берётся ли `Order.getId()` например, который может повториться в разных событиях жизненного цикла одного заказа). Правильный messageId — UUID именно на само сообщение, не на сущность.
+
+Если inbox работает — дубли идут в реальности из producer'а. Это ожидаемо от Outbox pattern (at-least-once), consumer обязан справляться.
+
+## Альтернативы Outbox и их ограничения
+
+**Простая цепочка без outbox**:
+
 ```java
 @Transactional
 public void createOrder(...) {
@@ -409,11 +463,12 @@ public void createOrder(...) {
 }
 ```
 
-Проблема. Если send выполнится, а tx откатится — фиктивное событие. Или наоборот. Даже с @TransactionalEventListener AFTER_COMMIT — если процесс упадёт между commit и send — потеря.
+Проблема: если `kafka.send()` выполнится, а транзакция откатится (например, из-за constraint violation в саму последнюю секунду) — фиктивное событие в брокере, orderа в БД нет. Или наоборот — send упал, tx закоммитилась — событие потеряно. Даже с `@TransactionalEventListener(AFTER_COMMIT)` — если процесс упадёт между commit и send, событие теряется.
 
-Outbox надёжнее в reliability perspective.
+Outbox надёжнее с точки зрения гарантий доставки.
 
-Kafka transactions. Kafka plus JPA в одной transaction:
+**Kafka transactions с JPA**:
+
 ```java
 @Transactional("kafkaTransactionManager")
 public void createOrder(...) {
@@ -422,50 +477,48 @@ public void createOrder(...) {
 }
 ```
 
-Проблема. kafkaTransactionManager управляет только Kafka. JPA — отдельно. Нельзя атомарно commit оба (без XA). ChainedTransactionManager (deprecated) best-effort, не гарантия.
+Проблема: `kafkaTransactionManager` управляет только транзакцией Kafka. JPA — отдельно. Нельзя атомарно закоммитить обе (без XA, которого нет в Kafka). `ChainedTransactionManager` (deprecated) — best-effort, не гарантия.
 
-Event Sourcing. Не хранишь текущее состояние, только события. Events — source of truth. Публикация automatically при append. Different architecture entirely. Complex — worthwhile только specific scenarios.
+**Event Sourcing**. Другой подход — не хранить текущее состояние, только события. События — source of truth. Публикация автоматически при append новых событий. Совсем другая архитектура, сложность значительно выше. Оправдан только в specific сценариях (audit-heavy домены, complex temporal queries).
 
 ## Best practices
 
-Outbox для guarantee «БД commit → event опубликуется». Fundamental reliability pattern для microservices publishing events.
+**Outbox для гарантии «БД commit → событие опубликуется»**. Фундаментальный reliability паттерн для микросервисов, публикующих события.
 
-Inbox / idempotency ключ для consumer. Complement to outbox — прevents duplicate processing on consumer side.
+**Inbox или другой idempotency-ключ для consumer**. Комплиментарен outbox — предотвращает дубли на стороне обработки.
 
-UUID as messageId. Universally unique identifiers ensure no collisions across sessions.
+**UUID как messageId**. Universally unique — никаких коллизий между сессиями и инстансами.
 
-Retention outbox / inbox таблиц. Prevent unbounded growth. Weekly или monthly cleanup schedules.
+**Retention outbox/inbox таблиц**. Предотвращает unbounded рост. Weekly или monthly cleanup schedules.
 
-ShedLock для publisher на multiple instances. Prevent parallel processing of same outbox records.
+**ShedLock для publisher на multiple instances**. Предотвращает параллельную обработку одних outbox-записей несколькими репликами.
 
-Debezium для real-time / high volume (вместо polling). Real-time propagation. But requires Kafka Connect infrastructure.
+**Debezium для real-time / high volume** — вместо polling. Real-time propagation, но требует Kafka Connect infrastructure.
 
-Aggregate ID как partition key — сохранение порядка per business entity.
+**Aggregate ID как partition key** — сохранение порядка per business entity.
 
-Мониторинг. Unprocessed outbox count — alert if grows sustainably. Inbox size — retention working. Publisher lag — freshness metric.
+**Мониторинг**: unprocessed outbox count (alert если растёт устойчиво); размер inbox (retention работает?); publisher lag (метрика свежести); ошибки publisher'а в логах.
 
-## Итоги
+## Заключение
 
-Outbox pattern решает атомарность «БД save plus event publish» через shifting problem. Event stored в БД в same transaction as business data. Separate publisher reads outbox — publishes к broker — marks processed.
+Outbox pattern решает атомарность «БД save + event publish» через перенос проблемы. Событие сохраняется в БД в той же транзакции что и бизнес-данные. Отдельный publisher читает outbox, публикует в брокер, отмечает как processed. Гарантия at-least-once (не exactly-once): publisher может послать дубли если крашнется после send но перед update `processed_at`.
 
-Гарантия at-least-once (не exactly-once). Publisher может послать дубли если crash после send но перед update processed_at.
+Debezium/CDC — real-time альтернатива polling'у. Читает WAL PostgreSQL напрямую. Требует Kafka Connect. Рекомендован для high-volume систем.
 
-Debezium/CDC — real-time alternative к polling. Reads WAL PostgreSQL. Requires Kafka Connect. Recommended для high volume.
+Inbox pattern для дедупликации на стороне consumer'а. Таблица с processed messageId. Проверка + обработка + запись в одной транзакции. Атомарность гарантирует отсутствие дублирующей обработки.
 
-Inbox pattern для consumer deduplication. Table processed message IDs. Check plus process plus save в one transaction. Atomicity guarantees no duplicate processing.
+Outbox + Inbox = **effectively exactly-once**. Не теоретически чистый, но бизнес-наблюдаемо эквивалентный.
 
-Outbox plus Inbox equal effectively exactly-once. Not theoretically pure but business observably equivalent.
+Идемпотентность обеспечивается через: уникальный messageId + inbox; conditional UPDATE (state machine transitions); UPSERT для inserts; optimistic version columns; Idempotency-Key HTTP header.
 
-Идемпотентность обеспечивается через. Уникальный messageId plus inbox. Conditional UPDATE (state machine transitions). UPSERT для inserts. Optimistic version columns. Idempotency-Key HTTP header.
+ShedLock для multi-instance publisher. Предотвращает параллельное выполнение job'ов через distributed lock. Реальный кейс `knp-fno21-shedlock-stale-image-dup-regnum` показал необходимость на практике.
 
-ShedLock для multi-instance publisher. Prevents parallel job execution через distributed lock. Реальный кейс knp-fno21-shedlock-stale-image-dup-regnum demonstrates необходимость.
+Retention обязательна — outbox/inbox расти вечно не могут. Delete старых или партиционирование для массивных объёмов.
 
-Retention необходима — outbox/inbox расти вечно не acceptable. Delete старых. Партиционирование для massive volumes.
+Мониторинг publisher lag критичен. Растущий lag = проблема с capacity, надо увеличивать частоту или переходить на Debezium.
 
-Publisher lag monitoring critical. Growing lag indicates capacity problem — increase frequency или switch к Debezium.
+Ordering сохраняется через aggregate_id как partition key.
 
-Ordering preserved through aggregate_id partition key.
+Альтернативы (chained saga без outbox, Kafka transactions с JPA, Event Sourcing) — либо ненадёжны, либо требуют совсем другой архитектуры.
 
-Alternatives — chained saga (unreliable), Kafka transactions с JPA (не работает без XA), Event Sourcing (complex, different architecture).
-
-Дальше — микросервисов resilience patterns comprehensively — Circuit Breaker, Retry, Bulkhead, Rate Limiting, Fallback.
+Дальше — паттерны resilience микросервисов: Circuit Breaker, Retry, Bulkhead, Rate Limiting, Fallback.
