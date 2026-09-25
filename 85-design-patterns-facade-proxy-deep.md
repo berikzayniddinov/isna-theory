@@ -1,115 +1,63 @@
-# 85. Design Patterns: Facade и Proxy — глубоко
+# 85. Facade и Proxy: два паттерна, на которых стоит Spring
 
-Файл про **два фундаментальных GoF-паттерна** и их реальное применение в Java/Spring: **Facade** (упрощение интерфейса к сложной подсистеме) и **Proxy** (представитель другого объекта). Углублённо: JDK Dynamic Proxy vs CGLIB vs ByteBuddy internals, self-invocation problem, реальные Spring-механизмы (@Transactional, @Async, @Cacheable, @PreAuthorize) все построены на Proxy.
+## Зачем это знать
 
-Связано с: `05-spring-framework-ioc-di.md`, `33-transactional-internals.md` (@Transactional через proxy), `34-transactional-advanced.md`, `60-spring-annotations-detailed.md` (@Async, @Cacheable), `67-gateway-detailed.md` (Gateway как proxy).
+Facade и Proxy — два из 23 GoF паттернов, но именно они настолько распространены в enterprise Java, что понимание их — не «академическое знание паттернов», а прямая эксплуатационная необходимость. Каждая аннотация Spring (`@Transactional`, `@Async`, `@Cacheable`, `@PreAuthorize`, `@Retryable`) работает через Proxy. Каждый `JdbcTemplate`, `RestTemplate`, `RabbitTemplate` — это Facade. Понимание этих двух паттернов даёт понимание того как Spring реально работает под капотом — и почему аннотация иногда не срабатывает, почему возникает `LazyInitializationException`, почему `@Transactional` на private методе игнорируется.
 
----
+Разница между «слышал про паттерны» и «понимаю их применение» — это способность за секунду ответить: почему `@Transactional` не работает при вызове `this.otherMethod()` внутри того же класса. Почему Spring Boot по умолчанию использует CGLIB, а не JDK Proxy. Что произойдёт если пометить `@Transactional` класс `final`. Почему для `@Cacheable` порядок важен относительно `@Transactional`. Каждый из этих вопросов — прямое применение знания механики proxy.
 
-## 0. Ментальная модель
+Разберём: ментальную модель — оба паттерна вводят «прослойку» между клиентом и объектом, но с разной целью (Facade упрощает, Proxy контролирует). Facade — мотивация, механика, JDK/Spring примеры (JdbcTemplate, RestTemplate), масштабирование на архитектуру (BFF, API Gateway), различия с Adapter/Mediator/Decorator, anti-pattern God Facade. Proxy — виды (virtual, protection, remote, smart), static vs dynamic. Глубоко: JDK Dynamic Proxy как работает (Proxy.newProxyInstance генерирует `$Proxy0`, кэширует, ограничения — только интерфейсы). CGLIB — bytecode manipulation через subclass, ограничения (не final, не private, не static). ByteBuddy как современная альтернатива. Spring AOP — как выбирает JDK vs CGLIB, механика `@Transactional` через `TransactionInterceptor`, self-invocation problem как классическая ловушка и четыре способа обойти. Прочие Spring-аннотации (`@Async`, `@Cacheable`, `@PreAuthorize`, `@Retryable`) — все proxy-based, порядок interceptor'ов важен. Разница Proxy vs Decorator (контроль доступа vs добавление функциональности, invisible vs client-composed). Практика: когда что использовать, какие ошибки типичны, как отлаживать.
 
-**Оба паттерна — про введение "прослойки"** между клиентом и настоящим объектом. Разница — **зачем**:
+Понятие абстракции как таковой — в 113. `@Transactional` внутренности — в 33. Spring аннотации — в 60. Здесь фокус на самих паттернах и их реализации.
 
-```
-Facade (упрощение):                    Proxy (управление доступом):
-                                       
-      Client                                 Client
-        │                                      │
-        ▼                                      ▼
-   ┌────────┐  ← простой интерфейс        ┌────────┐  ← ТОТ ЖЕ интерфейс
-   │ Facade │     скрывает сложность      │ Proxy  │     что и Real
-   └────┬───┘                             └────┬───┘
-        │                                      │
-   ┌────┼────┬────┐                            │  ← дополнительное поведение
-   ▼    ▼    ▼    ▼                            ▼     (auth, cache, log, tx)
-   Sub  Sub  Sub  Sub                       ┌────────┐
-   1    2    3    4                         │  Real  │
-                                            └────────┘
-```
+## Ментальная модель
 
-- **Facade** — новый **упрощённый** интерфейс, скрывающий N подсистем.
-- **Proxy** — **тот же** интерфейс, что и у real object, но с добавлением логики (cache, security, lazy load, remote).
+Оба паттерна вводят промежуточный объект между клиентом и настоящей реализацией. Отличаются целью и видимостью для клиента.
 
-Ключевое различие: клиент Facade **знает** что за фасадом много всего. Клиент Proxy — **не знает** что говорит с proxy, думает что напрямую с real object.
+**Facade** предоставляет новый упрощённый интерфейс к сложной подсистеме. Клиент **знает** что за фасадом много всего — просто не хочет с этим разбираться напрямую. Метод `orderFacade.placeOrder(...)` явно намекает «здесь сложная операция». Клиент не пишет `if (inventory.available()) { payment.charge(...); shipping.book(...); }` — он вызывает фасад, который координирует всё.
 
----
+**Proxy** имеет **тот же интерфейс** что и настоящий объект. Клиент **не знает** что говорит с proxy — думает что напрямую с real object. Прокси прозрачно вставляется в вызов и добавляет своё поведение (кэш, security, lazy loading, транзакция, удалённый вызов). `userService.findById(1L)` — клиент не в курсе что перед реальным `findById` был проверен cache, открыта транзакция и залогирован аудит.
 
-## 1. Facade — детально
+Ключевое различие: **Facade — про упрощение (видимо), Proxy — про контроль (невидимо)**. Клиент Facade знает что фасад скрывает сложность. Клиент Proxy думает что имеет дело с оригиналом.
 
-### 1.1 Мотивация
+## Facade: когда есть сложная подсистема
 
-Есть сложная подсистема: 5-10 классов, каждый с 10-30 методами. Клиент, чтобы сделать типовую операцию, должен:
-1. Знать какие классы вызывать.
-2. В правильном порядке.
-3. С правильными параметрами.
-4. Правильно обрабатывать промежуточные состояния.
-5. Правильно откатывать при ошибке.
+Мотивация проста. Есть подсистема — 5-10 классов, каждый со своим API. Типовая операция требует вызовов нескольких классов в правильном порядке, с правильной обработкой ошибок и compensation при частичных сбоях. Каждый клиент, желающий выполнить эту типовую операцию, вынужден повторять всю оркестрацию. Изменение подсистемы (добавили аудит, изменили порядок вызовов) — приходится править всех клиентов.
 
-Каждый клиент повторяет эту логику. Изменение подсистемы = изменение всех клиентов.
+Классический пример — обработка заказа. Без фасада контроллер знает про пять сервисов, все compensation flows, все edge cases:
 
-**Facade** — один класс с методом `doTypicalOperation(...)`, скрывающий всю сложность.
-
-### 1.2 Формальное определение (GoF)
-
-*Provide a unified interface to a set of interfaces in a subsystem. Facade defines a higher-level interface that makes the subsystem easier to use.*
-
-### 1.3 Классический пример — order processing
-
-**Без фасада**:
 ```java
-public class OrderController {
-    private InventoryService inventory;
-    private PaymentGateway payment;
-    private ShippingService shipping;
-    private NotificationService notification;
-    private AuditLog audit;
-
-    public OrderResult placeOrder(OrderRequest req) {
-        // 1. Проверить наличие
-        if (!inventory.hasStock(req.getItems())) {
-            return OrderResult.error("Out of stock");
+public OrderResult placeOrder(OrderRequest req) {
+    if (!inventory.hasStock(req.getItems())) return OrderResult.error("...");
+    ReservationId reservation = inventory.reserve(req.getItems());
+    try {
+        PaymentResult payResult = payment.charge(req.getUserId(), req.getTotalAmount());
+        if (!payResult.isSuccess()) {
+            inventory.releaseReservation(reservation);
+            return OrderResult.error("Payment failed");
         }
-        
-        // 2. Зарезервировать
-        ReservationId reservation = inventory.reserve(req.getItems());
-        
+        ShipmentId shipment;
         try {
-            // 3. Списать деньги
-            PaymentResult payResult = payment.charge(
-                req.getUserId(), req.getTotalAmount());
-            if (!payResult.isSuccess()) {
-                inventory.releaseReservation(reservation);
-                return OrderResult.error("Payment failed: " + payResult.getReason());
-            }
-            
-            // 4. Создать shipment
-            ShipmentId shipment;
-            try {
-                shipment = shipping.createShipment(req);
-            } catch (ShippingException e) {
-                payment.refund(payResult.getTransactionId());
-                inventory.releaseReservation(reservation);
-                throw e;
-            }
-            
-            // 5. Notify
-            notification.sendOrderConfirmation(req.getUserId(), shipment);
-            
-            // 6. Audit
-            audit.log("ORDER_PLACED", req.getUserId(), reservation, shipment);
-            
-            return OrderResult.success(shipment);
-        } catch (Exception e) {
-            audit.log("ORDER_FAILED", req.getUserId(), e.getMessage());
+            shipment = shipping.createShipment(req);
+        } catch (ShippingException e) {
+            payment.refund(payResult.getTransactionId());
+            inventory.releaseReservation(reservation);
             throw e;
         }
+        notification.sendOrderConfirmation(req.getUserId(), shipment);
+        audit.log("ORDER_PLACED", req.getUserId(), reservation, shipment);
+        return OrderResult.success(shipment);
+    } catch (Exception e) {
+        audit.log("ORDER_FAILED", req.getUserId(), e.getMessage());
+        throw e;
     }
 }
 ```
 
-100 строк в контроллере. Знает про 5 сервисов, все compensation flows, все ошибки. Копия в каждом месте где нужно `placeOrder`.
+Сто строк логики в контроллере. Копия в каждом месте где нужно `placeOrder` (другой endpoint, batch job, admin panel). Изменения (например, новый шаг — начисление бонусов) — править везде.
 
-**С фасадом**:
+С фасадом всё меняется. Вся оркестрация — в одном классе `OrderFacade`, контроллер тонкий:
+
 ```java
 @Service
 public class OrderFacade {
@@ -120,8 +68,7 @@ public class OrderFacade {
     private final AuditLog audit;
 
     public OrderResult placeOrder(OrderRequest req) {
-        // Вся сложная логика тут (одно место).
-        // ...
+        // вся сложная логика тут (одно место)
     }
 }
 
@@ -136,247 +83,118 @@ public class OrderController {
 }
 ```
 
-Контроллер тонкий. Facade инкапсулирует всё.
+Facade **не является членом подсистемы** — это отдельный класс, знающий про неё. Клиент **может** пользоваться и напрямую подсистемой, если нужен fine-grained control (например, административная панель, которой нужно резервирование без немедленной оплаты). Facade не запрещает прямой доступ, он **предлагает** удобный.
 
-### 1.4 UML
+## Facade в JDK и Spring
 
-```
-    ┌──────────┐
-    │  Client  │
-    └────┬─────┘
-         │
-         ▼
-    ┌──────────┐            ┌─── Subsystem ────┐
-    │  Facade  │────────►   │  ┌────────┐      │
-    │          │            │  │Inventory│      │
-    │+doA()    │            │  └────────┘      │
-    │+doB()    │            │  ┌────────┐      │
-    │+doC()    │──►────►    │  │Payment │      │
-    └──────────┘            │  └────────┘      │
-                            │  ┌────────┐      │
-                            │  │Shipping│      │
-                            │  └────────┘      │
-                            └──────────────────┘
-```
+Спринг-разработчик работает с фасадами постоянно, часто не задумываясь.
 
-Facade **не является членом подсистемы** — это отдельный класс, знающий про неё. Клиент **может** пользоваться и напрямую подсистемой, если нужен fine-grained control.
+**`java.net.URL`** — фасад над `URLConnection`, `HttpClient`, sockets, DNS resolver. `new URL("...").openStream()` — одна строка, за ней десяток классов и вся сетевая машинерия.
 
-### 1.5 Facade в JDK и Spring
+**`JOptionPane.showMessageDialog()`** — фасад над JDialog, JLabel, JButton, Frame, layout managers. Всё разложено на классы, но для типовой «покажи messagebox» одна статическая функция.
 
-Примеры где Facade **уже** применён:
-
-**`java.net.URL`** — фасад над `URLConnection`, `HttpClient`, `Sockets`, `DNS resolver`. `new URL("...").openStream()` — одна строка, за ней десяток классов.
-
-**`JOptionPane.showMessageDialog()`** — фасад над `JDialog`, `JLabel`, `JButton`, `Frame`, layout managers.
-
-**`javax.faces.context.FacesContext`** — фасад над JSF processing infrastructure.
-
-**Spring `JdbcTemplate`** — фасад над JDBC (Connection, Statement, ResultSet, ошибки, cleanup):
-```java
-// Без фасада (raw JDBC):
-try (Connection conn = ds.getConnection();
-     PreparedStatement ps = conn.prepareStatement("SELECT * FROM users WHERE id=?")) {
-    ps.setLong(1, id);
-    try (ResultSet rs = ps.executeQuery()) {
-        if (rs.next()) {
-            return mapUser(rs);
-        }
-        return null;
-    }
-} catch (SQLException e) {
-    throw new DataAccessException(e);
-}
-
-// С JdbcTemplate:
-User u = jdbc.queryForObject("SELECT * FROM users WHERE id=?", 
-    userRowMapper, id);
-```
-
-**Spring `RestTemplate` / `WebClient`** — фасад над HTTP-клиентом.
-
-**Spring `RabbitTemplate` / `KafkaTemplate`** — фасад над messaging.
-
-**Spring `TransactionTemplate`** — фасад над PlatformTransactionManager.
-
-Все шаблоны Spring "*Template" — это по сути **Facade + Template Method**.
-
-### 1.6 Facade в микросервисах — BFF и API Gateway
-
-Идея масштабируется на уровень системы:
-
-**Backend for Frontend (BFF)** — микросервис-facade перед N доменными сервисами. Каждому UI (mobile app, web, admin panel) — свой BFF, aggregating нужные ему данные.
-
-```
-                     ┌─── mobile BFF ───┐
-Mobile app ────────► │  aggregates:      │────► User Service
-                     │  - User info      │────► Order Service  
-                     │  - Recent orders  │────► Notification
-                     │  - Notifications  │
-                     └───────────────────┘
-
-                     ┌─── admin BFF ────┐
-Admin panel ──────►  │  aggregates:      │────► User Service
-                     │  - Full user data │────► Audit Log
-                     │  - Audit log      │────► Metrics
-                     │  - Metrics        │
-                     └───────────────────┘
-```
-
-**API Gateway** (nginx, Kong, Spring Cloud Gateway) — сетевой facade перед всеми backend'ами. Единая точка входа, TLS, аутентификация, rate limiting, routing.
-
-Отличие BFF от Gateway:
-- Gateway — тонкий: routing, cross-cutting concerns (auth, rate limit).
-- BFF — толстый: содержит бизнес-агрегацию для конкретного клиента.
-
-В КНП: `isnaknpgateway` — Gateway (Spring Cloud Gateway или nginx-based).
-
-### 1.7 Facade vs Adapter — важное различие
-
-Часто путают на собесе.
-
-**Adapter** — делает **несовместимое совместимым**. У нас есть класс с интерфейсом X, а клиент ожидает интерфейс Y. Adapter — обёртка, конвертирующая X → Y.
+**Spring `JdbcTemplate`** — фасад над JDBC (Connection, Statement, ResultSet, обработка ошибок, cleanup). Raw JDBC требует правильно управлять всеми ресурсами через try-with-resources, конвертировать SQLException в понятные типы, mapping'и. JdbcTemplate прячет всё это:
 
 ```java
-// Third-party класс (не можем менять):
+User u = jdbc.queryForObject(
+    "SELECT * FROM users WHERE id=?", 
+    userRowMapper, id
+);
+```
+
+Против raw JDBC в 15 строк с открытием/закрытием connection, prepared statement, result set. Одинаковая работа, разная эргономика.
+
+**Spring `RestTemplate` / `WebClient`** — фасад над HTTP-клиентом. Спрятаны connection pooling, timeouts, error handling, serialization.
+
+**Spring `RabbitTemplate` / `KafkaTemplate`** — фасад над messaging (channels, connections, acknowledgments, retries).
+
+**Spring `TransactionTemplate`** — фасад над `PlatformTransactionManager` для программного управления транзакциями.
+
+Общий паттерн: все шаблоны Spring `*Template` — это **Facade + Template Method**. Скелет операции фиксирован (Template Method), доступ упрощён (Facade).
+
+## Facade в микросервисах: BFF и API Gateway
+
+Идея масштабируется на уровень системы.
+
+**Backend for Frontend (BFF)** — микросервис-фасад перед N доменными сервисами. Каждому UI (мобильное приложение, веб, админ-панель) — свой BFF, агрегирующий нужные ему данные из нескольких сервисов. Мобильному приложению нужен user info + recent orders + notifications в одном запросе — вместо трёх вызовов из клиента, один вызов в BFF, который сам делает три параллельных запроса к доменным сервисам и собирает ответ.
+
+**API Gateway** (nginx, Kong, Spring Cloud Gateway) — сетевой фасад перед всеми backend'ами. Единая точка входа, TLS termination, аутентификация, rate limiting, routing.
+
+Отличие BFF от Gateway. Gateway тонкий — только cross-cutting concerns (auth, rate limit, routing). BFF толстый — содержит бизнес-агрегацию для конкретного клиента.
+
+В КНП: `isnaknpgateway` — Gateway (Spring Cloud Gateway или nginx-based), тонкий сетевой фасад.
+
+## Facade против Adapter, Mediator, Decorator
+
+Эти паттерны часто путают на собеседовании, разница принципиальна.
+
+**Adapter** делает **несовместимое совместимым**. Есть класс с интерфейсом X, клиент ожидает интерфейс Y. Adapter — обёртка, конвертирующая X → Y.
+
+```java
 class LegacyLogger {
-    void writeMessage(String severity, String message) { /* ... */ }
+    void writeMessage(String severity, String message) { }
 }
 
-// Наш интерфейс:
 interface Logger {
     void info(String msg);
     void error(String msg);
 }
 
-// Adapter:
 class LegacyLoggerAdapter implements Logger {
     private final LegacyLogger legacy;
-    
     public void info(String msg) { legacy.writeMessage("INFO", msg); }
     public void error(String msg) { legacy.writeMessage("ERROR", msg); }
 }
 ```
 
-**Facade** — **упрощает** уже совместимое. У нас есть подсистема с валидным API, но сложным. Facade — не адаптирует, а объединяет.
+Adapter меняет форму интерфейса (1-to-1). Facade объединяет N сервисов за одним упрощённым API (N-to-1). Adapter говорит «переведи с языка X на Y». Facade говорит «делай сложные вещи одной командой».
 
-Ключевое:
-- Adapter меняет форму интерфейса (не количество).
-- Facade **скрывает N интерфейсов за одним** упрощённым (меняет количество и уровень).
+**Mediator** координирует **peer-to-peer** взаимодействие между **равными** участниками. Никто не главный, mediator в центре. Пример: чат-комната — каждый пользователь пишет в комнату, комната рассылает всем. Facade **однонаправленный** — клиент вызывает фасад, фасад вызывает подсистему. Клиент **выше** уровнем чем подсистема. Mediator — про decoupling peers, Facade — про упрощение доступа.
 
-Adapter говорит: «переведи с языка X на язык Y».  
-Facade говорит: «делай сложные вещи одной командой».
+**Decorator** — про добавление ответственности, а не упрощение. Оба паттерна оборачивают, но Decorator сохраняет тот же интерфейс что и wrapped, Facade имеет свой уникальный. Разбор Decorator подробнее ниже, в контексте сравнения с Proxy.
 
-### 1.8 Facade vs Mediator
+## Anti-pattern: God Facade
 
-**Mediator** — координирует **peer-to-peer** взаимодействие между **равными** участниками. Никто не главный, mediator в центре. Пример: чат-комната — каждый пользователь пишет в комнату, комната рассылает всем.
+Опасность фасада — он становится «God object» с 30 методами, знающий всё про всю систему.
 
-**Facade** — **однонаправленный** доступ клиента к подсистеме. Клиент → facade → subsystem. Клиент **выше** уровнем чем подсистема.
+Признаки: 500+ строк в фасаде, множественные несвязанные операции в одном классе (`placeOrder`, `updateUserProfile`, `generateReport`), все запросы приложения идут через один фасад, тесты с десятками mock'ов.
 
-Mediator — про decoupling peers. Facade — про упрощение доступа.
+Fix — разделить по доменам: `OrderFacade`, `UserFacade`, `ReportFacade`. Внутри фасада делегировать бизнес-логику **application services** (в терминах DDD). Facade — только orchestration, не бизнес-правила. Расчёт скидки не в фасаде, а в `DiscountService`, к которому фасад обращается.
 
-### 1.9 Facade vs Decorator
+Правило: начинай без фасада, добавляй когда чувствуешь боль. Facade — рефакторинг, не изначальный дизайн.
 
-Про Decorator подробнее в §2 (сравнение с Proxy). Кратко: Decorator сохраняет тот же интерфейс что и wrapped. Facade имеет свой уникальный интерфейс.
+## Facade: когда не использовать
 
-### 1.10 Anti-pattern: God Facade
+Подсистема из 2-3 методов — прямой вызов проще, фасад — overhead. Клиент реально нуждается в fine-grained control (например, performance-critical low-level DB access, где JdbcTemplate добавляет неприемлемый overhead). Фасад добавляет indirection без упрощения — просто forwarder методов один-в-один.
 
-Опасность: facade становится "God object" — толстый класс с 30 методами и знанием всей системы.
+## Proxy: контроль доступа к объекту
 
-Признаки:
-- 500+ строк в facade.
-- Множественные несвязанные операции в одном классе.
-- Все запросы идут через один facade.
-- Тесты facade огромные, с 10 mocks.
+Мотивация Proxy — есть объект, к которому нужно контролировать доступ. Причины разнообразны:
 
-Fix:
-- Разделить по доменам: `OrderFacade`, `UserFacade`, `ReportFacade`.
-- Внутри facade делегировать бизнес-логику **приложенческим сервисам** (application services в DDD).
-- Facade — только orchestration, не бизнес-правила.
-
-### 1.11 Тесты Facade
-
-Facade — orchestration → тесты интеграционные (mock подсистем):
-
-```java
-@ExtendWith(MockitoExtension.class)
-class OrderFacadeTest {
-    @Mock InventoryService inventory;
-    @Mock PaymentGateway payment;
-    @Mock ShippingService shipping;
-    @Mock NotificationService notification;
-    @Mock AuditLog audit;
-    
-    @InjectMocks OrderFacade facade;
-    
-    @Test
-    void placeOrder_success_callsAllSubsystems() {
-        when(inventory.hasStock(any())).thenReturn(true);
-        when(inventory.reserve(any())).thenReturn(new ReservationId(1L));
-        when(payment.charge(any(), any())).thenReturn(PaymentResult.success("txn-1"));
-        when(shipping.createShipment(any())).thenReturn(new ShipmentId(2L));
-        
-        OrderResult result = facade.placeOrder(request);
-        
-        assertTrue(result.isSuccess());
-        verify(notification).sendOrderConfirmation(any(), any());
-        verify(audit).log(eq("ORDER_PLACED"), any(), any(), any());
-    }
-    
-    @Test
-    void placeOrder_paymentFails_releasesReservation() {
-        when(inventory.hasStock(any())).thenReturn(true);
-        when(inventory.reserve(any())).thenReturn(new ReservationId(1L));
-        when(payment.charge(any(), any())).thenReturn(PaymentResult.failed("insufficient funds"));
-        
-        OrderResult result = facade.placeOrder(request);
-        
-        assertFalse(result.isSuccess());
-        verify(inventory).releaseReservation(any());   // rollback
-        verify(shipping, never()).createShipment(any());
-    }
-}
-```
-
-Тесты verify правильный orchestration flow, включая compensation actions.
-
-### 1.12 Когда НЕ использовать Facade
-
-- Подсистема из 2-3 методов — прямой вызов проще, facade — overhead.
-- Клиент ДЕЙСТВИТЕЛЬНО нуждается в fine-grained control (например performance-critical low-level DB access).
-- Facade добавляет indirection без упрощения (просто forwarder).
-
-Правило: **начинай без facade, добавляй когда чувствуешь боль**. Facade — рефакторинг, не изначальный дизайн.
-
----
-
-## 2. Proxy — детально
-
-### 2.1 Мотивация
-
-Есть объект, к которому нужно контролировать доступ. Причины:
 1. **Ленивая инициализация** — real object дорого создавать, откладываем до первого использования.
 2. **Контроль доступа** — auth check перед вызовом.
 3. **Логирование / audit** — записать что кто вызвал.
-4. **Кэширование** — вернуть кэш если есть, иначе вызвать real object.
+4. **Кэширование** — вернуть cached если есть, иначе позвать real.
 5. **Транзакции** — открыть/закрыть транзакцию вокруг метода.
 6. **Remote invocation** — real object на другой машине, proxy общается по сети.
 7. **Reference counting / smart pointer** — вести счётчик использований.
 8. **Read/write разделение** — proxy шлёт reads на реплику, writes на master.
 
-Общая идея: **proxy имеет тот же интерфейс что real object**, но добавляет поведение.
+Общая идея: **proxy имеет тот же интерфейс что real object**, но добавляет поведение. Клиент вызывает proxy думая что общается с настоящим объектом.
 
-### 2.2 Формальное определение (GoF)
+Формальное определение GoF: *Provide a surrogate or placeholder for another object to control access to it*.
 
-*Provide a surrogate or placeholder for another object to control access to it.*
+## Виды Proxy
 
-### 2.3 Виды Proxy
+Классификация по цели контроля.
 
-**Virtual Proxy** — ленивое создание. Пока никто не вызвал реальную операцию — real object не существует.
+**Virtual Proxy** — ленивое создание. Пока никто не вызвал реальную операцию — real object не существует. Экономит ресурсы если объект дорогой, но не всегда используется.
+
 ```java
 class ImageProxy implements Image {
     private final String filename;
     private RealImage realImage;   // lazy
-    
+
     public void display() {
         if (realImage == null) {
             realImage = new RealImage(filename);   // expensive: reads file
@@ -386,9 +204,10 @@ class ImageProxy implements Image {
 }
 ```
 
-Hibernate lazy loading — virtual proxy. Пока не обратился к полю связанной entity — real query не выполнен. `user.getOrders().size()` триггерит SQL SELECT.
+Hibernate lazy loading — классический virtual proxy. `@ManyToOne(fetch = FetchType.LAZY)` возвращает не User, а proxy. Пока не обратился к полю (`user.getName()`) — реальный SELECT не выполнен. Минус — доступ вне scope сессии (после `session.close()`) → `LazyInitializationException`, потому что proxy пытается сделать query а session уже закрыт.
 
-**Protection Proxy** — контроль доступа по правам.
+**Protection Proxy** — контроль доступа по правам. Проверяет authorization перед делегированием.
+
 ```java
 class SecureBankAccount implements BankAccount {
     private final BankAccount real;
@@ -396,18 +215,19 @@ class SecureBankAccount implements BankAccount {
     
     public void transfer(long amount, String to) {
         if (!currentUser.hasRole("ADMIN") && amount > 10000) {
-            throw new SecurityException("Large transfer requires admin role");
+            throw new SecurityException("Large transfer requires admin");
         }
         real.transfer(amount, to);
     }
 }
 ```
 
-Spring Security `@PreAuthorize` — protection proxy.
+Spring Security `@PreAuthorize` — protection proxy. Читает `Authentication` из `SecurityContext`, evaluates SpEL expression, при false бросает `AccessDeniedException`.
 
-**Remote Proxy** — real object на другой машине. Proxy общается по сети.
+**Remote Proxy** — real object на другой машине. Proxy сериализует args, шлёт по сети, десериализует response.
+
 ```java
-class UserServiceStub implements UserService {   // Feign / gRPC-generated
+class UserServiceStub implements UserService {   // Feign / gRPC generated
     public User getUser(Long id) {
         HttpResponse resp = httpClient.get("http://user-service/users/" + id);
         return jackson.readValue(resp.body(), User.class);
@@ -415,9 +235,10 @@ class UserServiceStub implements UserService {   // Feign / gRPC-generated
 }
 ```
 
-Feign, gRPC stubs, RMI, EJB remote — remote proxy.
+Feign clients, gRPC stubs, RMI, EJB remote — всё remote proxy. Клиент `@Autowired UserServiceClient` не подозревает что под капотом HTTP.
 
-**Smart Proxy** — доп. поведение при доступе: reference counting, caching, logging, metrics.
+**Smart Proxy** — дополнительное поведение: reference counting, кэширование, логирование, метрики.
+
 ```java
 class CachingUserServiceProxy implements UserService {
     private final UserService real;
@@ -429,111 +250,29 @@ class CachingUserServiceProxy implements UserService {
 }
 ```
 
-Spring `@Cacheable` — smart proxy.
+Spring `@Cacheable` — smart proxy. `Collections.synchronizedList(list)` — тоже smart proxy (synchronization).
 
-**Copy-on-Write Proxy** — real object shared, proxy делает копию только при modification. Optimize memory.
+Есть ещё редкие варианты: **Copy-on-Write Proxy** (real object shared, proxy делает копию только при modification для оптимизации памяти), **Firewall Proxy** (network-level protection), **Synchronization Proxy** (thread-safe wrapper).
 
-**Firewall Proxy** — protection от external attacks (network level).
+## Static vs Dynamic Proxy
 
-**Synchronization Proxy** — thread-safe wrapper над non-thread-safe object. `Collections.synchronizedList(list)` — этот паттерн.
+**Static Proxy** — пишешь proxy-класс руками. Как все примеры выше. Явно видно что происходит, compile-time type safety, легко отлаживать. Минус — boilerplate: N методов интерфейса × 2-3 строки delegate каждый. Изменил интерфейс — правь proxy. Не работает для универсального case («любой сервис с @Transactional»).
 
-### 2.4 Классический пример — Virtual Proxy
+**Dynamic Proxy** — класс proxy создаётся на лету (в runtime или compile-time через bytecode manipulation). Обрабатывает **любой** метод через центральный `InvocationHandler` / `MethodInterceptor`. Не надо писать boilerplate — интерфейс и логика interceptor'а достаточно.
 
-```java
-interface Image {
-    void display();
-}
+Две основные реализации в Java: **JDK Dynamic Proxy** (`java.lang.reflect.Proxy`) — только для интерфейсов, встроен в JDK. **CGLIB** — bytecode manipulation, работает с классами через наследование. Spring использует обе для AOP, `@Transactional`, `@Async`, `@Cacheable`, `@PreAuthorize`.
 
-class RealImage implements Image {
-    private final String filename;
-    
-    public RealImage(String filename) {
-        this.filename = filename;
-        loadFromDisk();   // expensive
-    }
-    
-    private void loadFromDisk() {
-        System.out.println("Loading " + filename);
-        // 500 ms disk read
-    }
-    
-    public void display() {
-        System.out.println("Displaying " + filename);
-    }
-}
+## JDK Dynamic Proxy изнутри
 
-class ImageProxy implements Image {
-    private final String filename;
-    private RealImage realImage;
-    
-    public ImageProxy(String filename) {
-        this.filename = filename;
-        // Ничего не загружаем!
-    }
-    
-    public void display() {
-        if (realImage == null) {
-            realImage = new RealImage(filename);
-        }
-        realImage.display();
-    }
-}
-
-// Использование
-Image img = new ImageProxy("photo.jpg");   // instant
-// ... user не открыл вкладку ...
-// realImage не создан, память экономится
-img.display();   // теперь загружаем
-```
-
-Клиент **не знает** что говорит с proxy. Интерфейс `Image` тот же.
-
----
-
-## 3. Static vs Dynamic Proxy
-
-### 3.1 Static Proxy
-
-Пишешь proxy-класс руками (как выше `ImageProxy`, `CachingUserServiceProxy`).
-
-**Плюсы**:
-- Явно видно что происходит.
-- Compile-time type safety.
-- Легко отлаживать.
-
-**Минусы**:
-- Boilerplate: N методов интерфейса × 2-3 строки delegate каждый.
-- Изменяется интерфейс → надо править proxy.
-- Не работает для универсального case (например, "любой сервис под @Transactional").
-
-### 3.2 Dynamic Proxy
-
-Класс proxy создаётся **на лету** (в runtime или compile-time через bytecode manipulation). Обрабатывает **любой** метод через central `InvocationHandler` / `MethodInterceptor`.
-
-Две реализации в Java:
-- **JDK Dynamic Proxy** (`java.lang.reflect.Proxy`) — только для интерфейсов.
-- **CGLIB** — bytecode manipulation, работает с классами (наследование).
-
-Spring использует их для AOP, @Transactional, @Async, @Cacheable, @PreAuthorize.
-
----
-
-## 4. JDK Dynamic Proxy — как работает изнутри
-
-### 4.1 API
+API прост:
 
 ```java
 Object proxy = Proxy.newProxyInstance(
-    classLoader,                    // где загрузить сгенерированный класс
-    new Class<?>[]{MyInterface.class},   // какие интерфейсы реализовать
-    new InvocationHandler() {
-        @Override
-        public Object invoke(Object proxy, Method method, Object[] args) 
-                throws Throwable {
-            // Тут любая логика ДО, ПОСЛЕ, ВОКРУГ.
-            System.out.println("Called: " + method.getName());
-            return method.invoke(realObject, args);   // сам вызов real
-        }
+    classLoader,
+    new Class<?>[]{MyInterface.class},
+    (proxy, method, args) -> {
+        // ДО, ПОСЛЕ, ВОКРУГ
+        return method.invoke(realObject, args);
     }
 );
 
@@ -541,34 +280,25 @@ MyInterface p = (MyInterface) proxy;
 p.doSomething();
 ```
 
-### 4.2 Что происходит внутри
+Что делает JDK при первом вызове `Proxy.newProxyInstance()` для данной комбинации интерфейсов:
 
-JDK при первом вызове `Proxy.newProxyInstance(...)` для данной комбинации interfaces:
-
-1. **Генерирует bytecode** класса `$Proxy0` (или следующий номер), который:
-   - `implements` все указанные интерфейсы.
-   - Extends `java.lang.reflect.Proxy`.
-   - Для каждого метода интерфейса — реализация, которая вызывает `handler.invoke(this, method, args)`.
-2. **Cache** класса в `ProxyGenerator` — второй раз для тех же интерфейсов используется тот же класс.
-3. **Загружает** через указанный `ClassLoader`.
+1. **Генерирует bytecode** класса `$Proxy0` (или следующий номер), который implements все указанные интерфейсы, extends `java.lang.reflect.Proxy`, для каждого метода интерфейса имеет реализацию вызывающую `handler.invoke(this, method, args)`.
+2. **Кэширует** класса в `ProxyGenerator` — второй раз для тех же интерфейсов используется тот же класс.
+3. **Загружает** через указанный ClassLoader.
 4. **Instantiates** proxy object.
 
-Сгенерированный класс (упрощённо):
+Сгенерированный класс выглядит примерно так:
+
 ```java
 public final class $Proxy0 extends Proxy implements MyInterface {
     private static Method m_doSomething;
-    private static Method m_hashCode;
-    private static Method m_equals;
-    private static Method m_toString;
+    // ...
     
     static {
         m_doSomething = MyInterface.class.getMethod("doSomething");
-        // ...
     }
     
-    public $Proxy0(InvocationHandler h) {
-        super(h);
-    }
+    public $Proxy0(InvocationHandler h) { super(h); }
     
     @Override
     public void doSomething() {
@@ -578,33 +308,15 @@ public final class $Proxy0 extends Proxy implements MyInterface {
             throw new UndeclaredThrowableException(t);
         }
     }
-    
     // hashCode, equals, toString тоже delegated в handler
 }
 ```
 
-Смотреть сгенерированные классы:
-```
--Djdk.proxy.ProxyGenerator.saveGeneratedFiles=true
-```
+Посмотреть сгенерированные классы можно через `-Djdk.proxy.ProxyGenerator.saveGeneratedFiles=true` — сохранит `$Proxy0.class` в текущей директории.
 
-Сохранит `$Proxy0.class` в текущей директории. Открой в javap — увидишь.
+Плюсы JDK Proxy: встроен в JDK, нет зависимостей. Быстрая генерация класса. Простая ментальная модель — proxy implements interface. Минусы: **только для интерфейсов**. Если у тебя `class UserService` без интерфейса — JDK proxy не сработает. Reflection overhead на `method.invoke()` (значительно меньше в JDK 9+, но всё ещё дороже direct call).
 
-### 4.3 Плюсы JDK Proxy
-
-- **Встроен в JDK** — нет зависимостей.
-- **Быстрая генерация** класса.
-- **Простой mental model** — proxy implements interface.
-
-### 4.4 Минусы JDK Proxy
-
-- **Только для интерфейсов!** Если у тебя `class UserService` (без интерфейса) — JDK proxy не сработает.
-- Reflection overhead на `method.invoke()` (значительно меньше в JDK 9+, но всё ещё дороже direct call).
-- Все методы интерфейса — final в proxy (нельзя частично override).
-
-### 4.5 Ограничения — важно на собесе
-
-Работает **только с методами объявленными в интерфейсе**. Если class implements MyInterface + добавляет public method — proxy имеет только методы из MyInterface.
+**Ключевое ограничение**: работает только с методами объявленными в интерфейсе. Если class implements MyInterface + добавляет public method не из интерфейса — proxy имеет только методы из MyInterface:
 
 ```java
 interface UserService {
@@ -612,49 +324,37 @@ interface UserService {
 }
 
 class UserServiceImpl implements UserService {
-    public User findById(Long id) { /* ... */ }
-    public User findByEmail(String email) { /* ... */ }   // не в интерфейсе!
+    public User findById(Long id) { ... }
+    public User findByEmail(String email) { ... }   // не в интерфейсе!
 }
 
 UserService proxy = (UserService) Proxy.newProxyInstance(...);
-proxy.findById(1L);         // ✅ ok
-((UserServiceImpl) proxy).findByEmail("...");   // ❌ ClassCastException! Proxy НЕ instanceof UserServiceImpl
+proxy.findById(1L);         // ok
+((UserServiceImpl) proxy).findByEmail("...");   // ClassCastException!
+// Proxy НЕ instanceof UserServiceImpl
 ```
 
----
+## CGLIB: bytecode generation через subclass
 
-## 5. CGLIB — bytecode generation
-
-### 5.1 Мотивация
-
-Что если класс **не имеет интерфейса**? JDK proxy бесполезен. Тут CGLIB.
-
-**CGLIB** (Code Generation Library) — генерирует **subclass** нашего класса, overriding методы через `MethodInterceptor`.
-
-### 5.2 API
+Что если класс не имеет интерфейса? JDK proxy бесполезен. Тут появляется CGLIB (Code Generation Library) — генерирует **subclass** твоего класса, overriding методы через `MethodInterceptor`.
 
 ```java
 Enhancer enhancer = new Enhancer();
-enhancer.setSuperclass(UserService.class);   // наследуем
-enhancer.setCallback(new MethodInterceptor() {
-    @Override
-    public Object intercept(Object obj, Method method, Object[] args, 
-                            MethodProxy proxy) throws Throwable {
-        System.out.println("Called: " + method.getName());
-        return proxy.invokeSuper(obj, args);   // вызов оригинального метода
-    }
+enhancer.setSuperclass(UserService.class);
+enhancer.setCallback((MethodInterceptor) (obj, method, args, methodProxy) -> {
+    System.out.println("Called: " + method.getName());
+    return methodProxy.invokeSuper(obj, args);
 });
 UserService proxy = (UserService) enhancer.create();
 ```
 
-### 5.3 Что генерируется
-
-CGLIB создаёт класс `UserService$$EnhancerByCGLIB$$abc123` который:
-- Extends `UserService`.
+CGLIB создаёт класс типа `UserService$$EnhancerByCGLIB$$abc123`:
+- Extends UserService.
 - Overrides каждый non-final public method.
-- Каждый override делегирует в `MethodInterceptor`.
+- Каждый override делегирует в MethodInterceptor.
 
 Схематично:
+
 ```java
 public class UserService$$EnhancerByCGLIB extends UserService {
     private MethodInterceptor interceptor;
@@ -662,54 +362,37 @@ public class UserService$$EnhancerByCGLIB extends UserService {
     @Override
     public User findById(Long id) {
         return (User) interceptor.intercept(this, 
-            /* Method obj */, new Object[]{id}, 
-            /* MethodProxy */);
+            /* Method obj */, new Object[]{id}, /* MethodProxy */);
     }
-    
     // ... все другие public methods
 }
 ```
 
-`MethodProxy.invokeSuper()` — вызывает `super.findById(id)` через быстрый bypass (сгенерированный FastClass, не reflection).
+`MethodProxy.invokeSuper()` вызывает `super.findById(id)` через быстрый bypass (сгенерированный FastClass, не reflection) — CGLIB быстрее JDK Proxy на hot path.
 
-### 5.4 Плюсы CGLIB
+Плюсы CGLIB: работает без интерфейса. Быстрее JDK Proxy для method invocation. Более гибкий (перехват hashCode, equals, toString раздельно).
 
-- **Работает без интерфейса**.
-- **Быстрее JDK Proxy** для method invocation (нет reflection на hot path).
-- Более гибкий (можно перехватывать hashCode, equals, toString раздельно).
+Минусы: **не может proxy final classes** (нельзя extends). **Не может proxy final methods** (нельзя override). **Не может proxy private methods** (нельзя override). Конструктор parent класса вызывается при создании proxy — если parent имеет side effects, они выполнятся; часто нужен default constructor или Objenesis для обхода. Дополнительная зависимость (в Spring 5+ CGLIB встроен в `spring-core` в repackaged форме `org.springframework.cglib.*`).
 
-### 5.5 Минусы CGLIB
-
-- **Не может proxy final classes** (нельзя extends).
-- **Не может proxy final methods** (нельзя override).
-- **Не может proxy private methods** (нельзя override).
-- Конструктор parent класса вызывается при создании proxy (если parent имеет side effects — они выполнятся; часто нужен default constructor).
-- Дополнительная зависимость (в Spring 5+ CGLIB встроен в `spring-core` в repackaged форме `org.springframework.cglib.*`).
-
-### 5.6 Ограничения CGLIB на final
+**Классическая ловушка CGLIB и final**:
 
 ```java
 class MyService {
     public final String getName() { return "..."; }   // final!
-    public void doWork() { /* ... */ }
+    public void doWork() { }
 }
 
-MyService proxy = /* CGLIB proxy of MyService */;
-proxy.doWork();     // ✅ intercepted
-proxy.getName();    // ❌ вызывается напрямую, БЕЗ interceptor
+MyService proxy = /* CGLIB proxy */;
+proxy.doWork();     // intercepted
+proxy.getName();    // вызывается напрямую, БЕЗ interceptor
 ```
 
-Классические баги: `@Transactional` метод помечен `final` — proxy не может override → аннотация игнорируется.
+`@Transactional` метод помеченный `final` — proxy не может override → аннотация игнорируется. Silent bug — код компилируется, работает, но транзакция не открывается.
 
----
+## ByteBuddy: современная альтернатива
 
-## 6. ByteBuddy — современная альтернатива
+ByteBuddy — библиотека для bytecode manipulation. Более гибкая и быстрая чем CGLIB. Активно развивается (CGLIB заброшена, последний релиз ~2019). Используется Mockito, Hibernate, некоторые Spring internals в новых версиях.
 
-**ByteBuddy** — библиотека для bytecode manipulation. Более гибкая и быстрая чем CGLIB. Активно развивается (CGLIB — заброшена, последний release ~2019).
-
-Использует Mockito, Hibernate, некоторые Spring internals в новых версиях.
-
-Пример:
 ```java
 Class<?> dynamicType = new ByteBuddy()
     .subclass(UserService.class)
@@ -719,28 +402,18 @@ Class<?> dynamicType = new ByteBuddy()
     .load(UserService.class.getClassLoader())
     .getLoaded();
 
-UserService proxy = (UserService) dynamicType.getDeclaredConstructor().newInstance();
+UserService proxy = (UserService) dynamicType
+    .getDeclaredConstructor().newInstance();
 ```
 
-Плюсы:
-- Type-safe DSL.
-- Работает с Java 21+ модулями.
-- Активно поддерживается.
-- Лучшая performance.
+Плюсы: type-safe DSL, работает с Java 21+ модулями, активно поддерживается, лучшая performance. Минусы: отдельная зависимость, более сложный API.
 
-Минусы:
-- Отдельная зависимость.
-- Более сложный API.
+Spring может переключиться на ByteBuddy в будущих версиях, но пока CGLIB — default.
 
-Spring может переключиться на ByteBuddy в будущих версиях, но сейчас CGLIB — default.
+## Spring AOP: практика Proxy
 
----
+Spring использует Proxy pattern для всех аспектов:
 
-## 7. Spring AOP — практика Proxy
-
-### 7.1 Общая механика
-
-Spring использует **Proxy pattern** для всех aspect'ов (aspects):
 - `@Transactional` → `TransactionInterceptor`.
 - `@Async` → `AsyncExecutionInterceptor`.
 - `@Cacheable` / `@CacheEvict` → `CacheInterceptor`.
@@ -748,24 +421,11 @@ Spring использует **Proxy pattern** для всех aspect'ов (aspec
 - `@Retryable` (Spring Retry) → `RetryInterceptor`.
 - Custom aspects через `@Aspect` + `@Around` / `@Before` / `@After`.
 
-При bean creation:
-1. Spring создаёт real object.
-2. Проверяет: есть ли применимые advisors (например `@Transactional` на методе)?
-3. Если да — **оборачивает в proxy**.
-4. Injects proxy в других beans, не real.
+При bean creation Spring: создаёт real object → проверяет есть ли применимые advisors (например `@Transactional` на методе) → если да, оборачивает в proxy → injects proxy в других beans, не real. Клиент `@Autowired UserService us` получает **proxy**, не real object.
 
-Клиент (другой bean) `@Autowired UserService us` получает **proxy**, не real object.
+**Выбор JDK vs CGLIB**. Bean implements interface → JDK Proxy (default в некоторых конфигурациях). Bean не implements → CGLIB. Force CGLIB через `spring.aop.proxy-target-class=true` или `@EnableTransactionManagement(proxyTargetClass = true)`. **Spring Boot с 2.0 по умолчанию использует CGLIB** — упрощает жизнь разработчику (не надо думать про интерфейсы, всегда работает одинаково).
 
-### 7.2 JDK vs CGLIB — как выбирает Spring
-
-Правила:
-- Bean **implements interface** → JDK Proxy (default).
-- Bean **не implements** → CGLIB.
-- Force CGLIB: `spring.aop.proxy-target-class=true` или `@EnableTransactionManagement(proxyTargetClass = true)`.
-
-Spring Boot **с 2.0** — CGLIB by default (`proxy-target-class=true` для transaction management). Изменение для удобства (не надо думать про интерфейсы).
-
-### 7.3 Как работает `@Transactional` через Proxy
+## Как работает `@Transactional` через Proxy
 
 ```java
 @Service
@@ -799,19 +459,18 @@ Spring оборачивает `UserService` в CGLIB proxy. Клиент пол�
    - Иначе → `conn.commit()`.
 6. `conn.close()` (реально возвращается в HikariCP pool).
 
-Клиент не знает про транзакцию. Аннотация + proxy делают всё.
+Клиент не знает про транзакцию. Аннотация + proxy делают всё. Детально — файл 33 про transactional internals.
 
-Детально — `33-transactional-internals.md`.
+## Self-invocation problem: классическая ловушка №1
 
-### 7.4 Self-invocation problem — гоча №1
+Одна из самых частых ошибок работы с Spring proxy — вызов transactional метода изнутри того же класса:
 
-Классическая ошибка:
 ```java
 @Service
 public class UserService {
     
     public void publicMethod() {
-        internalMethod();   // ❌ прямой вызов, не через proxy!
+        internalMethod();   // прямой вызов, не через proxy!
     }
     
     @Transactional
@@ -821,69 +480,85 @@ public class UserService {
 }
 ```
 
-`publicMethod` вызывает `internalMethod` через `this` (не через proxy). Транзакция **НЕ открывается** — proxy не в пути вызова.
+`publicMethod` вызывает `internalMethod` через `this` (не через proxy). Транзакция **не открывается** — proxy не в пути вызова. Silent bug — код работает, но без транзакционных гарантий.
 
-Почему? Proxy оборачивает bean снаружи. Внутренний вызов `this.internalMethod()` — прямая ссылка на real object, minует proxy.
+Почему так? Proxy оборачивает bean снаружи. Внутренний вызов `this.internalMethod()` — прямая ссылка на real object, минует proxy.
 
-Схематично:
 ```
 Client → Proxy → real UserService.publicMethod()
                           │
-                          ▼ (this.internalMethod — прямой вызов на real object)
+                          ▼ (this.internalMethod — прямой вызов на real)
                      UserService.internalMethod()   ← proxy не в пути
                      @Transactional игнорируется!
 ```
 
-**Fixes**:
+Четыре способа обойти:
 
-1. **Self-injection** (уродливо, но работает):
-   ```java
-   @Autowired UserService self;   // Spring inject'ит proxy сам к себе
-   
-   public void publicMethod() {
-       self.internalMethod();   // через proxy
-   }
-   ```
+**1. Self-injection** — уродливо, но работает. Spring injects proxy сам к себе:
 
-2. **AopContext**:
-   ```java
-   @EnableAspectJAutoProxy(exposeProxy = true)
-   
-   public void publicMethod() {
-       ((UserService) AopContext.currentProxy()).internalMethod();
-   }
-   ```
+```java
+@Autowired UserService self;
 
-3. **Разделить на два bean'а**:
-   ```java
-   @Service class OrderFacade {
-       @Autowired OrderService orderService;
-       public void placeOrder() {
-           orderService.doTransactionalWork();   // через proxy!
-       }
-   }
-   
-   @Service class OrderService {
-       @Transactional
-       public void doTransactionalWork() { }
-   }
-   ```
+public void publicMethod() {
+    self.internalMethod();   // через proxy
+}
+```
 
-4. **AspectJ** (compile-time weaving, не proxy) — работает без proxy indirection. Но сложная настройка.
+**2. `AopContext`** — доступ к текущему proxy через ThreadLocal:
 
-**Правило**: `@Transactional` работает только для **внешних** вызовов через proxy. Внутренние вызовы (`this.xxx()`) не пойдут через interceptor.
+```java
+@EnableAspectJAutoProxy(exposeProxy = true)
 
-### 7.5 Другие ограничения Spring Proxy
+public void publicMethod() {
+    ((UserService) AopContext.currentProxy()).internalMethod();
+}
+```
 
-- **private methods** — не proxy'ятся. `@Transactional private` игнорируется.
-- **final methods** (при CGLIB) — не proxy'ятся.
-- **final classes** — не могут быть CGLIB-обёрнуты.
-- **static methods** — не proxy'ятся вообще.
-- **package-private methods** — technically могут proxy'иться, но зависит от Spring версии и настроек. Не полагайся.
+Требует включения `exposeProxy = true`, что не default.
 
-**Правило**: `@Transactional` / `@Async` / `@Cacheable` только на **public** методах, non-final.
+**3. Разделить на два бина** — часто самое чистое решение:
 
-### 7.6 Debug — как понять что там proxy
+```java
+@Service 
+class OrderFacade {
+    @Autowired OrderService orderService;
+    public void placeOrder() {
+        orderService.doTransactionalWork();   // через proxy
+    }
+}
+
+@Service 
+class OrderService {
+    @Transactional
+    public void doTransactionalWork() { }
+}
+```
+
+**4. AspectJ** (compile-time weaving, не proxy) — работает без proxy indirection. Аспект встраивается прямо в bytecode. Self-invocation работает. Но сложная настройка (compile-time агент, отдельная configuration).
+
+Правило: `@Transactional` работает только для внешних вызовов через proxy. Внутренние вызовы (`this.xxx()`) не пойдут через interceptor.
+
+## Другие ограничения Spring Proxy
+
+Все ограничения вытекают из механики proxy — интерсептируется только то, что видно снаружи.
+
+**private methods** — не proxy'ятся. Ни JDK Proxy (интерфейс не имеет private), ни CGLIB (private нельзя override). `@Transactional` на private методе — silent no-op.
+
+**final methods** (при CGLIB) — не proxy'ятся, нельзя override.
+
+**final classes** — не могут быть CGLIB-обёрнуты. `BeanCreationException` при старте.
+
+**static methods** — не proxy'ятся вообще. Static не привязан к экземпляру, proxy — instance-based.
+
+**package-private methods** — technically могут proxy'иться CGLIB, но зависит от версии и настроек Spring. Не полагайся.
+
+Правило: `@Transactional`, `@Async`, `@Cacheable` только на **public** методах, non-final.
+
+Особая история с Kotlin — все классы `final` by default. Kotlin plugin `all-open` автоматически открывает `@Component` классы для Spring proxy.
+
+## Отладка: как понять что там proxy
+
+Быстрая проверка через `bean.getClass().getName()`:
 
 ```java
 @Autowired UserService us;
@@ -891,166 +566,127 @@ Client → Proxy → real UserService.publicMethod()
 @PostConstruct
 void init() {
     System.out.println(us.getClass().getName());
-    // Output:
+    // Возможные варианты:
     //   UserService$$EnhancerBySpringCGLIB$$abc123    ← CGLIB proxy
     //   com.sun.proxy.$Proxy42                          ← JDK proxy
     //   com.example.UserService                         ← real (no proxy)
 }
 ```
 
-В IDE — можно поставить breakpoint в `TransactionInterceptor.invoke` и увидеть full stacktrace.
+Если видишь имя оригинального класса без EnhancerBy... суффикса — proxy не создан. Аннотация не сработает. Проверять почему (final class? final method? не bean вообще?).
 
-### 7.7 AOP alternatives
+В IDE можно поставить breakpoint в `TransactionInterceptor.invoke()` и увидеть full stacktrace — прошёл ли вызов через interceptor. Если stacktrace не проходит через interceptor — self-invocation или другая ловушка.
 
-**Spring AOP** — proxy-based. Ограничения выше.
+## AOP alternatives: AspectJ
 
-**AspectJ** — bytecode weaving:
-- **Compile-time weaving (CTW)** — javac + iajc modifies .class files. Слоу build, но zero runtime cost.
-- **Load-time weaving (LTW)** — Java agent modifies bytecode at classloading. Runtime cost.
+Spring AOP — proxy-based. Все ограничения выше. **AspectJ** — bytecode weaving, две разновидности:
 
-AspectJ mощнее (перехватывает всё, включая self-invocation), но сложнее. Для типичного Spring-приложения — Spring AOP достаточно.
+- **Compile-time weaving (CTW)** — javac + iajc модифицируют .class файлы. Медленный build, но zero runtime cost.
+- **Load-time weaving (LTW)** — Java agent модифицирует bytecode при classloading. Runtime cost, но не нужен специальный build.
 
----
+AspectJ мощнее (перехватывает всё, включая self-invocation, private, final), но сложнее настроить. Для типичного Spring-приложения Spring AOP достаточно. AspectJ имеет смысл когда нужна перехват private/self-invocation или когда работаешь с legacy-кодом который сложно рефакторить.
 
-## 8. @Async, @Cacheable, @PreAuthorize — все proxy-based
+## Другие Spring-аннотации: те же принципы
 
-### 8.1 @Async
+Все аспект-аннотации Spring работают через proxy тем же образом.
+
+**`@Async`**:
 
 ```java
 @Async
 public CompletableFuture<Report> generateReport(Long id) {
-    // ... slow computation
+    // slow computation
     return CompletableFuture.completedFuture(report);
 }
 ```
 
-Proxy при вызове:
-1. Не выполняет метод immediately.
-2. Оборачивает в `Runnable` / `Callable`.
-3. Submit в `TaskExecutor` (обычно `ThreadPoolTaskExecutor` или virtual thread executor).
-4. Возвращает `CompletableFuture` (или void).
-5. Реальный метод выполняется в другом thread'е.
+Proxy при вызове не выполняет метод immediately — оборачивает в Runnable/Callable, submit в `TaskExecutor` (обычно `ThreadPoolTaskExecutor` или virtual thread executor), возвращает CompletableFuture. Реальный метод выполняется в другом треде.
 
 Ограничения те же: self-invocation, private, final, static — не работают.
 
-Как настроить virtual threads:
+Настройка virtual threads (Java 21+):
+
 ```java
 @Bean
 AsyncTaskExecutor asyncTaskExecutor() {
-    return new TaskExecutorAdapter(Executors.newVirtualThreadPerTaskExecutor());
+    return new TaskExecutorAdapter(
+        Executors.newVirtualThreadPerTaskExecutor()
+    );
 }
 ```
 
-### 8.2 @Cacheable
+**`@Cacheable`**:
 
 ```java
 @Cacheable("users")
 public User findById(Long id) {
-    return repo.findOne(id);   // slow DB query
+    return repo.findOne(id);
 }
 ```
 
-Proxy:
-1. Компилирует key из method args (default — все args).
-2. Проверяет cache.
-3. Cache hit → возвращает cached value.
-4. Cache miss → вызывает real method, кладёт в cache, возвращает.
+Proxy компилирует key из method args (default — все args), проверяет cache: hit → возвращает cached value; miss → вызывает real method, кладёт в cache, возвращает. `@CacheEvict` — proxy удаляет из cache перед/после вызова.
 
-`@CacheEvict` — proxy удаляет из cache перед/после вызова.
-
-### 8.3 @PreAuthorize (Spring Security)
+**`@PreAuthorize`** (Spring Security):
 
 ```java
 @PreAuthorize("hasRole('ADMIN') or #userId == authentication.name")
-public User getUserProfile(Long userId) { /* ... */ }
+public User getUserProfile(Long userId) { }
 ```
 
-Proxy:
-1. Достаёт `Authentication` из `SecurityContext`.
-2. Оценивает SpEL expression.
-3. Если false → `AccessDeniedException`.
-4. Иначе — real method.
+Proxy достаёт `Authentication` из `SecurityContext`, evaluates SpEL expression, если false — `AccessDeniedException`, иначе — real method.
 
-### 8.4 @Retryable (Spring Retry)
+**`@Retryable`** (Spring Retry):
 
 ```java
 @Retryable(value = TransientException.class, 
            maxAttempts = 3, 
            backoff = @Backoff(delay = 1000, multiplier = 2))
-public String callFlakyAPI() { /* ... */ }
+public String callFlakyAPI() { }
 ```
 
-Proxy:
-1. Try 1 → exception (TransientException).
-2. Sleep 1000ms.
-3. Try 2 → exception.
-4. Sleep 2000ms.
-5. Try 3 → success or `ExhaustedRetryException`.
+Proxy: try 1 → exception → sleep 1000ms → try 2 → exception → sleep 2000ms → try 3 → success или `ExhaustedRetryException`.
 
 Каждая аннотация — свой interceptor в цепочке proxy.
 
-### 8.5 Порядок interceptor'ов
+## Порядок interceptor'ов: тонкость которая важна
 
-Если на методе `@Transactional` + `@Cacheable` + `@Async` — в каком порядке?
+Если на методе несколько аннотаций — `@Transactional` + `@Cacheable` + `@Async` — Spring выстраивает цепочку interceptor'ов по priority. Default порядок:
 
-Spring выстраивает **цепочку interceptor'ов** по priority. Order (низкое = ближе снаружи):
-- `@Async` (обычно `Ordered.LOWEST_PRECEDENCE`).
-- `@Transactional` (по умолчанию LOWEST).
-- `@Cacheable` (LOWEST).
+- `@Async` — `LOWEST_PRECEDENCE`.
+- `@Transactional` — `LOWEST_PRECEDENCE`.
+- `@Cacheable` — `LOWEST_PRECEDENCE`.
 
-Управлять через `@Order` или `@EnableTransactionManagement(order=...)`.
+Все одинаковые → недетерминированный порядок → проблема.
 
-**Классическая ошибка**: `@Transactional` + `@Cacheable` на одном методе.
-- Если `@Cacheable` снаружи `@Transactional` → cache hit не открывает транзакцию (ok).
-- Если `@Transactional` снаружи `@Cacheable` → лишняя транзакция для cache hit (проблема).
+Управлять через `@Order` или `@EnableTransactionManagement(order=100)` + `@EnableCaching(order=200)` — явно указать.
 
-Обычно **Cache снаружи Transaction** — правильно. Проверь порядком.
+Классическая ошибка: `@Transactional` + `@Cacheable` на одном методе.
+- Если `@Cacheable` снаружи `@Transactional` → cache hit не открывает транзакцию (правильно).
+- Если `@Transactional` снаружи `@Cacheable` → лишняя транзакция для cache hit (неправильно).
 
----
+Обычно **Cache снаружи Transaction** — правильно. Проверять порядок явно.
 
-## 9. Proxy vs Decorator — принципиально важно
+## Proxy vs Decorator: принципиальная разница
 
-Часто на собесе. Оба паттерна:
-- Оборачивают объект.
-- Реализуют тот же интерфейс.
-- Делегируют вызовы wrapped object.
+Часто на собеседовании. Оба паттерна оборачивают объект, реализуют тот же интерфейс, делегируют вызовы wrapped object. В чём разница?
 
-**В чём разница?**
+**Намерение**. Proxy — контроль доступа к объекту (кэш, security, lazy, remote). Клиент не знает что говорит с proxy — думает что с real. Decorator — добавление функциональности к объекту динамически. Клиент знает что декорировал (сам оборачивает).
 
-### 9.1 Намерение
+**Управление жизненным циклом**. Proxy сам создаёт / управляет real object (или получает его из фабрики). Клиент не знает про real. Decorator — клиент **явно** создаёт wrapped и decorator, собирает цепочку.
 
-**Proxy** — **контроль доступа** к объекту (кэш, security, lazy, remote). Клиент **не знает** что говорит с proxy — думает что с real.
+**Композиция**. Decorator часто цепочка: `new EncryptedStream(new BufferedStream(new FileStream("f")))`. Каждый добавляет своё поведение. Proxy обычно один, не собирается в цепочку от клиента.
 
-**Decorator** — **добавление функциональности** к объекту динамически. Клиент **знает** что декорировал (сам оборачивает).
-
-### 9.2 Управление жизненным циклом
-
-**Proxy** — сам создаёт/управляет real object (или получает его из фабрики). Клиент не знает про real.
-
-**Decorator** — клиент **явно** создаёт wrapped и decorator. Клиент собирает цепочку.
-
-### 9.3 Композиция
-
-**Decorator** — часто цепочка: `new EncryptedStream(new BufferedStream(new FileStream("f")))`. Каждый добавляет своё поведение.
-
-**Proxy** — обычно **один** proxy. Не собирается в цепочку от клиента.
-
-### 9.4 Пример Decorator в JDK
+**Пример Decorator в JDK**:
 
 ```java
 InputStream in = new FileInputStream("f.txt");
 InputStream buffered = new BufferedInputStream(in);
 InputStream zipped = new GZIPInputStream(buffered);
-
-// Клиент собирает цепочку:
-// - FileInputStream (real - read from disk)
-// - BufferedInputStream (add buffering)
-// - GZIPInputStream (add decompression)
 ```
 
-Каждый уровень **сохраняет интерфейс** InputStream, но **добавляет** поведение.
+Клиент собирает цепочку: FileInputStream (real — read from disk), BufferedInputStream (add buffering), GZIPInputStream (add decompression). Каждый уровень сохраняет интерфейс InputStream, добавляет поведение.
 
-### 9.5 Резюме
+Резюме через таблицу:
 
 | | Proxy | Decorator |
 |-|-------|-----------|
@@ -1059,347 +695,50 @@ InputStream zipped = new GZIPInputStream(buffered);
 | Real object owner | Proxy | Клиент |
 | Composition | Обычно один | Часто цепочка |
 | Классические use cases | Cache, Lazy, Remote, Security | I/O streams, GUI toolkit |
-| Spring examples | @Transactional, @Async | Java IO, Redis Cache decorators |
+| Spring examples | @Transactional, @Async | Java IO, Redis decorators |
 
-**Простой mnemonic**: Proxy решает **«кто может»**. Decorator решает **«что дополнительно делать»**.
+Простой mnemonic: Proxy решает «кто может». Decorator решает «что дополнительно делать».
 
----
+## Практика: где что использовать
 
-## 10. Полная сравнительная таблица
+**Facade** когда: клиенту нужно N связанных операций (объединить в один «typical use case» метод); скрыть 3rd-party API за собственным domain-specific API (легче тестировать); разделить orchestration от business logic; уменьшить coupling между слоями.
 
-| Pattern | Intent | Interface | Multiple targets | Client aware |
-|---------|--------|-----------|------------------|--------------|
-| Facade | Simplify interface to subsystem | New (simplified) | Yes (subsystem) | Yes |
-| Adapter | Convert incompatible interface | New (target) | No (one adaptee) | Sometimes |
-| Proxy | Control access to object | Same as target | No | No (transparent) |
-| Decorator | Add responsibilities dynamically | Same as target | No | Yes (composes) |
-| Mediator | Encapsulate object interactions | New | Yes (colleagues) | Yes |
-| Bridge | Decouple abstraction from impl | Different (both) | No | Yes |
-| Composite | Treat individual and group uniformly | Same (tree) | Yes | No |
+**Proxy** когда: нужно прозрачно добавить cross-cutting поведение (log, cache, tx, auth) — Spring AOP; real object дорого создавать → lazy load (Hibernate, JPA); real object на другой машине → remote proxy (Feign, gRPC); нужен counted / synchronized доступ.
 
-Часто путаемые:
-- **Adapter vs Facade**: Adapter меняет ФОРМУ интерфейса; Facade — упрощает СЛОЖНОСТЬ.
-- **Proxy vs Decorator**: Proxy контролирует доступ (invisible); Decorator добавляет функциональность (client-composed).
-- **Proxy vs Adapter**: Adapter меняет интерфейс; Proxy сохраняет интерфейс.
-- **Facade vs Mediator**: Facade — вертикально (клиент выше подсистемы); Mediator — горизонтально (peers).
+**Не Proxy** когда: клиент сам должен решать композицию — используй Decorator; меняешь интерфейс — используй Adapter.
 
----
-
-## 11. Практика: где что использовать
-
-### 11.1 Facade когда:
-- Клиенту нужно N связанных операций → objединить в один "typical use case" метод.
-- Скрыть 3rd-party API за собственным domain-specific API (протестируется легче).
-- Разделить orchestration от business logic.
-- Уменьшить coupling между слоями.
-
-### 11.2 Proxy когда:
-- Нужно **прозрачно** добавить cross-cutting поведение (log, cache, tx, auth) — Spring AOP.
-- Real object дорого создавать → lazy load (Hibernate, JPA).
-- Real object на другой машине → remote proxy (Feign, gRPC).
-- Нужно counted / synchronized доступ.
-
-### 11.3 Не Proxy когда:
-- Клиент **сам** должен решать композицию — используй Decorator.
-- Меняешь интерфейс — используй Adapter.
-
-### 11.4 Комбинация
-
-Часто в реальных системах — вместе:
+**Комбинация**. В реальных системах — вместе:
 
 ```
 Client
    ↓
-[Proxy for @Transactional]        ← proxy adds tx
+[Proxy for @Transactional]         ← proxy adds tx
    ↓
-[Real OrderFacade]                 ← facade orchestrates
+[Real OrderFacade]                  ← facade orchestrates
    ↓
-[Proxy for @Cacheable]  → [Real UserService]     ← proxy adds cache
+[Proxy for @Cacheable] → [Real UserService]     ← proxy adds cache
 [Proxy for @Transactional] → [Real PaymentGateway]
 [Proxy for @Retryable] → [Real ExternalApiClient]
 ```
 
 Facade — верхний уровень (orchestration). Proxy — по всей системе для cross-cutting concerns.
 
----
+## Отладка в проде: типовые сценарии
 
-## 12. Собесные вопросы
+**«@Transactional не работает — транзакция не открывается»**. Проверить: `bean.getClass().getName()` — есть ли `EnhancerBySpringCGLIB` в имени. Если нет — proxy не создан, разобраться почему (final class? bean vs plain new? scope issue?). Если есть — проверить не self-invocation ли (вызов `this.transactionalMethod()` из другого метода того же класса). Breakpoint в `TransactionInterceptor.invoke()` — реально ли проходит.
 
-### Q1: Что такое паттерн Facade?
+**«@Cacheable не кэширует, каждый вызов идёт в БД»**. Те же проверки. Плюс: правильно ли настроен `CacheManager` (без CacheManager @Cacheable молчит). Правильно ли собирается ключ (default = все args, если args non-hashable — cache не работает).
 
-Facade — структурный паттерн. Предоставляет **упрощённый интерфейс** к сложной подсистеме. Клиент вместо знания про 5 классов подсистемы вызывает один метод facade.
+**«@Async работает синхронно»**. Skip proxy (self-invocation) — самая частая причина. Проверить `@EnableAsync` включён. Проверить конфигурация `TaskExecutor`.
 
-Пример: `OrderFacade.placeOrder(request)` внутри координирует Inventory, Payment, Shipping, Notification, Audit. Клиент не знает про них.
+**`LazyInitializationException` в контроллере**. Hibernate lazy proxy пытается сделать query, но session уже закрыт (за пределами `@Transactional` метода). Fix: либо fetch eagerly в query, либо перенести обработку внутрь transactional метода, либо использовать `@Transactional(readOnly=true)` на контроллере (не рекомендуется), либо OSIV (`open-in-view=true` — тоже anti-pattern, но иногда используется).
 
-Плюсы: снижение coupling, читаемость, одно место для orchestration.
-Минусы: risk of "God facade" — толстый класс со всеми методами системы.
-
-### Q2: Разница Facade и Adapter?
-
-**Adapter** — переводит между несовместимыми интерфейсами. У нас класс с API X, клиент ожидает Y. Adapter — обёртка X → Y.
-
-**Facade** — упрощает совместимую подсистему. Не переводит, а объединяет N сервисов за одним простым API.
-
-Adapter меняет ФОРМУ интерфейса (1-to-1). Facade — УРОВЕНЬ (N-to-1).
-
-### Q3: Что такое паттерн Proxy?
-
-Proxy — структурный паттерн. Представитель другого объекта. Имеет **тот же интерфейс** что и real object, но контролирует доступ / добавляет поведение.
-
-Виды:
-- **Virtual** — lazy init (Hibernate lazy loading).
-- **Protection** — auth check (Spring Security).
-- **Remote** — real на другой машине (Feign, gRPC).
-- **Smart** — cache, log, reference counting (Spring @Cacheable).
-
-Клиент **не знает** что говорит с proxy.
-
-### Q4: Разница Proxy и Decorator?
-
-Обычная путаница. Оба wrap object с тем же интерфейсом.
-
-**Proxy** — контроль **доступа**. Proxy владеет real object (создаёт lazy или получает из фабрики). Клиент **прозрачно** говорит с proxy.
-
-**Decorator** — добавляет **функциональность**. Клиент **явно** wraps: `new BufferedStream(new FileStream(...))`. Часто цепочка.
-
-Proxy: клиент видит только proxy.
-Decorator: клиент собирает цепочку сам.
-
-### Q5: JDK Dynamic Proxy vs CGLIB?
-
-**JDK Proxy** (`java.lang.reflect.Proxy`):
-- Требует **интерфейс**.
-- Встроен в JDK.
-- Создаёт класс implements interface, delegates to InvocationHandler.
-- Не может proxy классы без интерфейса.
-
-**CGLIB**:
-- Работает **без интерфейса** — создаёт subclass через bytecode generation.
-- Не может proxy final classes/methods.
-- Быстрее JDK Proxy (нет reflection на hot path).
-- Требует public no-arg конструктор (или использует Objenesis).
-
-Spring:
-- Interface есть → JDK Proxy (default).
-- Interface нет → CGLIB.
-- `spring.aop.proxy-target-class=true` → всегда CGLIB.
-- Spring Boot 2.0+ — CGLIB по умолчанию.
-
-### Q6: Как работает `@Transactional`?
-
-Spring оборачивает bean в proxy (JDK или CGLIB). При вызове метода помеченного `@Transactional`:
-
-1. Proxy перехватывает вызов.
-2. `TransactionInterceptor.invoke()`:
-   - Читает метаданные (propagation, isolation, readOnly).
-   - Через `PlatformTransactionManager` открывает транзакцию: `dataSource.getConnection()`, `setAutoCommit(false)`, binds connection в ThreadLocal.
-3. Вызывает real метод.
-4. После return:
-   - RuntimeException → rollback.
-   - Ok → commit.
-5. `conn.close()` (возврат в pool).
-
-Клиент видит обычный вызов метода. Proxy делает всю магию.
-
-### Q7: Что такое self-invocation problem?
-
-Классическая ошибка со Spring Proxy:
-```java
-@Service
-class UserService {
-    public void a() {
-        b();   // ❌ не через proxy!
-    }
-    
-    @Transactional
-    public void b() { }
-}
-```
-
-`a()` вызывает `b()` через `this` (прямая ссылка на real object) — proxy не в пути → `@Transactional` игнорируется.
-
-Причина: proxy оборачивает bean **снаружи**. Внутренние вызовы `this.method()` минуют proxy.
-
-Fixes:
-1. Self-injection (`@Autowired UserService self`).
-2. `AopContext.currentProxy()`.
-3. Разделить на два bean'а (facade + service).
-4. AspectJ (compile-time weaving — работает без proxy indirection).
-
-### Q8: Почему `@Transactional` не работает на private методе?
-
-Spring proxy (JDK или CGLIB) может перехватывать только **public** методы:
-- JDK Proxy — реализует **интерфейс**, интерфейсные методы всегда public.
-- CGLIB — создаёт **subclass**, private методы нельзя override.
-
-Fix: сделать метод public. Или вынести в отдельный bean.
-
-Также не работает:
-- final methods (CGLIB не может override).
-- static methods (не proxy'ятся).
-- private (не proxy'ятся).
-
-### Q9: Как отладить: proxy сработал или нет?
-
-```java
-@Autowired UserService us;
-
-@PostConstruct
-void check() {
-    System.out.println(us.getClass().getName());
-}
-```
-
-- `com.example.UserService` → нет proxy (плохо, если ждём @Transactional).
-- `UserService$$EnhancerBySpringCGLIB$$...` → CGLIB proxy.
-- `com.sun.proxy.$Proxy42` → JDK proxy.
-
-Ещё можно поставить breakpoint в `TransactionInterceptor.invoke()` — увидишь весь stacktrace вызова.
-
-### Q10: Facade vs Mediator?
-
-**Facade** — **однонаправленный**: клиент выше подсистемы, вызывает facade → facade вызывает подсистему. Не coordinate peers.
-
-**Mediator** — **peer-to-peer**: coordinate несколько **равных** объектов, которые общаются через mediator (не напрямую). Пример: chat room — users шлют в room, room routes to other users.
-
-Facade — снаружи → внутрь. Mediator — сбоку → сбоку (координация peers).
-
-### Q11: Что такое Virtual Proxy?
-
-Proxy с **ленивой инициализацией** real object'а. Пока клиент не вызвал реальную операцию — real не создан.
-
-Классический пример: Hibernate lazy loading.
-```java
-@ManyToOne(fetch = FetchType.LAZY)
-private User user;   // hibernate создаёт proxy, real query только при user.getName()
-```
-
-Плюсы: экономия ресурсов если объект дорог, но не всегда нужен.
-Минусы: доступ вне scope (например LazyInitializationException в Hibernate после закрытия session).
-
-### Q12: Что такое Remote Proxy?
-
-Proxy которое **прозрачно** прокси в вызов на другой машине. Клиент вызывает proxy как обычный объект, proxy сериализует args, шлёт по сети, десериализует response.
-
-Примеры:
-- **Feign clients** (Spring Cloud) — генерирует remote proxy из annotated interface. Клиент `@Autowired UserServiceClient` — под капотом HTTP proxy.
-- **gRPC generated stubs** — remote proxy к gRPC service.
-- **RMI, EJB remote** — старые enterprise.
-
-Клиент пишет `userClient.getUser(1L)` — а под капотом HTTP GET, JSON parse, error handling.
-
-### Q13: Почему нельзя self-invocation в Spring AOP?
-
-Потому что Spring AOP — **proxy-based**. Proxy оборачивает bean снаружи. Клиент → proxy → real.
-
-Внутри real object'а `this` — ссылка на **сам real** (не proxy). Вызов `this.method()` не проходит через proxy.
-
-AspectJ (не Spring AOP) использует **bytecode weaving** — модифицирует сам .class файл. Тогда self-invocation работает, потому что аспект встроен в код.
-
-Trade-off: Spring AOP проще настроить, AspectJ мощнее.
-
-### Q14: Что такое Protection Proxy?
-
-Proxy который **проверяет права** перед делегированием real object. Spring Security `@PreAuthorize`:
-```java
-@PreAuthorize("hasRole('ADMIN')")
-public void deleteUser(Long id) { }
-```
-
-Proxy при вызове:
-1. Читает current authentication из SecurityContext.
-2. Evaluates SpEL expression.
-3. Если false → AccessDeniedException.
-4. Иначе — real method.
-
-Клиент не пишет security check в коде — proxy делает.
-
-### Q15: Может ли Facade быть Proxy?
-
-Технически — да, часто комбинируются в реальном коде.
-
-Пример: **API Gateway** — facade для микросервисов (aggregation) + proxy (auth, rate limiting, routing).
-
-**BFF (Backend for Frontend)** — фасад для UI, часто с кэшем (smart proxy).
-
-Формально это разные responsibilities: facade **упрощает**, proxy **контролирует**. В одном объекте могут быть оба.
-
-### Q16: Что произойдёт если Spring bean с `@Transactional` — final class?
-
-- Если CGLIB (default) — Spring **не сможет создать proxy** → BeanCreationException.
-- Если JDK Proxy — работает (proxy не extends class, а implements interface).
-
-Fix для CGLIB: убрать `final` с класса. Или force JDK Proxy с интерфейсом.
-
-Похожая проблема с Kotlin — все классы `final` by default. Kotlin plugin `all-open` открывает `@Component` классы автоматически.
-
-### Q17: Разница Proxy и Bridge?
-
-Часто путают.
-
-**Proxy** — тот же интерфейс что и real object, wraps один real.
-
-**Bridge** — separates **abstraction** от **implementation**, обе могут развиваться независимо. Разные интерфейсы для абстракции и impl.
-
-Классический пример Bridge: `Shape` (abstraction) + `Renderer` (implementation).
-```java
-abstract class Shape {
-    protected Renderer renderer;   // bridge к implementation
-    abstract void draw();
-}
-
-class Circle extends Shape {
-    void draw() { renderer.renderCircle(...); }
-}
-
-interface Renderer {
-    void renderCircle(...);
-    void renderSquare(...);
-}
-
-class OpenGLRenderer implements Renderer { ... }
-class DirectXRenderer implements Renderer { ... }
-```
-
-Shape и Renderer развиваются независимо. Разные интерфейсы.
-
-Proxy — один интерфейс, wraps target.
-
-### Q18: Что такое AOP alliance MethodInterceptor?
-
-Стандартный интерфейс для интерцепторов:
-```java
-public interface MethodInterceptor {
-    Object invoke(MethodInvocation invocation) throws Throwable;
-}
-```
-
-Spring использует его как основу advisors. Каждый interceptor (transaction, cache, security, async) — реализует этот интерфейс.
-
-Chain: `Client → Proxy → [Advisor1 → Advisor2 → ... → real method]`. Каждый advisor вызывает `invocation.proceed()` для continue chain.
-
-### Q19: Порядок аспектов при нескольких аннотациях?
-
-Если `@Transactional` + `@Cacheable` + `@Async` — Spring создаёт цепочку interceptor'ов, порядок через `@Order` или property.
-
-Default order:
-- `@Async` — LOWEST_PRECEDENCE.
-- `@Transactional` — LOWEST_PRECEDENCE.
-- `@Cacheable` — LOWEST_PRECEDENCE.
-
-Все одинаковые → недетерминированный порядок → problem.
-
-Правильно: `@EnableTransactionManagement(order=100)`, `@EnableCaching(order=200)` — явно указать.
-
-Обычный правильный порядок: cache → transaction → real (cache снаружи).
-
-### Q20: Как реализовать custom AOP с @Aspect?
+**Custom AOP с `@Aspect`** — пример полностью работающего:
 
 ```java
 @Aspect
 @Component
 public class LoggingAspect {
-    
     @Around("execution(* com.example.service..*(..))")
     public Object logAround(ProceedingJoinPoint pjp) throws Throwable {
         long start = System.currentTimeMillis();
@@ -1413,79 +752,72 @@ public class LoggingAspect {
 }
 ```
 
-Spring создаёт proxy для beans в `com.example.service`. При каждом method call — `LoggingAspect.logAround` вызывается, timing logged.
+Spring создаёт proxy для beans в `com.example.service`. При каждом method call `LoggingAspect.logAround` вызывается, timing логируется.
 
 Pointcut expressions (execution, within, args, @annotation) — селектят где применить.
 
 Виды advice: `@Before`, `@After`, `@AfterReturning`, `@AfterThrowing`, `@Around`.
 
----
+## Проверочные вопросы для собеседования
 
-## 13. Мини-чеклист «прочитал — знаю»
+Быстрые ответы на типовые вопросы:
 
-За 3-5 секунд:
+**Facade** — упрощение доступа к сложной подсистеме. Клиент знает что за фасадом много всего.
 
-- [ ] Facade — упрощение доступа к сложной подсистеме.
-- [ ] Клиент facade знает что за фасадом много всего.
-- [ ] Facade vs Adapter: адаптер меняет форму, facade объединяет N сервисов.
-- [ ] Facade vs Mediator: facade вертикально, mediator peer-to-peer.
-- [ ] Anti-pattern: God Facade.
-- [ ] JdbcTemplate, RestTemplate — Spring Facades.
-- [ ] BFF, API Gateway — Facade в микросервисах.
-- [ ] Proxy — представитель, тот же интерфейс что real.
-- [ ] Клиент proxy не знает что говорит с proxy.
-- [ ] Виды proxy: virtual, protection, remote, smart, cache.
-- [ ] Virtual Proxy — lazy init (Hibernate lazy loading).
-- [ ] Protection Proxy — auth check.
-- [ ] Remote Proxy — Feign, gRPC stubs, RMI.
-- [ ] Static Proxy — писать руками.
-- [ ] Dynamic Proxy — генерация в runtime.
-- [ ] JDK Dynamic Proxy — только для interface'ов, через InvocationHandler.
-- [ ] CGLIB — bytecode generation, subclass, работает без interface.
-- [ ] CGLIB не может final class / method.
-- [ ] Spring Boot 2.0+ — CGLIB by default.
-- [ ] Sprint Proxy invisible: `bean.getClass().getName()` покажет.
-- [ ] @Transactional, @Async, @Cacheable, @PreAuthorize — все proxy-based.
-- [ ] Self-invocation problem: this.method() минует proxy.
-- [ ] Fix: self-inject / AopContext / разделить bean / AspectJ.
-- [ ] @Transactional не работает на private, final, static.
-- [ ] Proxy vs Decorator: proxy invisible, decorator composed by client.
-- [ ] Proxy vs Adapter: proxy same interface, adapter changes interface.
-- [ ] AOP interceptor chain: cache → transaction → real.
-- [ ] `@Around` @Aspect + pointcut — custom AOP.
-- [ ] AspectJ — bytecode weaving, работает с self-invocation.
-- [ ] ByteBuddy — современный CGLIB replacement.
+**Facade vs Adapter**: адаптер меняет форму интерфейса (1-to-1), фасад объединяет N сервисов за одним упрощённым API (N-to-1).
 
----
+**Facade vs Mediator**: фасад однонаправленный (клиент выше подсистемы), медиатор — peer-to-peer координация равных.
 
-## Итог
+**God Facade** — anti-pattern (500+ строк, все домены в одном классе). Fix — разделить по доменам.
 
-**Facade** — упрощение. Один класс скрывает N подсистем за domain-specific API. Клиент знает про facade, не про подсистему. Anti-pattern — God Facade. Spring Templates (JdbcTemplate, RestTemplate) — примеры. В микросервисах — BFF/API Gateway.
+**Spring templates** (JdbcTemplate, RestTemplate, RabbitTemplate) — все Facade + Template Method.
 
-**Proxy** — представитель. Тот же интерфейс что real, но с добавлением поведения (cache, security, lazy, remote). Клиент **не знает** про proxy. Виды: Virtual (lazy), Protection (auth), Remote (network), Smart (cache/log).
+**Proxy** — представитель, тот же интерфейс что real. Клиент не знает что говорит с proxy.
 
-**Реализация Proxy в Java**:
-- **Static** — писать руками.
-- **JDK Dynamic** — только для interface'ов, через `InvocationHandler`, встроен.
-- **CGLIB** — bytecode subclass, работает без interface, не final classes/methods.
-- **ByteBuddy** — современная альтернатива CGLIB.
+**Виды proxy**: virtual (lazy init, Hibernate lazy loading), protection (auth, @PreAuthorize), remote (Feign, gRPC), smart (cache, log — @Cacheable).
 
-**Spring AOP** — proxy-based, аспекты через interceptors:
-- `@Transactional` → `TransactionInterceptor`.
-- `@Async` → `AsyncExecutionInterceptor`.
-- `@Cacheable` → `CacheInterceptor`.
-- `@PreAuthorize` → `MethodSecurityInterceptor`.
+**Static Proxy** — писать руками. **Dynamic Proxy** — генерация в runtime.
 
-**Ключевые ограничения Spring Proxy**:
-- Only **public** methods.
-- Not **final** classes/methods (CGLIB).
-- Not **static** methods.
-- **Self-invocation** minует proxy — fix через self-inject / AopContext / разделение bean'ов.
+**JDK Dynamic Proxy** — только для interface'ов, через InvocationHandler, встроен в JDK.
 
-**Сравнение с другими паттернами**:
-- **Proxy vs Decorator** — proxy invisible + controls access; decorator composed by client + adds behavior.
-- **Proxy vs Adapter** — proxy same interface; adapter changes interface.
-- **Facade vs Adapter** — facade объединяет; adapter переводит.
-- **Facade vs Mediator** — facade vertical; mediator peer-to-peer.
+**CGLIB** — bytecode generation, subclass, работает без interface, не может final/private/static.
 
-Дальше в теме: практика — включи `-Djdk.proxy.ProxyGenerator.saveGeneratedFiles=true` и посмотри что реально генерируется для `@Transactional`. Открой class через javap. Пойми на glass level что делает Spring AOP. Всё встанет на место.
+**Spring Boot 2.0+** — CGLIB by default.
+
+**`@Transactional` через proxy** — TransactionInterceptor открывает транзакцию до, commit/rollback после.
+
+**Self-invocation problem** — this.method() минует proxy. Fix: self-inject / AopContext / разделить bean / AspectJ.
+
+**`@Transactional` не работает на private/final/static** — proxy не может их перехватить.
+
+**Проверка proxy** — `bean.getClass().getName()` покажет EnhancerBySpringCGLIB или $Proxy или plain class.
+
+**Proxy vs Decorator**: proxy invisible (клиент не знает), decorator composed by client (клиент явно оборачивает).
+
+**AOP interceptor chain порядок** — cache снаружи transaction обычно правильно.
+
+**AspectJ** — bytecode weaving, работает с self-invocation, private, final. Сложнее настроить.
+
+**ByteBuddy** — современный CGLIB replacement, используется в Mockito, Hibernate, потенциально в Spring будущего.
+
+## Заключение
+
+Facade и Proxy — два фундаментальных структурных паттерна, на которых практически стоит весь enterprise Spring. Facade упрощает доступ к сложной подсистеме (JdbcTemplate над JDBC, OrderFacade над сервисами, BFF/Gateway над микросервисами). Клиент знает что за фасадом сложность. Proxy контролирует доступ к объекту с тем же интерфейсом (@Transactional, @Async, @Cacheable, @PreAuthorize через AOP). Клиент не знает что говорит с proxy.
+
+**Виды Proxy**: Virtual (lazy — Hibernate LAZY loading), Protection (auth — Spring Security @PreAuthorize), Remote (Feign, gRPC stubs), Smart (cache — @Cacheable, tx — @Transactional).
+
+**Реализации Dynamic Proxy**: JDK Dynamic Proxy (только для интерфейсов, встроен в JDK, генерирует $Proxy0 через reflection), CGLIB (bytecode manipulation через subclass, работает без интерфейсов, ограничения final/private/static), ByteBuddy (современная альтернатива, активно развивается).
+
+**Spring AOP** — proxy-based. Bean с интерфейсом → JDK Proxy или CGLIB (в Boot 2.0+ CGLIB default). Bean без интерфейса → CGLIB. Все аспект-аннотации (@Transactional, @Async, @Cacheable, @PreAuthorize, @Retryable) реализованы через interceptor'ы в proxy chain.
+
+**Self-invocation problem** — самая частая ловушка. `this.method()` минует proxy. Fix: self-injection, AopContext, разделение на два бина, AspectJ (bytecode weaving).
+
+**Ограничения Spring Proxy**: private / final / static методы не proxy'ятся. Silent bug — код работает, аннотация игнорируется. Правило: аспект-аннотации только на public non-final методах. Для Kotlin — `all-open` plugin.
+
+**Порядок interceptor'ов** важен когда несколько аннотаций. Cache обычно снаружи Transaction (cache hit не должен открывать tx). Указывать явно через `@Order` или `@EnableXxx(order=N)`.
+
+**Proxy vs Decorator**: proxy контролирует доступ (invisible для клиента, proxy владеет real object), decorator добавляет функциональность (клиент явно оборачивает, часто в цепочку).
+
+**Отладка**: `bean.getClass().getName()` для проверки наличия proxy. Breakpoint в TransactionInterceptor для проверки прохождения. Silent bugs (self-invocation, final method) — самые коварные.
+
+Концепция абстракции как таковой — в 113. `@Transactional` детали — в 33. Spring аннотации подробно — в 60. Здесь была глубина конкретно по Facade и Proxy: механика, реализации, Spring применение, типовые ошибки и способы их обходить.
