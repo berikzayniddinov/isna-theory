@@ -556,9 +556,9 @@ class OrderService {
 
 Особая история с Kotlin — все классы `final` by default. Kotlin plugin `all-open` автоматически открывает `@Component` классы для Spring proxy.
 
-## Отладка: как понять что там proxy
+## Отладка: как понять что там proxy и что реально происходит
 
-Быстрая проверка через `bean.getClass().getName()`:
+Быстрая проверка наличия proxy через `bean.getClass().getName()`:
 
 ```java
 @Autowired UserService us;
@@ -573,38 +573,116 @@ void init() {
 }
 ```
 
-Если видишь имя оригинального класса без EnhancerBy... суффикса — proxy не создан. Аннотация не сработает. Проверять почему (final class? final method? не bean вообще?).
+Если видишь имя оригинального класса без `EnhancerBy...` или `$Proxy...` — proxy не создан, аннотация не сработает. Причин может быть несколько: класс не является Spring bean (`new UserService()` вместо `@Autowired`); класс `final` (CGLIB не может extends); нет ни одной аспект-аннотации на bean; bean создаётся factory-методом который возвращает не proxy; `spring.aop.auto=false` в конфигурации.
 
-В IDE можно поставить breakpoint в `TransactionInterceptor.invoke()` и увидеть full stacktrace — прошёл ли вызов через interceptor. Если stacktrace не проходит через interceptor — self-invocation или другая ловушка.
+**Проверка что вызов действительно прошёл через interceptor**. Поставить breakpoint в `org.springframework.transaction.interceptor.TransactionInterceptor.invoke()` (для @Transactional) или `AsyncExecutionInterceptor.invoke()` (для @Async) — при вызове метода breakpoint должен сработать. Если не срабатывает — либо proxy не создан, либо self-invocation, либо метод private/final/static.
 
-## AOP alternatives: AspectJ
+**Stacktrace-анализ**. При исключении внутри `@Transactional` метода полный stacktrace должен содержать примерно такую цепочку:
 
-Spring AOP — proxy-based. Все ограничения выше. **AspectJ** — bytecode weaving, две разновидности:
+```
+at UserService.update(UserService.java:42)              ← real метод
+at UserService$$FastClassBySpringCGLIB.invoke(...)      ← CGLIB dispatch
+at org.springframework.cglib.proxy.MethodProxy.invoke   ← CGLIB proxy machinery
+at org.springframework.aop.framework.CglibAopProxy...   ← Spring proxy adapter
+at TransactionInterceptor.invokeWithinTransaction       ← вот здесь tx открылась
+at TransactionInterceptor.invoke(TransactionInterceptor.java:...)
+at ReflectiveMethodInvocation.proceed(...)              ← chain of advisors
+at UserService$$EnhancerBySpringCGLIB$$abc.update(...)  ← точка входа
+at UserController.updateUser(UserController.java:...)   ← клиент
+```
 
-- **Compile-time weaving (CTW)** — javac + iajc модифицируют .class файлы. Медленный build, но zero runtime cost.
-- **Load-time weaving (LTW)** — Java agent модифицирует bytecode при classloading. Runtime cost, но не нужен специальный build.
+Ключевые фреймы — `TransactionInterceptor.invokeWithinTransaction` (транзакция реально открыта) и `EnhancerBySpringCGLIB` (клиент попал в proxy). Если этих фреймов нет — proxy не сработал.
 
-AspectJ мощнее (перехватывает всё, включая self-invocation, private, final), но сложнее настроить. Для типичного Spring-приложения Spring AOP достаточно. AspectJ имеет смысл когда нужна перехват private/self-invocation или когда работаешь с legacy-кодом который сложно рефакторить.
+**Actuator endpoint `/actuator/beans`** покажет все bean'ы с их фактическими типами. Для больших приложений это единственный способ быстро узнать какие бины прокси'нуты, а какие нет.
 
-## Другие Spring-аннотации: те же принципы
+**Отладка через `-Xlog:jni+resolve=debug`** или через `-verbose:class` при старте — покажет когда и какие $Proxy / EnhancerByCGLIB классы генерируются. Полезно понять точку создания.
 
-Все аспект-аннотации Spring работают через proxy тем же образом.
+**`AopUtils.isAopProxy(bean)`** — utility метод Spring для программной проверки. `AopUtils.isJdkDynamicProxy(bean)` и `AopUtils.isCglibProxy(bean)` — уточнить тип. `AopProxyUtils.ultimateTargetClass(bean)` — получить оригинальный класс скрытый за proxy (полезно в тестах).
 
-**`@Async`**:
+## AspectJ vs Spring AOP: реальные trade-off'ы
+
+Spring AOP — proxy-based, с ограничениями обсуждёнными выше (public non-final, no self-invocation, no private, no static). AspectJ — bytecode weaving, работает **без** proxy, все ограничения снимаются.
+
+**Compile-time weaving (CTW)**. Специальный компилятор `ajc` (или `iajc` Maven/Gradle plugin) заменяет обычный `javac`. Читает исходники Java + AspectJ (`.aj` файлы или `@Aspect` в обычных классах), генерирует `.class` файлы с уже встроенными аспектами. Bytecode уже содержит вставки — при загрузке нет runtime overhead на dispatch.
+
+Выигрыш производительности: 5-15% по сравнению с proxy-based (нет reflection, нет через-interceptor dispatch, JIT inlining работает лучше на плоском bytecode). Минус: build медленнее (ajc ощутимо медленнее javac), IDE integration хуже (не все IDE понимают .aj-файлы), диагностика сложнее (стектрейсы содержат синтезированные методы типа `foo_aroundBody0`).
+
+**Load-time weaving (LTW)**. Java agent модифицирует bytecode прямо при `ClassLoader.defineClass()`. Обычный javac, но при запуске JVM с `-javaagent:aspectjweaver.jar` byte code изменяется on the fly. Плюс: build обычный, минус: overhead на classloading (первый раз каждый класс проходит через weaver), сложнее debugging (stack traces с weaved-методами).
+
+**Когда AspectJ имеет смысл**:
+
+- **Self-invocation необходимо**. Legacy код где рефакторинг на два бина невозможен, а `@Transactional` нужно внутри одного класса.
+- **Аспекты на private / final методах**. Например аудит-логирование всех методов класса включая private helpers.
+- **Аспекты на конструкторах**. Proxy не может перехватить `new UserService()`. AspectJ — может (через `execution(UserService.new(..))`).
+- **Аспекты на static методах**. То же, proxy не работает, AspectJ работает.
+- **Аспекты на final классах / не Spring beans**. Например, логировать все методы JDK классов (не рекомендуется, но технически возможно с AspectJ).
+- **Performance-critical hot paths** — 5-15% выигрыш JIT inlining vs interceptor dispatch стоит сложности.
+
+Для типичного Spring enterprise приложения Spring AOP достаточно. AspectJ — по конкретной необходимости, не «по умолчанию». Сложность настройки и debugging обычно не окупается.
+
+Комбинация возможна: Spring использует `@AspectJ` синтаксис (`@Aspect`, `@Around`, pointcut expressions) но с proxy-механикой. То есть аннотации те же, а под капотом proxy. Полный AspectJ включается через `<aop:aspectj-autoproxy proxy-target-class="true"/>` + `-javaagent:aspectjweaver.jar`.
+
+## @Async: механика, executors, return types, virtual threads
+
+`@Async` — аннотация для асинхронного выполнения метода. Proxy при вызове не выполняет метод immediately — оборачивает в `Runnable`/`Callable`, submit в `TaskExecutor`, возвращает `Future`/`CompletableFuture`/void. Реальный метод выполняется в другом треде.
+
+**Требования на возвращаемый тип**:
+
+- **`void`** — fire-and-forget. Клиент вызвал и забыл, никаких гарантий на результат или исключение (exceptions глотаются, дефолтно логируются `AsyncUncaughtExceptionHandler`, кастомизируется).
+- **`Future<T>`** — старый Java API. Клиент может `.get()` для дождаться, `.cancel()` для отмены. Устаревающий вариант, обычно избегается.
+- **`CompletableFuture<T>` / `ListenableFuture<T>`** — modern. Композиция через `.thenApply`, `.thenCompose`, `.exceptionally`. Стандарт для новых async методов.
+- Любой другой тип — Spring запустит асинхронно, но return value будет игнорирован (получишь `null` синхронно). Обычно baг.
+
+**Настройка TaskExecutor**. Дефолтный `SimpleAsyncTaskExecutor` создаёт **новый тред на каждый вызов** — категорически неприемлемо в prod (можно исчерпать треды за минуты). Надо явно настроить:
 
 ```java
-@Async
-public CompletableFuture<Report> generateReport(Long id) {
-    // slow computation
-    return CompletableFuture.completedFuture(report);
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+    
+    @Override
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(1000);
+        executor.setThreadNamePrefix("async-");
+        executor.setRejectedExecutionHandler(
+            new ThreadPoolExecutor.CallerRunsPolicy()   // fallback
+        );
+        executor.initialize();
+        return executor;
+    }
+    
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -> {
+            log.error("Async method {} failed", method.getName(), ex);
+        };
+    }
 }
 ```
 
-Proxy при вызове не выполняет метод immediately — оборачивает в Runnable/Callable, submit в `TaskExecutor` (обычно `ThreadPoolTaskExecutor` или virtual thread executor), возвращает CompletableFuture. Реальный метод выполняется в другом треде.
+Ключевые параметры. `corePoolSize` — базовое число тредов, всегда живых. `maxPoolSize` — максимум при нагрузке. `queueCapacity` — размер очереди задач когда все core threads заняты. `rejectedExecutionHandler` — что делать когда и очередь заполнена, и maxPoolSize достигнут. `CallerRunsPolicy` — выполнить в calling thread (даёт backpressure). `AbortPolicy` (дефолт) — бросить `RejectedExecutionException` (клиент падает). `DiscardPolicy` — молча выбросить (обычно плохо, теряются задачи).
 
-Ограничения те же: self-invocation, private, final, static — не работают.
+**Множество executors для разных задач**. Часто в приложении несколько классов async работ: быстрые (email отправка) и тяжёлые (генерация отчётов). Смешивать в одном пуле — тяжёлые блокируют быстрые. Правильно — разные executors:
 
-Настройка virtual threads (Java 21+):
+```java
+@Bean("emailExecutor")
+Executor emailExecutor() { /* small pool */ }
+
+@Bean("reportExecutor")
+Executor reportExecutor() { /* large pool with big queue */ }
+
+// Использование:
+@Async("emailExecutor")
+public void sendEmail(...) { }
+
+@Async("reportExecutor")
+public CompletableFuture<Report> generateReport(...) { }
+```
+
+**Virtual threads (Java 21+)** меняют картину. Вместо platform thread pool можно использовать unbounded virtual thread executor:
 
 ```java
 @Bean
@@ -615,7 +693,13 @@ AsyncTaskExecutor asyncTaskExecutor() {
 }
 ```
 
-**`@Cacheable`**:
+Каждый `@Async` вызов создаёт новый virtual thread — миллионы возможны (см. файл 110). Никаких пулов, queues, rejection policies. Но остаются ограничения VT — pinning на synchronized (до Java 24), JDBC-драйверы должны быть VT-friendly (PG 42.7+, HikariCP 5.1+). И connection pool БД всё равно потолок для DB-heavy async работ.
+
+**Все proxy-ограничения применимы**: self-invocation, private, final, static, void return type (для fire-and-forget) — как в @Transactional.
+
+**Тонкость с exception handling**. Для методов возвращающих `CompletableFuture` — исключения ловятся через `.exceptionally(ex -> ...)` или `.handle((result, ex) -> ...)`. Для `void` — `AsyncUncaughtExceptionHandler` (глобальный). Забывчивость этого — типовой prod bug: async метод падает, никто не знает.
+
+## @Cacheable: генерация ключей, cache manager, edge cases
 
 ```java
 @Cacheable("users")
@@ -624,116 +708,363 @@ public User findById(Long id) {
 }
 ```
 
-Proxy компилирует key из method args (default — все args), проверяет cache: hit → возвращает cached value; miss → вызывает real method, кладёт в cache, возвращает. `@CacheEvict` — proxy удаляет из cache перед/после вызова.
+Механика внутри `CacheInterceptor`: (1) достаёт `CacheManager` бин, находит cache по имени `"users"`; (2) вычисляет **key** через `KeyGenerator` (default — `SimpleKeyGenerator`, использует все параметры метода); (3) `cache.get(key)` → если hit, возвращает cached value без вызова метода; (4) если miss, вызывает real method, `cache.put(key, result)`, возвращает.
 
-**`@PreAuthorize`** (Spring Security):
+**Генерация ключей** — самая частая источник ошибок. `SimpleKeyGenerator` работает так: если один параметр — используется он сам (при условии что имеет корректный equals/hashCode); если несколько — создаётся `SimpleKey` который делает equals/hashCode по массиву параметров. Проблемы:
+
+- **Параметры без `equals`/`hashCode`** (например custom класс без переопределения) — cache будет always miss, потому что каждый вызов даёт объект с новым identity hash.
+- **Массивы** как параметры — `hashCode()` массива основан на identity, не на содержимом. `findByIds(new long[]{1,2,3})` два раза подряд — два разных ключа.
+- **null параметр** — включается в ключ, работает, но может быть неожиданно.
+
+Правильный подход — явно задавать key через SpEL:
+
+```java
+@Cacheable(value = "users", key = "#id")
+public User findById(Long id) { }
+
+@Cacheable(value = "users", key = "#user.email")
+public User findByExample(User user) { }
+
+@Cacheable(value = "orders", key = "#userId + ':' + #status")
+public List<Order> findByUserAndStatus(Long userId, Status status) { }
+```
+
+**CacheManager** — абстракция над реальным cache (`ConcurrentMapCacheManager` для in-memory, `CaffeineCacheManager` для Caffeine, `RedisCacheManager` для распределённого). Без явного CacheManager `@Cacheable` **не работает** (Spring Boot автоматически создаёт `ConcurrentMapCacheManager` если ничего другого нет). Классическая ошибка — забыть `@EnableCaching` — тогда даже с CacheManager proxy не создаётся, аннотация игнорируется.
+
+**Условное кэширование** через `condition` и `unless`:
+
+```java
+@Cacheable(value = "users", condition = "#id > 0", unless = "#result == null")
+public User findById(Long id) { }
+```
+
+`condition` — SpEL, вычисляется **до** вызова метода; если false, кэш пропускается, метод вызывается напрямую. `unless` — SpEL, вычисляется **после** вызова; если true, результат в кэш не кладётся. Разница ключевая: `condition` может использовать только параметры, `unless` — ещё и `#result`.
+
+**Cache stampede** — классическая проблема кэшей. Cache miss на популярном ключе → N параллельных запросов одновременно → все N делают тяжёлый метод → все N кладут в cache. При популярных ключах и медленных методах — DB под ударом. Решение: `sync = true`:
+
+```java
+@Cacheable(value = "users", key = "#id", sync = true)
+public User findById(Long id) { }
+```
+
+`sync=true` — Spring использует synchronized блок вокруг load; N параллельных вызовов ждут первого, дальше все получают cached значение. Работает только для однопроцессного in-memory cache. Для Redis нужны отдельные механизмы (Redis SETNX + TTL, distributed lock).
+
+**`@CacheEvict`** — proxy удаляет из cache. `allEntries=true` — очищает весь named cache. `beforeInvocation=true` — удаляет до вызова метода (полезно если метод может упасть, но кэш всё равно надо инвалидировать).
+
+**`@CachePut`** — proxy **всегда** вызывает метод и кладёт результат в cache. Отличие от `@Cacheable` — не читает из cache, только обновляет. Полезно для update-методов.
+
+**Комбинация `@Caching`** — несколько cache-операций на одном методе:
+
+```java
+@Caching(
+    evict = {
+        @CacheEvict(value = "usersByEmail", key = "#user.email"),
+        @CacheEvict(value = "usersById", key = "#user.id")
+    },
+    put = @CachePut(value = "usersById", key = "#user.id")
+)
+public User updateUser(User user) { }
+```
+
+Обновляем пользователя — инвалидируем два кэша (по email и по id), плюс кладём свежую версию в usersById.
+
+**Тонкость с TTL**. `@Cacheable` не задаёт TTL — это ответственность CacheManager. Spring Cache abstraction не имеет унифицированного способа задать TTL per-cache — надо через конфигурацию конкретного провайдера:
+
+```java
+// Caffeine
+@Bean
+CacheManager cacheManager() {
+    CaffeineCacheManager mgr = new CaffeineCacheManager("users", "orders");
+    mgr.setCaffeine(Caffeine.newBuilder()
+        .expireAfterWrite(Duration.ofMinutes(10))
+        .maximumSize(10_000));
+    return mgr;
+}
+
+// Redis (Spring Data Redis)
+@Bean
+CacheManager cacheManager(RedisConnectionFactory f) {
+    RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig()
+        .entryTtl(Duration.ofMinutes(10));
+    return RedisCacheManager.builder(f).cacheDefaults(config).build();
+}
+```
+
+## @PreAuthorize: SpEL, security context, тонкости
 
 ```java
 @PreAuthorize("hasRole('ADMIN') or #userId == authentication.name")
 public User getUserProfile(Long userId) { }
 ```
 
-Proxy достаёт `Authentication` из `SecurityContext`, evaluates SpEL expression, если false — `AccessDeniedException`, иначе — real method.
+Механика `MethodSecurityInterceptor`: (1) достаёт `Authentication` из `SecurityContextHolder` (ThreadLocal-based); (2) evaluates SpEL expression через `MethodSecurityExpressionHandler` в контексте текущего authentication + параметров метода; (3) если результат false → `AccessDeniedException`; (4) иначе → делегирует real method.
 
-**`@Retryable`** (Spring Retry):
+**SpEL context** содержит: `authentication` (текущий Authentication), `principal` (principal того же authentication), параметры метода по имени (`#userId`, `#user.email` и т.д.). Плюс кастомные bean expressions через `@authz.hasPermission(#target)` где `authz` — Spring bean с методом `hasPermission`.
+
+**Требование к именам параметров**. Spring по умолчанию использует debug-информацию из bytecode для получения имён параметров. Без `-parameters` флага компилятора (Java 8+) или без явных `@Param` annotations — параметры называются `arg0`, `arg1` и т.д. `@PreAuthorize("#userId == ...")` тогда не работает. Fix: включить `-parameters` в compiler options (Maven `maven-compiler-plugin` `<parameters>true</parameters>`, Gradle `options.compilerArgs += "-parameters"`).
+
+**`@PostAuthorize`** — оценка **после** выполнения метода, доступ к `returnObject`:
 
 ```java
-@Retryable(value = TransientException.class, 
-           maxAttempts = 3, 
-           backoff = @Backoff(delay = 1000, multiplier = 2))
+@PostAuthorize("returnObject.owner == authentication.name")
+public Document getDocument(Long id) { }
+```
+
+Метод выполнится, но результат клиенту не отдастся если expression false. Полезно когда нельзя проверить permission без загрузки объекта. Опасность — тяжёлый метод выполняется зря если authorization fail. Обычно `@PreAuthorize` предпочтительнее.
+
+**`@PreFilter` / `@PostFilter`** — фильтрация коллекций входа/выхода:
+
+```java
+@PostFilter("filterObject.owner == authentication.name")
+public List<Document> listAll() { }
+```
+
+Из возвращённого списка Spring оставит только те объекты, у которых `owner == authentication.name`. `filterObject` — специальный variable в SpEL, означает текущий элемент коллекции. Работает через iteration и remove — на больших коллекциях медленно (O(n) с SpEL evaluation каждого элемента). Лучше фильтровать в SQL.
+
+**MethodSecurityInterceptor chain**. Внутри Spring Security цепочка advisors: `AuthorizationManagerBeforeMethodInterceptor` (для `@PreAuthorize`), `AuthorizationManagerAfterMethodInterceptor` (для `@PostAuthorize`), `PreFilterAuthorizationMethodInterceptor`, `PostFilterAuthorizationMethodInterceptor`. Каждый advisor работает через отдельный `AuthorizationManager` — можно кастомизировать логику решения.
+
+**Кастомный `PermissionEvaluator`** для сложных сценариев:
+
+```java
+@Component
+public class DocumentPermissionEvaluator implements PermissionEvaluator {
+    public boolean hasPermission(Authentication auth, Object target, Object perm) {
+        Document d = (Document) target;
+        return d.getOwnerId().equals(currentUserId(auth)) 
+            || auth.getAuthorities().contains(new SimpleGrantedAuthority("ADMIN"));
+    }
+    // ...
+}
+
+@PreAuthorize("hasPermission(#doc, 'read')")
+public void view(Document doc) { }
+```
+
+Централизует permission logic в одном месте, аннотации остаются семантическими (`'read'`, `'write'`, `'delete'`).
+
+## @Retryable: механика, backoff, recovery
+
+```java
+@Retryable(
+    value = TransientException.class, 
+    maxAttempts = 3, 
+    backoff = @Backoff(delay = 1000, multiplier = 2)
+)
 public String callFlakyAPI() { }
 ```
 
-Proxy: try 1 → exception → sleep 1000ms → try 2 → exception → sleep 2000ms → try 3 → success или `ExhaustedRetryException`.
+Механика `RetryOperationsInterceptor` через `RetryTemplate`: (1) выполняет метод; (2) при exception проверяет `RetryPolicy` (тип исключения соответствует, попыток ещё осталось); (3) если retry — `BackoffPolicy.backOff()` (sleep согласно стратегии), затем повтор; (4) если нет retry (все попытки исчерпаны, exception не тот тип) — пробрасывает исключение или вызывает `@Recover` метод.
 
-Каждая аннотация — свой interceptor в цепочке proxy.
+**Стратегии backoff**:
 
-## Порядок interceptor'ов: тонкость которая важна
+- **FixedBackoffPolicy** — постоянная задержка между попытками (delay=1000 → 1s, 1s, 1s).
+- **ExponentialBackoffPolicy** — экспоненциальный рост (delay=1000, multiplier=2 → 1s, 2s, 4s, 8s).
+- **UniformRandomBackoffPolicy** — случайная задержка между `minBackoff` и `maxBackoff`.
+- **ExponentialRandomBackoffPolicy** (jittered) — экспоненциальный + рандомизация. Обычно правильный выбор для распределённых систем: избегает thundering herd когда много клиентов ретраятся одновременно (см. файл 106).
 
-Если на методе несколько аннотаций — `@Transactional` + `@Cacheable` + `@Async` — Spring выстраивает цепочку interceptor'ов по priority. Default порядок:
-
-- `@Async` — `LOWEST_PRECEDENCE`.
-- `@Transactional` — `LOWEST_PRECEDENCE`.
-- `@Cacheable` — `LOWEST_PRECEDENCE`.
-
-Все одинаковые → недетерминированный порядок → проблема.
-
-Управлять через `@Order` или `@EnableTransactionManagement(order=100)` + `@EnableCaching(order=200)` — явно указать.
-
-Классическая ошибка: `@Transactional` + `@Cacheable` на одном методе.
-- Если `@Cacheable` снаружи `@Transactional` → cache hit не открывает транзакцию (правильно).
-- Если `@Transactional` снаружи `@Cacheable` → лишняя транзакция для cache hit (неправильно).
-
-Обычно **Cache снаружи Transaction** — правильно. Проверять порядок явно.
-
-## Proxy vs Decorator: принципиальная разница
-
-Часто на собеседовании. Оба паттерна оборачивают объект, реализуют тот же интерфейс, делегируют вызовы wrapped object. В чём разница?
-
-**Намерение**. Proxy — контроль доступа к объекту (кэш, security, lazy, remote). Клиент не знает что говорит с proxy — думает что с real. Decorator — добавление функциональности к объекту динамически. Клиент знает что декорировал (сам оборачивает).
-
-**Управление жизненным циклом**. Proxy сам создаёт / управляет real object (или получает его из фабрики). Клиент не знает про real. Decorator — клиент **явно** создаёт wrapped и decorator, собирает цепочку.
-
-**Композиция**. Decorator часто цепочка: `new EncryptedStream(new BufferedStream(new FileStream("f")))`. Каждый добавляет своё поведение. Proxy обычно один, не собирается в цепочку от клиента.
-
-**Пример Decorator в JDK**:
+**`@Recover`** — метод-fallback когда retry исчерпан:
 
 ```java
-InputStream in = new FileInputStream("f.txt");
-InputStream buffered = new BufferedInputStream(in);
-InputStream zipped = new GZIPInputStream(buffered);
+@Retryable(value = TransientException.class, maxAttempts = 3)
+public String callAPI(Long id) { }
+
+@Recover
+public String recover(TransientException e, Long id) {
+    log.warn("Retry exhausted for id={}, using default", id);
+    return "default-value";
+}
 ```
 
-Клиент собирает цепочку: FileInputStream (real — read from disk), BufferedInputStream (add buffering), GZIPInputStream (add decompression). Каждый уровень сохраняет интерфейс InputStream, добавляет поведение.
+Требования к `@Recover` методу: тот же тип возвращаемого значения; первый параметр — тип исключения; остальные параметры совпадают с retry-методом. Spring находит recover по match'у.
 
-Резюме через таблицу:
+**RetryListener** для observability и custom logic:
+
+```java
+@Bean
+RetryListener retryListener() {
+    return new RetryListener() {
+        public <T, E extends Throwable> void onError(
+                RetryContext ctx, RetryCallback<T,E> cb, Throwable ex) {
+            log.warn("Retry attempt {} failed: {}", ctx.getRetryCount(), ex.getMessage());
+        }
+    };
+}
+```
+
+Полезно для метрик (сколько retries по каким методам), circuit breaker integration.
+
+**Anti-patterns**. Ретрай на **всех** exception (`value = Exception.class`) — плохо, включает бизнес-ошибки которые не должны ретраится (invalid input, authorization denied). Ретрай на **non-idempotent** операции без deduplication — двойная оплата, двойной email. Слишком много попыток без backoff — thundering herd на downstream. Синхронный retry с большим delay блокирует calling thread — если это HTTP request handler, клиент ждёт всё время + может отвалиться по своему timeout, а ретрай продолжится впустую.
+
+**Circuit breaker дополняет retry** (Resilience4j `@Retry` + `@CircuitBreaker`). Ретрай для transient failures, circuit breaker для сустаinеd failures — если downstream реально лежит, retry не поможет, надо на время перестать пытаться.
+
+## Порядок interceptor'ов: точная механика
+
+Когда на методе несколько аспект-аннотаций — Spring собирает **цепочку advisors**, каждый обрабатывается по очереди. Внутренне это `ReflectiveMethodInvocation` со списком interceptor'ов, каждый вызывает `invocation.proceed()` чтобы передать управление следующему.
+
+Порядок определяется через `@Order` или интерфейс `Ordered` / `PriorityOrdered` на самом advisor'е. Меньший order = **внешний** (раньше в цепочке). Больший order = **внутренний**.
+
+Default приоритеты — многие Spring-аннотации по умолчанию `LOWEST_PRECEDENCE` (Integer.MAX_VALUE). Одинаковый приоритет → недетерминированный порядок → баги воспроизводимые «через раз».
+
+Правильно — явно задавать через `@EnableXxx(order = N)`:
+
+```java
+@EnableCaching(order = 1)                  // самый внешний
+@EnableTransactionManagement(order = 2)     // внутри cache
+@EnableAsync(order = 3)                     // самый внутренний
+```
+
+**Правильный порядок обычно cache → tx → метод**. Обоснование: при cache hit не должна открываться транзакция (пустая работа с БД), проверка кэша — cheap операция, должна быть первой.
+
+Если поставить наоборот (tx снаружи cache): cache hit → открыта пустая транзакция → cache вернул значение → tx commit'ится «зря». На каждый cache hit — расход connection из пула, WAL запись (для tx с ACID guarantees), overhead. Cache теряет смысл — вместо экономии БД добавляется overhead. Реальный prod bug: команда добавила @Cacheable на существующий @Transactional метод, throughput упал вместо роста. Виной был порядок.
+
+**@Async особый случай**. `@Async` возвращает CompletableFuture сразу, поэтому если оно **внутри** @Transactional — транзакция закрывается **до** реального выполнения метода в другом треде. Транзакция не действует внутри async метода. Обычно async **снаружи** tx — сам async метод открывает свою транзакцию.
+
+Диагностика: включить debug логирование `org.springframework.aop.framework.CglibAopProxy` — покажет реальную цепочку interceptor'ов для каждого метода.
+
+## Proxy vs Decorator: глубокая разница
+
+Оба паттерна оборачивают объект тем же интерфейсом. Разница — в **отношении к жизненному циклу** и **осведомлённости клиента**.
+
+**Управление жизненным циклом**. В Proxy — proxy owns реальный объект. Клиент получает только proxy, real создаётся либо lazily внутри proxy (Virtual Proxy), либо инъектится в proxy извне (Smart Proxy), либо не существует локально вовсе (Remote Proxy). Клиент никогда не видит real напрямую. Пример: Hibernate lazy proxy — вы получили User, но реального ResultSet-mapped объекта ещё нет, он материализуется при первом обращении к полю.
+
+В Decorator — клиент owns и wrapped, и decorator. Клиент явно пишет `new BufferedInputStream(new FileInputStream("f.txt"))`. Обе стороны видны, часть цепочки. Клиент может расформировать decorator и работать с оригиналом.
+
+**Композиция**. Proxy обычно один — один proxy на один real. Даже когда Spring применяет много аспектов, это одна цепочка interceptors внутри одного CGLIB proxy, не N вложенных proxy. Композиция происходит через AOP infrastructure, не через client-side wrapping.
+
+Decorator создан для композиции. `new EncryptedStream(new BufferedStream(new GzipStream(new FileStream("f"))))` — четыре уровня, каждый добавляет своё поведение. Порядок важен, каждый комбинирует с предыдущим.
+
+**Прозрачность**. Клиент Proxy думает что говорит с оригиналом. Аннотация `@Transactional` должна работать «магически» — код `userService.update(...)` выглядит обычным вызовом. Прозрачность — цель.
+
+Клиент Decorator знает про composition. Он явно собирает — если забудет `BufferedInputStream`, чтение будет медленным (каждый byte напрямую с диска). Осведомлённость — тоже цель, потому что клиент выбирает поведение.
+
+**Реальный tricky пример: Hibernate**. Lazy loading — proxy: клиент вызывает `user.getOrders()`, proxy незаметно делает SELECT. Клиент не знает про SQL. Идеальный proxy.
+
+А `Hibernate.initialize(user.getOrders())` — принудительная инициализация proxy — это уже клиент явно взаимодействует с proxy механикой. В строгом смысле не paradigm-clean.
+
+**Ошибка понимания**. Многие думают что `@Transactional` работает как decorator (клиент оборачивает). На самом деле клиент не оборачивает — Spring делает это автоматически при создании bean. Клиент **не знает** что перед его userService стоит proxy. Это принципиально отличает Proxy от Decorator.
+
+Таблица сводит различия:
 
 | | Proxy | Decorator |
 |-|-------|-----------|
 | Намерение | Control access | Add behavior |
 | Клиент знает | Нет (proxy invisible) | Да (клиент wraps) |
-| Real object owner | Proxy | Клиент |
+| Real object owner | Proxy (или его создатель) | Клиент |
 | Composition | Обычно один | Часто цепочка |
 | Классические use cases | Cache, Lazy, Remote, Security | I/O streams, GUI toolkit |
-| Spring examples | @Transactional, @Async | Java IO, Redis decorators |
+| Spring examples | @Transactional, @Async, Hibernate LAZY | Java IO, GUI wrapping |
+| Cost для клиента | Нулевой (transparent) | Знание композиции |
 
-Простой mnemonic: Proxy решает «кто может». Decorator решает «что дополнительно делать».
+Правило: Proxy отвечает на «кто может» (управляет доступом). Decorator отвечает на «что дополнительно» (расширяет поведение).
 
-## Практика: где что использовать
+## Performance implications: цена proxy
 
-**Facade** когда: клиенту нужно N связанных операций (объединить в один «typical use case» метод); скрыть 3rd-party API за собственным domain-specific API (легче тестировать); разделить orchestration от business logic; уменьшить coupling между слоями.
+Proxy не бесплатен. Overhead в трёх местах:
 
-**Proxy** когда: нужно прозрачно добавить cross-cutting поведение (log, cache, tx, auth) — Spring AOP; real object дорого создавать → lazy load (Hibernate, JPA); real object на другой машине → remote proxy (Feign, gRPC); нужен counted / synchronized доступ.
+**Method dispatch через interceptor chain**. Обычный вызов метода в Java — ~1-2 наносекунды (плюс возможный JIT inlining в ноль). Через Spring proxy — 50-200 ns на пустую цепочку (один interceptor), больше при нескольких аспектах. Значимо для tight loops с миллионами вызовов, незаметно для типичных enterprise методов с БД в 5-50 ms.
 
-**Не Proxy** когда: клиент сам должен решать композицию — используй Decorator; меняешь интерфейс — используй Adapter.
+**Reflection cost** для JDK Proxy. `method.invoke()` внутри `InvocationHandler` использует reflection — не так дёшево как direct call. С Java 9+ MethodHandle-based dispatch значительно ускорил, но всё ещё дороже CGLIB (который использует прямые вызовы через сгенерированный bytecode). Реально: JDK Proxy ~500 ns на вызов, CGLIB ~100 ns.
 
-**Комбинация**. В реальных системах — вместе:
+**Megamorphic call sites**. JIT-оптимизация inlining лучше работает на **monomorphic** call sites — когда через одну точку вызова всегда проходит один тип. Proxy — новый класс на каждый bean (`$Proxy0`, `$Proxy1`, `EnhancerByCGLIB$abc`, `EnhancerByCGLIB$def`), все имплементят одинаковый интерфейс. Если клиент работает с interface через много разных proxy — call site становится megamorphic, JIT не может inline, dispatch дорогой (см. файл 112 про JIT).
+
+Практическое влияние: обычно ничтожно. Enterprise workload — DB, network, disk доминируют. Proxy overhead в 100-500 ns на фоне 10 ms SQL — 0.005%. Тюнить имеет смысл только для действительно hot paths (миллион+ вызовов в секунду).
+
+Способы оптимизации если проблема реальна: (1) кэшировать результаты дорогих proxy-вызовов; (2) переходить на AspectJ (weaving в bytecode, дешевле dispatch); (3) убрать proxy где не нужен (иногда `@Transactional` на trivial методе излишен).
+
+## Тестирование proxy-based beans
+
+Тесты обычно не заботятся о proxy — вызывают методы обычным способом. Но есть моменты которые надо понимать.
+
+**Unit tests (без Spring context)**. Обычно `new UserService(mockedRepo, ...)` — тестируется real class. Аннотации `@Transactional`/`@Cacheable` **не работают** (нет proxy). Это правильно для unit test — мы тестируем логику, не Spring infrastructure. Если нужна логика вокруг транзакции — интеграционный тест.
+
+**`@SpringBootTest` / `@DataJpaTest`**. Полный Spring context поднят, все аспекты работают. Здесь proxy реален. Можно тестировать что `@Transactional` действительно rollback'ит при exception.
+
+**`@MockBean` vs `@SpyBean`**. `@MockBean` заменяет bean на Mockito mock (без реального класса). Все аспекты пропадают — mock не проходит через proxy. `@SpyBean` — оборачивает **real bean** (уже proxy'ннный) в spy, сохраняя всю Spring machinery. Полезно когда нужно частично мокнуть поведение, но сохранить `@Transactional`.
+
+**Верификация `@Transactional` в тестах**:
+
+```java
+@Test
+void update_onError_rollsBack() {
+    // given
+    User u = repo.save(new User("test"));
+    
+    // when
+    assertThrows(RuntimeException.class, () -> service.updateWithFailure(u.getId()));
+    
+    // then — rollback произошёл, изменения не сохранились
+    User reloaded = repo.findById(u.getId()).orElseThrow();
+    assertEquals("test", reloaded.getName());   // не изменилось
+}
+```
+
+Работает потому что `service` в тесте — proxy (Spring context поднят), `@Transactional` работает.
+
+**AopUtils для программной верификации в тесте**:
+
+```java
+@Test
+void userService_isProxy() {
+    assertTrue(AopUtils.isAopProxy(userService));
+    assertTrue(AopUtils.isCglibProxy(userService));
+    assertEquals(UserService.class, AopProxyUtils.ultimateTargetClass(userService));
+}
+```
+
+Полезно как sanity check в критичных проектах — тест провалится если кто-то случайно сломает proxy (сделал класс final).
+
+## Практические сценарии: где что использовать
+
+**Facade** — когда клиенту нужно N связанных операций подсистемы. Классический пример: обработка заказа с несколькими сервисами. Также — обёртка над третьесторонним API (легче тестировать через свою абстракцию), разделение orchestration от business logic, agregation в BFF/API Gateway. Правило: начинай без фасада, добавляй когда чувствуешь боль от дублирования orchestration.
+
+**Proxy** — для прозрачного добавления cross-cutting поведения (log, cache, tx, auth) через Spring AOP. Для lazy loading тяжёлых объектов (Hibernate). Для remote calls (Feign, gRPC). Для thread-safe wrapping. Для reference counting (редко в Java, чаще в C++).
+
+**Не Proxy** когда: клиент должен явно управлять композицией — Decorator; когда меняется форма интерфейса — Adapter; когда нужна координация peers — Mediator.
+
+**Комбинация в реальных системах**. Часто и вместе:
 
 ```
 Client
    ↓
-[Proxy for @Transactional]         ← proxy adds tx
+[CGLIB Proxy for @Transactional]         ← proxy adds tx
    ↓
-[Real OrderFacade]                  ← facade orchestrates
-   ↓
-[Proxy for @Cacheable] → [Real UserService]     ← proxy adds cache
+[Real OrderFacade]                        ← facade orchestrates
+   ↓ ↓ ↓
+[Proxy for @Cacheable] → [Real UserService]        
 [Proxy for @Transactional] → [Real PaymentGateway]
-[Proxy for @Retryable] → [Real ExternalApiClient]
+[Proxy for @Retryable + @CircuitBreaker] → [Real ExternalApiClient]
 ```
 
-Facade — верхний уровень (orchestration). Proxy — по всей системе для cross-cutting concerns.
+Facade — верхний уровень (business orchestration). Proxy — по всей системе для cross-cutting concerns (tx, cache, retry, security, метрики).
 
-## Отладка в проде: типовые сценарии
+## Отладка в проде: реальные сценарии
 
-**«@Transactional не работает — транзакция не открывается»**. Проверить: `bean.getClass().getName()` — есть ли `EnhancerBySpringCGLIB` в имени. Если нет — proxy не создан, разобраться почему (final class? bean vs plain new? scope issue?). Если есть — проверить не self-invocation ли (вызов `this.transactionalMethod()` из другого метода того же класса). Breakpoint в `TransactionInterceptor.invoke()` — реально ли проходит.
+**Симптом «@Transactional не работает — транзакция не открывается»**. Пошаговая диагностика:
 
-**«@Cacheable не кэширует, каждый вызов идёт в БД»**. Те же проверки. Плюс: правильно ли настроен `CacheManager` (без CacheManager @Cacheable молчит). Правильно ли собирается ключ (default = все args, если args non-hashable — cache не работает).
+1. `bean.getClass().getName()` — есть ли `EnhancerBySpringCGLIB` или `$Proxy`? Если нет — proxy не создан. Причины: класс `final`; `@Transactional` только на реализации без интерфейса + `spring.aop.proxy-target-class=false`; bean создаётся через `new` вместо DI; `@EnableTransactionManagement` не включён; `PlatformTransactionManager` бин не создан.
+2. Proxy есть, но не работает? — проверить не self-invocation ли. Логи по строке `this.transactionalMethod()` — прямой вызов через `this`, минует proxy. Fix — один из четырёх способов (self-inject, AopContext, разделение на два бина, AspectJ).
+3. Метод не public? — `@Transactional` игнорируется без ошибок. Проверить модификатор.
+4. Breakpoint в `TransactionInterceptor.invokeWithinTransaction()` — при вызове метода проходит через? Если нет — proxy не в пути. Если да — транзакция открыта, ищи проблему дальше (rollback rules — по умолчанию только `RuntimeException` и `Error`; checked exception не роллбэчит).
 
-**«@Async работает синхронно»**. Skip proxy (self-invocation) — самая частая причина. Проверить `@EnableAsync` включён. Проверить конфигурация `TaskExecutor`.
+**Симптом «@Cacheable не кэширует, каждый вызов идёт в БД»**. Кроме proxy-проверок:
 
-**`LazyInitializationException` в контроллере**. Hibernate lazy proxy пытается сделать query, но session уже закрыт (за пределами `@Transactional` метода). Fix: либо fetch eagerly в query, либо перенести обработку внутрь transactional метода, либо использовать `@Transactional(readOnly=true)` на контроллере (не рекомендуется), либо OSIV (`open-in-view=true` — тоже anti-pattern, но иногда используется).
+1. `CacheManager` bean создан? — при отсутствии `@Cacheable` молча ничего не делает (не бросает ошибку). Проверить `@EnableCaching`.
+2. Cache с указанным именем существует? — `spring.cache.cache-names` или явное определение в CacheManager.
+3. Ключ правильно генерируется? — включить debug для `org.springframework.cache.interceptor.CacheAspectSupport`, увидеть какие ключи вычисляются.
+4. Параметр без нормального `equals/hashCode`? — каждый вызов даёт новый ключ, cache always miss.
 
-**Custom AOP с `@Aspect`** — пример полностью работающего:
+**Симптом «@Async работает синхронно, метод блокирует calling thread»**. Стандартные проверки плюс:
+
+1. `@EnableAsync` включён?
+2. Self-invocation? — вызов async метода изнутри того же класса выполняется синхронно.
+3. Return type правильный? Void или Future/CompletableFuture. Любой другой тип — синхронное выполнение.
+4. `TaskExecutor` настроен? Если используется дефолтный `SimpleAsyncTaskExecutor` — работает асинхронно, но создаёт новый тред на каждый вызов (opasно в prod).
+
+**Симптом `LazyInitializationException` в контроллере**. Hibernate lazy proxy пытается сделать query, но session закрыт (за пределами `@Transactional` метода в service layer). Классика.
+
+Решения по возрастанию правильности: (1) `FETCH JOIN` в query — тяжёлая ассоциация грузится сразу, никаких lazy proxy'ев не нужно; (2) DTO projection — не возвращать entity в контроллер, конвертировать в DTO внутри @Transactional; (3) `@Transactional(readOnly=true)` на всём service методе, возвращающем данные; (4) `open-in-view=true` (OSIV) — session остаётся открытой всё время обработки request'а, lazy loading работает в контроллере (**anti-pattern** — сложно контролировать N+1 queries, отладка становится непонятной; но иногда используется как быстрый fix legacy).
+
+**Custom AOP с `@Aspect`** для timing-логирования:
 
 ```java
 @Aspect
@@ -746,59 +1077,17 @@ public class LoggingAspect {
             return pjp.proceed();
         } finally {
             long duration = System.currentTimeMillis() - start;
-            log.info("Method {} took {} ms", pjp.getSignature(), duration);
+            if (duration > 100) {
+                log.warn("Slow method {}: {} ms", pjp.getSignature(), duration);
+            }
         }
     }
 }
 ```
 
-Spring создаёт proxy для beans в `com.example.service`. При каждом method call `LoggingAspect.logAround` вызывается, timing логируется.
+Spring создаёт proxy для beans в `com.example.service`. Каждый вызов проходит через `logAround`, timing для медленных методов пишется в лог.
 
-Pointcut expressions (execution, within, args, @annotation) — селектят где применить.
-
-Виды advice: `@Before`, `@After`, `@AfterReturning`, `@AfterThrowing`, `@Around`.
-
-## Проверочные вопросы для собеседования
-
-Быстрые ответы на типовые вопросы:
-
-**Facade** — упрощение доступа к сложной подсистеме. Клиент знает что за фасадом много всего.
-
-**Facade vs Adapter**: адаптер меняет форму интерфейса (1-to-1), фасад объединяет N сервисов за одним упрощённым API (N-to-1).
-
-**Facade vs Mediator**: фасад однонаправленный (клиент выше подсистемы), медиатор — peer-to-peer координация равных.
-
-**God Facade** — anti-pattern (500+ строк, все домены в одном классе). Fix — разделить по доменам.
-
-**Spring templates** (JdbcTemplate, RestTemplate, RabbitTemplate) — все Facade + Template Method.
-
-**Proxy** — представитель, тот же интерфейс что real. Клиент не знает что говорит с proxy.
-
-**Виды proxy**: virtual (lazy init, Hibernate lazy loading), protection (auth, @PreAuthorize), remote (Feign, gRPC), smart (cache, log — @Cacheable).
-
-**Static Proxy** — писать руками. **Dynamic Proxy** — генерация в runtime.
-
-**JDK Dynamic Proxy** — только для interface'ов, через InvocationHandler, встроен в JDK.
-
-**CGLIB** — bytecode generation, subclass, работает без interface, не может final/private/static.
-
-**Spring Boot 2.0+** — CGLIB by default.
-
-**`@Transactional` через proxy** — TransactionInterceptor открывает транзакцию до, commit/rollback после.
-
-**Self-invocation problem** — this.method() минует proxy. Fix: self-inject / AopContext / разделить bean / AspectJ.
-
-**`@Transactional` не работает на private/final/static** — proxy не может их перехватить.
-
-**Проверка proxy** — `bean.getClass().getName()` покажет EnhancerBySpringCGLIB или $Proxy или plain class.
-
-**Proxy vs Decorator**: proxy invisible (клиент не знает), decorator composed by client (клиент явно оборачивает).
-
-**AOP interceptor chain порядок** — cache снаружи transaction обычно правильно.
-
-**AspectJ** — bytecode weaving, работает с self-invocation, private, final. Сложнее настроить.
-
-**ByteBuddy** — современный CGLIB replacement, используется в Mockito, Hibernate, потенциально в Spring будущего.
+Pointcut expressions селектят где применить: `execution(...)` — по сигнатуре метода; `within(...)` — по классу/пакету; `@annotation(...)` — по наличию аннотации; `args(...)` — по типам параметров. Advice: `@Before` (до), `@After` (после, finally), `@AfterReturning` (только при success), `@AfterThrowing` (только при exception), `@Around` (полный контроль, вызывает `pjp.proceed()`).
 
 ## Заключение
 
