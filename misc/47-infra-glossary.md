@@ -2,43 +2,43 @@
 
 ## Зачем нужен reference на базовые термины
 
-Разработчик регулярно encounters инфраструктурные concepts не связанные напрямую с business logic его приложения. Термины letme «под капотом» K8s, network layer, OS mechanisms. Understanding этих terms critical для reading system architecture documents, discussing deployment issues с ops teams, troubleshooting production incidents. Часто разница между «работает» и «работает reliably» лежит в этих fundamentals.
+Разработчик постоянно сталкивается с инфраструктурными понятиями, которые не связаны напрямую с бизнес-логикой его приложения. Термины «под капотом» K8s, сетевого стека, механизмов ОС. Понимание этих терминов критично для чтения архитектурных документов, обсуждения проблем деплоя с ops-командой, разбора прод-инцидентов. Разница между «работает» и «работает надёжно» часто лежит именно в этих основах.
 
-Разница между разработчиком «знающим базовое» и «понимающим infrastructure» проявляется в incident scenarios. Первый видит «container OOMKilled», перезапускает pod, надеется на fix. Второй знает что OOMKilled means container exceeded memory limit — kernel killed process due to cgroup memory constraint. Investigation goes к memory usage patterns, heap sizing, potential leaks. Знает что context switch между threads costs microseconds — high thread count creates significant overhead beyond individual thread costs. Знает difference между file descriptor limits ulimit -n и per-process limits соединяющих множество networking issues.
+Разница между разработчиком «со знанием базового» и «понимающим инфраструктуру» проявляется в инцидентах. Первый видит «container OOMKilled», перезапускает pod и надеется, что починилось. Второй понимает: OOMKilled означает, что контейнер превысил memory limit, и kernel убил процесс через ограничение cgroup. Расследование идёт в сторону паттернов использования памяти, размера heap, возможных утечек. Знает, что context switch между потоками стоит микросекунды — большое количество потоков даёт серьёзный overhead сверх стоимости самих потоков. Знает разницу между `ulimit -n` (лимит file descriptor'ов на процесс) и системными лимитами, в которые упираются многие сетевые проблемы.
 
-В этом файле разберём critical infrastructure concepts глубоко enough для reasoning про system behavior. Сервер как general concept и its manifestations (physical, VM, container). Virtual Machine mechanics плюс discrimination от Java VM (JVM). Container mechanics через Linux namespaces plus cgroups. Kubernetes pod как composite unit deployment. CPU architecture — cores, threads, cache hierarchy, context switching, cgroup CPU limits в containers. RAM management. Buffers на многих levels — TCP, disk, application, log. Network connections plus TCP handshake, connection pools, file descriptors, HTTP keepalive. Process vs thread differences. Sockets plus TCP/UDP. Kernel vs user space plus system calls overhead.
+В этом файле — критичные инфраструктурные концепции на уровне, достаточном для рассуждений о поведении системы. Сервер как общее понятие и его реализации (physical, VM, container). Механика Virtual Machine и её отличие от Java VM (JVM). Механика контейнеров через Linux namespaces и cgroups. Kubernetes pod как составная единица деплоя. Архитектура CPU — ядра, потоки, иерархия кэшей, context switch, cgroup CPU limits в контейнерах. Управление RAM. Buffers на разных уровнях — TCP, диск, приложение, лог. Сетевые соединения, TCP handshake, connection pools, file descriptors, HTTP keep-alive. Разница process vs thread. Sockets, TCP/UDP. Kernel vs user space, стоимость системных вызовов.
 
 ## Сервер: общая концепция
 
-Server это компьютер обслуживающий запросы других компьютеров. Simple definition охватывающая множество manifestations.
+Сервер — это компьютер, обслуживающий запросы других компьютеров. Простое определение, которое покрывает множество реализаций.
 
-Physical server — реальная железка в data center. Rack-mounted unit с CPUs, RAM, storage, networking. Provides raw computational resource. Historically dominant deployment model. Requires physical management — power, cooling, network cabling.
+Physical server — реальная железка в дата-центре. Rack-mounted unit с CPU, RAM, storage, сетью. Даёт сырой вычислительный ресурс. Исторически основная модель деплоя. Требует физического обслуживания — питание, охлаждение, кабели.
 
-Virtual server (VM) — программная эмуляция physical computer. Multiple VMs share physical hardware через hypervisor. Each VM appears как independent computer к software running внутри. Isolation between VMs.
+Virtual server (VM) — программная эмуляция физического компьютера. Несколько VM делят железо через hypervisor. Каждая VM изнутри выглядит как независимый компьютер. Изоляция между VM.
 
-Container — процесс с изоляцией через OS mechanisms. Shares kernel with host. Lightweight compared to VMs. Fast startup, low overhead.
+Container — процесс с изоляцией через механизмы ОС. Делит kernel с хостом. Лёгкий по сравнению с VM. Быстрый старт, низкий overhead.
 
-Классы серверов по функции. Web server (nginx, Apache) обслуживает HTTP requests. Application server (Tomcat, JBoss) hosts application code. Database server (PostgreSQL, MySQL) persistent data storage. Message broker (RabbitMQ, Kafka) inter-service communication. Cache server (Redis, Memcached) fast access to cached data. File server storage plus retrieval. DNS server name resolution. Mail server email handling.
+Классы серверов по функции. Web server (nginx, Apache) обслуживает HTTP-запросы. Application server (Tomcat, JBoss) запускает код приложения. Database server (PostgreSQL, MySQL) — хранение данных. Message broker (RabbitMQ, Kafka) — межсервисная коммуникация. Cache server (Redis, Memcached) — быстрый доступ к закэшированным данным. File server — хранение и выдача файлов. DNS server — резолв имён. Mail server — почта.
 
-В микросервисной архитектуре — каждый микросервис обычно = один «server» role. Instances того же service могут быть multiple для scaling.
+В микросервисной архитектуре каждый микросервис обычно = один «server role». Инстансов одного сервиса может быть несколько для масштабирования.
 
 ## Virtual Machine mechanics
 
-VM это программная эмуляция физического компьютера. Внутри VM — своя ОС (guest OS) which считает что работает на реальном железе. Reality — hypervisor virtualizes все hardware access.
+VM — это программная эмуляция физического компьютера. Внутри VM своя ОС (guest OS), которая считает, что работает на реальном железе. По факту hypervisor виртуализирует весь доступ к железу.
 
-Hypervisor это software layer управляющий VMs. VMware ESXi, KVM (Kernel Virtual Machine, встроенный Linux), Hyper-V (Microsoft), Xen. Provides каждой VM.
+Hypervisor — слой ПО, управляющий VM. VMware ESXi, KVM (встроенный в Linux), Hyper-V (Microsoft), Xen. Выдаёт каждой VM её «железо».
 
-Virtual CPU mapped к physical cores. Multiple VMs могут share cores через time-slicing — hypervisor scheduler decides какая VM runs on which core when. Modern CPUs имеют hardware virtualization support (Intel VT-x, AMD-V) reducing overhead.
+Virtual CPU маппится на физические ядра. Несколько VM могут делить ядра через time-slicing — шедулер hypervisor'а решает, какая VM работает на каком ядре в каждый момент. Современные CPU имеют аппаратную поддержку виртуализации (Intel VT-x, AMD-V), которая снижает overhead.
 
-Virtual RAM — chunk physical memory allocated к VM. Guest OS думает что имеет full RAM. Modern hypervisors support memory ballooning — reclaim unused memory from VMs, share pages между VMs (deduplication).
+Virtual RAM — кусок физической памяти, выделенный VM. Guest OS думает, что ей доступна вся RAM. Современные hypervisor'ы поддерживают memory ballooning — забирают неиспользуемую память у VM, дедуплицируют одинаковые страницы между VM.
 
-Virtual disk — обычно file или block device на host storage. Appears как physical disk к guest. Can be sparse (allocate space as used) или fully allocated.
+Virtual disk — обычно файл или block device на хост-хранилище. Для guest-а выглядит как физический диск. Может быть sparse (место выделяется по мере использования) или заранее аллоцированным целиком.
 
-Virtual network interface — connects VM к virtual network. Multiple VMs могут share physical network через bridged или NAT configurations.
+Virtual network interface — подключает VM к виртуальной сети. Несколько VM могут делить физическую сеть через bridged или NAT конфигурации.
 
-Two hypervisor types. Type 1 (bare-metal) — hypervisor runs напрямую на hardware. VMware ESXi, Xen, KVM. Better performance, standard для production. Type 2 (hosted) — hypervisor runs как application inside host OS. VirtualBox, VMware Workstation. Convenient для development, overhead higher.
+Два типа hypervisor'ов. Type 1 (bare-metal) — работает напрямую на железе. VMware ESXi, Xen, KVM. Лучше по производительности, стандарт для прода. Type 2 (hosted) — работает как приложение внутри хост-ОС. VirtualBox, VMware Workstation. Удобно для разработки, overhead выше.
 
-VMs vs containers key differences:
+VM vs container — ключевые отличия:
 
 | | VM | Container |
 |---|---|---|
@@ -48,57 +48,57 @@ VMs vs containers key differences:
 | Изоляция | Сильная (hardware-level virt) | Слабее (namespace-based) |
 | Overhead | Много (OS overhead) | Мало (native processes) |
 
-Different use cases. VMs для strong isolation, running different OSes, legacy applications requiring specific environments. Containers для application deployment где host OS acceptable, faster iteration, denser packing на hardware.
+Разные сценарии применения. VM — когда нужна сильная изоляция, разные ОС, legacy-приложения с жёсткими требованиями к окружению. Container — для деплоя приложений, где хостовая ОС подходит, нужна быстрая итерация и плотная упаковка на железо.
 
-Java VM (JVM) — completely different concept. Not VM в смысле VMware. Bytecode interpreter — runs Java bytecode compiled from source. Provides platform independence — same bytecode runs everywhere JVM exists. Not virtualizing hardware — abstracting language runtime.
+Java VM (JVM) — совершенно другое понятие. Это не VM в смысле VMware. Интерпретатор байт-кода — выполняет Java bytecode, скомпилированный из исходников. Даёт платформенную независимость — один и тот же байт-код работает везде, где есть JVM. Виртуализирует не железо, а языковой runtime.
 
 ## Container mechanics
 
-Container это isolated процесс plus его окружение (JDK, libraries, config). Implementation через Linux namespaces plus cgroups. Not separate OS — shares kernel with host.
+Container — это изолированный процесс плюс его окружение (JDK, библиотеки, конфиг). Реализован через Linux namespaces + cgroups. Это не отдельная ОС — kernel общий с хостом.
 
-Linux namespaces provide isolation dimensions.
+Linux namespaces дают разные измерения изоляции.
 
-PID namespace — process IDs. Container's processes see себя как PID 1 (init) plus own PID space. Host sees actual PIDs (different values).
+PID namespace — process ID. Внутри контейнера его процессы видят себя как PID 1 (init) + собственное пространство PID. Хост видит реальные PID (другие значения).
 
-Network namespace — networking. Own network interfaces, routing tables, iptables rules. Independent от host network.
+Network namespace — сеть. Собственные интерфейсы, таблицы маршрутизации, правила iptables. Независимы от хостовой сети.
 
-Mount namespace — filesystem view. Own filesystem tree. Can bind-mount specific host paths для sharing.
+Mount namespace — вид файловой системы. Собственное дерево. Через bind-mount можно шарить конкретные пути с хостом.
 
-UTS namespace — hostname, domain name. Container's hostname independent от host.
+UTS namespace — hostname, domain name. Hostname контейнера независим от хостового.
 
-IPC namespace — inter-process communication (semaphores, shared memory). Isolated per container.
+IPC namespace — межпроцессная коммуникация (семафоры, shared memory). Изолирована на контейнер.
 
-User namespace — user IDs. UID 0 (root) inside container может быть unprivileged user на host.
+User namespace — user ID. UID 0 (root) внутри контейнера может быть непривилегированным пользователем на хосте.
 
-cgroups control resource usage. Memory cgroup limits max RAM. CPU cgroup limits CPU shares or hard limits. Block IO cgroup limits disk bandwidth. Network cgroup limits bandwidth or shapes traffic.
+cgroups контролируют использование ресурсов. Memory cgroup — максимум RAM. CPU cgroup — доля CPU или жёсткий лимит. Block IO cgroup — пропускная способность диска. Network cgroup — пропускная способность сети или шейпинг трафика.
 
-Together — namespaces isolate view, cgroups limit resources. Container это process с restricted view plus resource limits.
+Вместе: namespaces изолируют «что видно», cgroups ограничивают «сколько можно использовать». Container — процесс с ограниченным обзором и ограниченными ресурсами.
 
-Runtimes for containers. Docker популярный original tool. containerd more focused modern runtime. Podman daemonless alternative к Docker. CRI-O Kubernetes-focused runtime. All implement OCI (Open Container Initiative) specifications.
+Runtimes контейнеров. Docker — популярный оригинальный инструмент. containerd — более узкоспециализированный современный runtime. Podman — альтернатива Docker без демона. CRI-O — runtime, заточенный под Kubernetes. Все реализуют OCI (Open Container Initiative) спецификации.
 
 ## Kubernetes pod
 
-Pod — минимальная единица деплоя в K8s. Обычно 1 pod = 1 container. Может быть multi-container (sidecar pattern) sharing.
+Pod — минимальная единица деплоя в K8s. Обычно 1 pod = 1 container. Бывают multi-container (sidecar pattern), которые делят ресурсы.
 
-Containers в одном pod share several resources. Network namespace — same IP address, same port space (containers can не listen on same port). IPC namespace — inter-process communication accessible between containers. Volumes — shared storage between containers.
+Контейнеры внутри одного pod делят несколько ресурсов. Network namespace — один IP, одно пространство портов (два контейнера не могут слушать один и тот же порт). IPC namespace — межпроцессная коммуникация доступна между контейнерами. Volumes — общее хранилище между контейнерами.
 
-Что НЕ shared. Filesystems — each container has separate filesystem. Processes — each container's process visible only within its container.
+Что НЕ делят. Файловые системы — у каждого контейнера своя. Процессы — процессы одного контейнера видны только внутри него.
 
-Multi-container patterns. Sidecar — helper container for main app (logging agent, service mesh proxy, metrics exporter). Ambassador — proxy для outbound connections (encapsulating service discovery). Adapter — normalizing output for standard monitoring tools.
+Multi-container паттерны. Sidecar — вспомогательный контейнер к основному приложению (log agent, service mesh proxy, metrics exporter). Ambassador — proxy для исходящих соединений (инкапсулирует service discovery). Adapter — нормализация вывода под стандартные инструменты мониторинга.
 
-Pod эфемерен — умер и появился новый с другим IP address. Каждый restart pods имеет different IP. Application code should NEVER hard-code pod IPs. Communication должно go через Kubernetes Services which provide stable endpoints поверх changing pod IPs.
+Pod эфемерен — умер и появился новый с другим IP. Каждый перезапуск — новый IP. Код приложения НИКОГДА не должен хардкодить pod IP. Коммуникация должна идти через Kubernetes Services, которые дают стабильные endpoint'ы поверх меняющихся pod IP.
 
 ## CPU: cores, threads, cache hierarchy
 
-CPU (Central Processing Unit) — процессор. Modern CPUs имеют multiple cores plus multiple threads per core.
+CPU (Central Processing Unit) — процессор. Современные CPU имеют несколько ядер, а каждое ядро — несколько потоков.
 
-Core — физическая единица выполнения. Actual processing hardware. Independent instruction execution.
+Core — физическая единица исполнения. Реальное железо для вычислений. Независимое выполнение инструкций.
 
-Thread — логическая единица. Через Hyper-Threading (Intel) или SMT (AMD) один core выполняет 2 threads simultaneously. Sharing core resources plus efficiencies.
+Thread — логическая единица. Через Hyper-Threading (Intel) или SMT (AMD) одно ядро выполняет 2 потока одновременно. Делят ресурсы ядра с некоторым приростом эффективности.
 
-Example. Intel Xeon 8 cores × 2 HT threads per core = 16 logical CPUs. Operating system sees 16 CPUs. Programs могут schedule 16 threads simultaneously executing. But actual parallelism limited к 8 (physical cores).
+Пример. Intel Xeon 8 ядер × 2 HT-потока на ядро = 16 логических CPU. ОС видит 16 CPU. Программы могут планировать 16 потоков на одновременное выполнение. Но реальный параллелизм ограничен 8 (физические ядра).
 
-CPU cache hierarchy critical для performance:
+Иерархия CPU cache критична для производительности:
 ```
 Регистр       ~1 ns    (int, обрабатываемый сейчас)
 L1 cache      ~1 ns    (32-64 KB)
@@ -108,75 +108,75 @@ RAM           ~100 ns  (GB, «медленная» относительно cach
 Disk (SSD)    ~100 μs  (в 1000× медленнее RAM)
 ```
 
-Разница между register и RAM — 100×. Между RAM и SSD — 1000×. Отсюда critical importance cache-friendly кода — data локально accessible через caches dramatically faster than RAM access.
+Разница между регистром и RAM — 100×. Между RAM и SSD — 1000×. Отсюда важность cache-friendly кода — данные, лежащие локально и доступные через кэши, читаются драматически быстрее, чем из RAM.
 
-Practical implications. Sequential data access (arrays) predictable к CPU prefetcher — brings data к cache before needed. Random access (linked lists, hash lookups) unpredictable — cache misses frequent — slow. Modern algorithm design prefers cache-friendly data structures.
+Практические следствия. Последовательный доступ (массивы) предсказуем для CPU prefetcher'а — он тащит данные в кэш заранее. Случайный доступ (linked list, hash lookup) — непредсказуем, cache miss'ы часты, работа идёт медленно. Современный дизайн алгоритмов предпочитает cache-friendly структуры данных.
 
-CPU в containers. K8s измеряет CPU в millicores (m):
+CPU в контейнерах. K8s измеряет CPU в millicore (m):
 - 1000m = 1 полное ядро.
 - 500m = 0.5 ядра (throttling).
 - 100m = 0.1 ядра.
 
-Pod resource specification:
+Спецификация ресурсов pod:
 ```yaml
 resources:
   requests: { cpu: 200m }
   limits:   { cpu: "2" }
 ```
 
-Requests это гарантированный minimum — scheduler places pod на node with sufficient available. Limits максимальный upper bound — cgroups CPU throttling когда pod exceeds. Throttled tasks slowed down not killed.
+Requests — гарантированный минимум — шедулер ставит pod на node, где есть столько свободного CPU. Limits — верхняя граница — cgroup делает CPU throttling, когда pod превышает лимит. Задачи при throttling замедляются, а не убиваются.
 
-Context switch — переключение между процессами/потоками. Not free — approximately 1-10 μs overhead per switch. Много potоков → много context switches → CPU занят переключением not useful work.
+Context switch — переключение между процессами/потоками. Не бесплатно — ~1–10 μs на переключение. Много потоков → много context switch'ей → CPU занят переключениями, а не полезной работой.
 
-Отсюда — virtual threads в Java 21 (файл 19). Instead of OS threads (heavy context switches), virtual threads managed by JVM (lightweight scheduling). Allows millions of virtual threads without context switch storm.
+Отсюда — virtual threads в Java 21 (файл 19). Вместо OS-потоков (тяжёлые context switch) — virtual threads, управляемые JVM (лёгкий шедулинг). Позволяет держать миллионы virtual thread'ов без лавины context switch'ей.
 
-Diagnosing CPU-bound scenarios. `top` показывает %CPU близко к 100% — CPU-bound. В application — thread dump показывает потоки в RUNNABLE state consistently — computation not I/O bound. Fixes — optimize algorithm complexity, parallelize hot paths, cache results.
+Диагностика CPU-bound сценариев. `top` показывает %CPU близко к 100% — упор в CPU. В приложении — thread dump показывает потоки в RUNNABLE state стабильно — задача вычислительная, а не I/O-bound. Что чинить — сложность алгоритма, распараллеливание горячих путей, кэширование результатов.
 
 ## RAM management
 
-Основная оперативная память. Units — 1 KB = 1024 bytes. 1 MB = 1024 KB. 1 GB = 1024 MB. Typical enterprise server имеет 8-256 GB RAM.
+Основная оперативная память. Единицы — 1 KB = 1024 bytes, 1 MB = 1024 KB, 1 GB = 1024 MB. Типичный enterprise-сервер — 8–256 GB RAM.
 
-RAM в containers через K8s specifications:
+RAM в контейнерах через спецификации K8s:
 ```yaml
 resources:
   requests: { memory: 512Mi }
   limits:   { memory: 1Gi }
 ```
 
-Requests guaranteed minimum. Limits hard cap. При exceeding limit — OOMKilled. Kernel убивает процесс через OOM killer choosing worst offender. Not throttling like CPU — hard termination.
+Requests — гарантированный минимум. Limits — жёсткий потолок. Превышение лимита — OOMKilled. Kernel убивает процесс через OOM killer, выбирая «худшего нарушителя». Это не throttling как у CPU — а жёсткое завершение.
 
-Отличия от CPU cache. RAM это DRAM technology — cheaper, denser, но slower than CPU caches. CPU caches SRAM — faster, more expensive, less dense. RAM measured в GB. Cache в MB (L3) или KB (L1/L2).
+Отличия от CPU cache. RAM — технология DRAM — дешевле, плотнее, но медленнее CPU-кэшей. CPU cache — SRAM — быстрее, дороже, менее плотная. RAM измеряется в GB. Cache — в MB (L3) или KB (L1/L2).
 
-Приложение работает directly с RAM. CPU cache — прозрачное для программиста acceleration frequently accessed data. JIT compilers плюс OS help optimize placement.
+Приложение работает напрямую с RAM. CPU cache — прозрачное для программиста ускорение частых обращений. JIT compiler и ОС помогают оптимизировать размещение.
 
 ## Buffer: temporary storage patterns
 
-Buffer это временное хранилище данных между источником и потребителем. Идея — сгладить разницу в скоростях или упростить batching operations.
+Buffer — временное хранилище данных между источником и потребителем. Смысл — сгладить разницу в скоростях или собрать операции в batch.
 
-TCP buffer — kernel maintains receive и send buffers per TCP connection. Application writes к socket — kernel buffers данные для sending. Application reads — kernel provides из receive buffer already filled by network.
+TCP buffer — kernel поддерживает receive- и send-буферы на каждое TCP-соединение. Приложение пишет в сокет — kernel буферизует данные для отправки. Приложение читает — kernel отдаёт из receive-буфера, который уже наполнила сеть.
 
-Configuration в Linux:
+Конфигурация в Linux:
 ```
 net.core.rmem_max = 16777216       # 16 MB max receive
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 ```
 
-If application doesn't read fast enough — buffer fills — TCP advertises reduced window — sender slows down (TCP flow control). Natural backpressure mechanism.
+Если приложение не успевает читать — буфер заполняется — TCP уменьшает window — отправитель замедляется (TCP flow control). Естественный механизм backpressure.
 
-Disk buffer (page cache) — kernel caches file reads и writes. Read cache prevents re-reading same file. Write cache batches multiple writes into fewer disk operations. Explicit fsync forces flush для durability guarantees.
+Disk buffer (page cache) — kernel кэширует чтения и записи файлов. Read-кэш предотвращает повторное чтение того же файла. Write-кэш объединяет несколько записей в меньшее число дисковых операций. Явный fsync принудительно сбрасывает данные для гарантий durability.
 
-Отсюда `free -h` shows `used + free + buff/cache`. buff/cache appears used но can be freed by kernel when needed для actual application memory. Not «lost» memory.
+Отсюда `free -h` показывает `used + free + buff/cache`. buff/cache выглядит занятым, но может быть освобождён kernel'ом, когда понадобится реальная память приложению. Это не «потерянная» память.
 
-Java ByteBuffer два types. `ByteBuffer.allocate(1024)` allocates в JVM heap. Standard managed memory. `ByteBuffer.allocateDirect(1024)` allocates outside heap. DMA-friendly для NIO operations. Not managed by regular GC — cleaner references handle disposal.
+Java ByteBuffer — два типа. `ByteBuffer.allocate(1024)` — в JVM heap. Стандартная управляемая память. `ByteBuffer.allocateDirect(1024)` — вне heap. DMA-friendly для NIO. Не управляется обычным GC — освобождение через cleaner-ссылки.
 
-Application buffers common в various libraries. Kafka producer buffers messages до `linger.ms` или `batch.size`. Consumer buffers polled records между process calls. JDBC batching accumulates INSERTs.
+Application buffers встречаются во многих библиотеках. Kafka producer буферизует сообщения до `linger.ms` или `batch.size`. Consumer буферизует распарсенные записи между вызовами process. JDBC batching накапливает INSERT'ы.
 
-Log buffer — async log appender queues events. Background thread writes к disk. Application не blocks на log I/O. Caveat — при JVM crash не yet-written events lost.
+Log buffer — async-аппендер лога складывает события в очередь. Фоновый поток пишет на диск. Приложение не блокируется на log I/O. Нюанс — при краше JVM ещё не записанные события теряются.
 
 ## TCP connection lifecycle
 
-TCP connection — полнодуплексный канал между two IP:port pair'ами. Established через 3-way handshake:
+TCP connection — полнодуплексный канал между парой `IP:port`. Устанавливается через 3-way handshake:
 ```
 Client → SYN → Server
 Client ← SYN-ACK ← Server
@@ -184,71 +184,71 @@ Client → ACK → Server
 Connected!
 ```
 
-Approximately 1 RTT (round-trip time). Local network 1 ms. Cross-region 100 ms или more.
+Около 1 RTT (round-trip time). Локальная сеть — 1 ms. Между регионами — 100 ms и больше.
 
-TLS handshake adds 1-2 RTT для encryption negotiation. Total connection establishment 30-100 ms с SSL включая all handshakes plus authentication.
+TLS handshake добавляет 1–2 RTT для согласования шифрования. Итого установка соединения с SSL — 30–100 ms, включая все handshake'и и аутентификацию.
 
-Connection pool это переиспользование open connections. Amortizes handshake cost over many requests. Critical optimization.
+Connection pool — переиспользование открытых соединений. Амортизирует стоимость handshake на много запросов. Критичная оптимизация.
 
-JDBC pool (HikariCP) maintains persistent connections к DB. HTTP client pools (Apache HttpClient, OkHttp) reuse TCP connections для HTTP requests. Kafka producer/consumer maintain persistent connections к brokers.
+JDBC pool (HikariCP) держит постоянные соединения с БД. HTTP-клиенты (Apache HttpClient, OkHttp) переиспользуют TCP-соединения для HTTP-запросов. Kafka producer/consumer держат постоянные соединения с брокерами.
 
-Connection lifecycle states. Establish — TCP плюс TLS handshake. Idle — открыт, не используется, held for reuse. In-use — application actively using. Close — TCP 4-way close handshake gracefully terminates.
+Состояния соединения. Establish — TCP + TLS handshake. Idle — открыто, не используется, лежит в пуле для переиспользования. In-use — приложение активно работает с ним. Close — TCP 4-way close, корректное завершение.
 
-Common problems. Stale connection — network/firewall killed but pool doesn't know. Fix — keepalive probes plus test-on-borrow validation. Leak — application acquired but not released. Fix — try-with-resources plus leak-detection-threshold в HikariCP. Exhausted pool — все в use, new requests wait. Fix — increase pool или fix leak.
+Типичные проблемы. Stale connection — сеть/файрвол убили соединение, но пул об этом не знает. Чинится keep-alive-пробами и test-on-borrow валидацией. Утечка — приложение взяло соединение, но не вернуло. Чинится try-with-resources и `leak-detection-threshold` в HikariCP. Исчерпание пула — все соединения в работе, новые запросы ждут. Чинится увеличением пула или устранением утечки.
 
-HTTP keep-alive default в HTTP/1.1. Connection не closes после request/response. Next request from same client reuses TCP connection. Amortizes handshake overhead.
+HTTP keep-alive — по умолчанию в HTTP/1.1. Соединение не закрывается после request/response. Следующий запрос с того же клиента переиспользует TCP-соединение. Амортизирует стоимость handshake.
 
-HTTP/2 multiplexes multiple requests через one connection. Multiple concurrent requests interleaved. Better utilization single TCP connection.
+HTTP/2 мультиплексирует несколько запросов в одном соединении. Параллельные запросы чередуются. Лучшая утилизация одного TCP-соединения.
 
-WebSocket reuses TCP как full-duplex stream. Long-lived connection для bi-directional communication.
+WebSocket использует TCP как full-duplex stream. Долгоживущее соединение для двусторонней коммуникации.
 
 ## File descriptors
 
-В Linux каждое TCP connection = file descriptor. Also opened files, pipes, sockets — all file descriptors. Kernel resource per process.
+В Linux каждое TCP-соединение = file descriptor. Открытые файлы, pipe'ы, сокеты — тоже file descriptor'ы. Это ресурс kernel'а на процесс.
 
-Limit через ulimit -n. Default обычно 1024 — too low для serious production. Should be 65535 или higher.
+Лимит — через `ulimit -n`. По умолчанию обычно 1024 — мало для серьёзного прода. Нужно 65535 или больше.
 
-Утечка FD leads к «Too many open files» errors. Monitor через `lsof -p <pid> | wc -l`. Investigate когда count keeps growing without corresponding workload growth.
+Утечка FD приводит к ошибкам «Too many open files». Мониторить через `lsof -p <pid> | wc -l`. Разбираться, если счётчик растёт при неизменной нагрузке.
 
 ## Process vs Thread
 
-Process — изолированный экземпляр программы. Каждый имеет свой PID (process ID), свою virtual memory (isolated от других), свои open files и sockets, свои threads (минимум один — main thread).
+Process — изолированный экземпляр программы. У каждого свой PID, своя виртуальная память (изолированная от других), свои открытые файлы и сокеты, свои потоки (минимум один — main thread).
 
-Создание процесса дорого. fork() в Linux copies entire process state. Optimized через copy-on-write но still non-trivial cost.
+Создание процесса дорого. `fork()` в Linux копирует всё состояние процесса. Оптимизируется copy-on-write, но всё равно нетривиально.
 
-Thread — единица исполнения внутри процесса. Threads одного процесса делят memory space (heap), open files, sockets. Свои — stack, registers, program counter.
+Thread — единица исполнения внутри процесса. Потоки одного процесса делят адресное пространство (heap), открытые файлы, сокеты. Свои у каждого — stack, регистры, program counter.
 
-Создание thread быстрее создания process. Communication между threads через shared memory (легче, но более dangerous — race conditions).
+Создание потока быстрее создания процесса. Коммуникация между потоками через shared memory (легче, но опаснее — race conditions).
 
-В Java — раньше 1 Java Thread = 1 OS thread. Heavy — expensive create, expensive context switch. С Java 21 — Virtual Threads — millions of lightweight threads. JVM schedules them onto pool OS threads. Efficient для I/O-bound workloads.
+В Java раньше 1 Java Thread = 1 OS thread. Тяжело — дорого создавать, дорого переключать. С Java 21 — virtual threads — миллионы лёгких потоков. JVM шедулит их на пул OS-потоков. Эффективно для I/O-bound нагрузок.
 
-Detailed virtual threads в файле 19.
+Детальнее про virtual threads — в файле 19.
 
 ## Sockets
 
-Socket = endpoint для сети. Pair (IP address, port).
+Socket — endpoint для сети. Пара (IP, port).
 
-Types. Stream (TCP) — reliable, ordered, connection-based. Datagram (UDP) — unreliable, unordered, faster, connectionless. Unix domain socket — IPC на one host через filesystem socket file, faster than TCP loopback.
+Типы. Stream (TCP) — надёжный, упорядоченный, с установлением соединения. Datagram (UDP) — ненадёжный, неупорядоченный, быстрее, без соединения. Unix domain socket — IPC в пределах одного хоста через файл-сокет на диске, быстрее, чем TCP loopback.
 
-Server sockets. bind(port) plus listen() — server prepares to accept connections. accept() — creates new socket для each incoming connection. Original listening socket continues accepting more connections.
+Server sockets. `bind(port)` + `listen()` — сервер готов принимать соединения. `accept()` — создаёт новый сокет на каждое входящее соединение. Исходный listening-сокет продолжает принимать новые.
 
-Client sockets. connect(server_ip, port) — establishes connection к server. Client uses socket для sending/receiving data.
+Client sockets. `connect(server_ip, port)` — устанавливает соединение с сервером. Клиент использует сокет для чтения/записи.
 
-Socket = file descriptor в Linux. read()/write() work как with files. Uniform I/O API.
+Socket = file descriptor в Linux. `read()`/`write()` работают так же, как с файлами. Единый I/O API.
 
 ## Kernel vs User space
 
-Kernel space — Linux kernel code. Manages CPU scheduling, memory allocation, I/O (disk, network), filesystem, process management. Works в privileged mode с full hardware access.
+Kernel space — код ядра Linux. Отвечает за шедулинг CPU, выделение памяти, I/O (диск, сеть), файловую систему, управление процессами. Работает в privileged mode с полным доступом к железу.
 
-User space — обычные процессы. Applications, services, tools. Works в user mode с limited privileges. Cannot access hardware directly или memory других processes.
+User space — обычные процессы. Приложения, сервисы, утилиты. Работают в user mode с ограниченными привилегиями. Не могут напрямую обращаться к железу или памяти других процессов.
 
-System calls — mechanism for user space processes к request kernel services. When application needs I/O — read, write, send, recv, open, close — invokes system call.
+System calls — механизм, через который user-space процесс запрашивает услуги у kernel'а. Когда приложению нужен I/O — read, write, send, recv, open, close — вызывается system call.
 
-System call flow. Application makes function call (например read()). Library translates к syscall instruction. CPU switches user→kernel mode (context switch, expensive). Kernel executes actual operation. Returns к user mode. Application receives result.
+Поток выполнения system call. Приложение вызывает функцию (например, `read()`). Библиотека переводит это в syscall-инструкцию. CPU переключается из user в kernel mode (это context switch, дорого). Kernel выполняет реальную операцию. Возврат в user mode. Приложение получает результат.
 
-Context switches cost 100 ns to microseconds. Many system calls per operation kills performance. Optimizations. Batch I/O — one syscall для multiple operations (writev, sendfile). Async I/O — epoll, io_uring — reduce syscall overhead through event notification instead of per-operation calls.
+Context switch стоит от сотни наносекунд до микросекунд. Много system call'ов на операцию убивают производительность. Оптимизации. Batch I/O — один syscall на несколько операций (`writev`, `sendfile`). Async I/O — epoll, io_uring — снижают overhead syscall'ов за счёт event-notification вместо вызова на каждую операцию.
 
-Java code goes через JVM runtime которое uses syscalls when needed. Direct sysscall costs mostly hidden but still relevant для performance-critical paths.
+Java-код проходит через JVM runtime, который дёргает syscall'ы по необходимости. Прямая стоимость syscall'ов в основном скрыта, но на критичных для производительности участках всё ещё важна.
 
 ## Terminology cheat sheet
 
@@ -313,26 +313,26 @@ Comprehensive quick reference:
 
 ## Итоги
 
-Сервер как general concept охватывает physical, VM, container, pod realizations. Каждый с trade-offs.
+Сервер как общее понятие покрывает physical, VM, container, pod реализации. У каждой — свои trade-off'ы.
 
-VM — full OS on hypervisor. Strong isolation, minute-scale startup, GB-scale sizes.
+VM — полная ОС поверх hypervisor'а. Сильная изоляция, старт за минуты, объём в GB.
 
-Container — process с namespaces plus cgroups. Shared kernel, seconds-scale startup, MB-scale sizes. Different tradeoff.
+Container — процесс с namespaces и cgroups. Общий kernel, старт за секунды, объём в MB. Другой набор компромиссов.
 
-Pod в K8s — 1+ container sharing network, IPC, volumes. Ephemeral IPs — communicate through Services.
+Pod в K8s — один или несколько контейнеров, которые делят сеть, IPC, volumes. IP эфемерный — ходим через Services.
 
-CPU cores plus threads (HT). Cache hierarchy critical (register → L1 → L2 → L3 → RAM 100× → disk 1000× slower). Context switch overhead ~1-10 μs. cgroup limits в containers.
+CPU — ядра и потоки (HT). Критична иерархия кэшей (регистр → L1 → L2 → L3 → RAM в 100× медленнее → диск в 1000× медленнее). Context switch стоит ~1–10 μs. В контейнерах действуют cgroup-лимиты.
 
-RAM management с requests plus limits в containers. OOMKilled hard kill on exceed.
+Управление RAM — requests и limits в контейнерах. OOMKilled — жёсткое завершение при превышении.
 
-Buffer temporary storage smoothing rate differences. TCP kernel buffers, disk page cache, Java ByteBuffer heap vs direct, application-level batching.
+Buffer — временное хранилище, которое сглаживает разницу в скоростях. TCP-буферы в kernel'е, disk page cache, Java ByteBuffer heap vs direct, batching на уровне приложения.
 
-TCP connection lifecycle с 3-way handshake ~1 RTT plus TLS 1-2 RTT. Connection pools amortize cost.
+TCP connection lifecycle — 3-way handshake ~1 RTT плюс TLS 1–2 RTT. Connection pools амортизируют эту стоимость.
 
-File descriptors как handles к files/sockets. ulimit constraint. Leaks manifested через «Too many open files».
+File descriptor'ы — handle'ы на файлы/сокеты. Упираются в `ulimit`. Утечки проявляются как «Too many open files».
 
-Process vs thread. Threads share memory within process. Virtual threads (Java 21) million-scale через JVM scheduling.
+Process vs thread. Потоки делят память внутри процесса. Virtual threads (Java 21) — миллионы «зелёных» потоков через JVM scheduling.
 
-Kernel space privileged, user space regular apps. System calls bridge, cost context switches. Batching plus async I/O reduce overhead.
+Kernel space — привилегированный, user space — обычные приложения. System call'ы — мост между ними, стоят context switch'а. Batching и async I/O снижают overhead.
 
-Дальше — глубокое comparison монолит vs микросервисы, когда что выбирать, migration strategies.
+Дальше — глубокое сравнение монолит vs микросервисы, когда что выбирать, стратегии миграции.
